@@ -13,6 +13,7 @@ import {
   type IpcMainInvokeEvent,
 } from "electron";
 import { DekiAgentRuntime } from "@deki-ai/agent-runtime";
+import { GitCheckpointManager } from "@deki-ai/git-checkpoint";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import {
   ensureDekiDirectories,
@@ -51,6 +52,9 @@ import {
   commandResultSchema,
   clearDataInputSchema,
   dataUsageSchema,
+  gitCheckpointCreateInputSchema,
+  gitCheckpointIdInputSchema,
+  gitCheckpointSchema,
   IPC_CHANNELS,
   mcpServerEditorSchema,
   mcpToolSummarySchema,
@@ -100,6 +104,8 @@ class DesktopController {
   readonly #mcp = new McpManager();
   readonly #settings: SettingsStore;
   readonly #models: ModelConfigStore;
+  readonly #checkpoints: GitCheckpointManager | undefined;
+  readonly #resumeLatest: boolean;
   #runtime: DekiAgentRuntime | undefined;
   #trusted = false;
   #starting: Promise<void> | undefined;
@@ -116,6 +122,7 @@ class DesktopController {
     memory: MemoryEngine,
     settings: SettingsStore,
     recentWorkspaces: string[],
+    resumeLatest: boolean,
   ) {
     this.#workspace = workspace;
     this.#runtimeWorkspace = runtimeWorkspace;
@@ -125,6 +132,8 @@ class DesktopController {
     this.#memory = memory;
     this.#settings = settings;
     this.#models = new ModelConfigStore(paths.modelsFile);
+    this.#checkpoints = workspace ? new GitCheckpointManager(workspace) : undefined;
+    this.#resumeLatest = resumeLatest;
     this.#recentWorkspaces = recentWorkspaces;
     this.#settings.subscribe((snapshot) => {
       applyNativeSettings(snapshot);
@@ -132,7 +141,10 @@ class DesktopController {
     });
   }
 
-  static async create(workspace?: string): Promise<DesktopController> {
+  static async create(
+    workspace?: string,
+    options: { resumeLatest?: boolean } = {},
+  ): Promise<DesktopController> {
     const paths = getDekiPaths();
     await ensureDekiDirectories(paths);
     const runtimeWorkspace = workspace ?? join(paths.root, "general");
@@ -165,6 +177,7 @@ class DesktopController {
       memory,
       settings,
       await listRecentWorkspaces(paths.configFile),
+      options.resumeLatest === true,
     );
     instance.#trusted = workspace
       ? await isWorkspaceTrusted(paths.configFile, workspace)
@@ -881,6 +894,52 @@ class DesktopController {
     return records;
   }
 
+  async listGitCheckpoints() {
+    if (!this.#workspace || !this.#trusted || !this.#checkpoints) return [];
+    return this.#checkpoints.list();
+  }
+
+  async createGitCheckpoint(message?: string): Promise<CommandResult> {
+    if (!this.#workspace || !this.#trusted || !this.#checkpoints) {
+      return { ok: false, error: "Git Checkpoint 只在受信任的 Git 项目中可用" };
+    }
+    if (this.#runtime?.snapshot().streaming) {
+      return { ok: false, error: "Agent 正在运行，暂时不能创建 Checkpoint" };
+    }
+    try {
+      const checkpoint = await this.#checkpoints.create(message);
+      this.#diagnostics.push(`已创建 Git Checkpoint: ${checkpoint.id}`);
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: formatError(error) };
+    }
+  }
+
+  async previewGitCheckpoint(id: string): Promise<string> {
+    if (!this.#workspace || !this.#trusted || !this.#checkpoints) {
+      throw new Error("Git Checkpoint 只在受信任的 Git 项目中可用");
+    }
+    return this.#checkpoints.diff(id);
+  }
+
+  async restoreGitCheckpoint(id: string): Promise<CommandResult> {
+    if (!this.#workspace || !this.#trusted || !this.#checkpoints) {
+      return { ok: false, error: "Git Checkpoint 只在受信任的 Git 项目中可用" };
+    }
+    if (this.#runtime?.snapshot().streaming) {
+      return { ok: false, error: "Agent 正在运行，暂时不能恢复 Checkpoint" };
+    }
+    try {
+      const result = await this.#checkpoints.restore(id);
+      this.#diagnostics.push(
+        `已恢复 ${result.restored.id}；恢复前状态保存在 ${result.safetyCheckpoint.id}`,
+      );
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: formatError(error) };
+    }
+  }
+
   async dispose(): Promise<void> {
     await this.#runtime?.dispose();
     this.#runtime = undefined;
@@ -912,6 +971,7 @@ class DesktopController {
         memoryEngine: this.#memory,
         mcpManager: this.#mcp,
         settings: this.#settings.snapshot().effective,
+        resumeLatest: this.#resumeLatest,
         mcpEnvironment: this.#workspace
           ? Object.fromEntries(Object.entries(
               (await readMcpLocalConfig(this.#mcpLocalFile())).servers,
@@ -1092,7 +1152,9 @@ async function writeDiagnosticLog(
 
 async function bootstrap(): Promise<void> {
   const workspace = await resolveStartupWorkspace(process.argv);
-  controller = await DesktopController.create(workspace);
+  controller = await DesktopController.create(workspace, {
+    resumeLatest: process.argv.includes("--resume"),
+  });
   registerIpcHandlers();
   await configureAppProtocol();
   createWindow();
@@ -1444,6 +1506,41 @@ function registerIpcHandlers(): void {
       await controller?.listAuditRecords() ?? [],
     );
   });
+  ipcMain.handle(IPC_CHANNELS.listGitCheckpoints, async (event) => {
+    assertTrustedSender(event);
+    return gitCheckpointSchema.array().parse(
+      await controller?.listGitCheckpoints() ?? [],
+    );
+  });
+  ipcMain.handle(IPC_CHANNELS.createGitCheckpoint, async (event, raw) => {
+    assertTrustedSender(event);
+    const { message } = gitCheckpointCreateInputSchema.parse(raw ?? {});
+    return commandResultSchema.parse(await controller?.createGitCheckpoint(message));
+  });
+  ipcMain.handle(IPC_CHANNELS.previewGitCheckpoint, async (event, raw) => {
+    assertTrustedSender(event);
+    const { id } = gitCheckpointIdInputSchema.parse(raw);
+    return await controller?.previewGitCheckpoint(id) ?? "";
+  });
+  ipcMain.handle(IPC_CHANNELS.restoreGitCheckpoint, async (event, raw) => {
+    assertTrustedSender(event);
+    const { id } = gitCheckpointIdInputSchema.parse(raw);
+    const owner = BrowserWindow.fromWebContents(event.sender);
+    const preview = await controller?.previewGitCheckpoint(id) ?? "";
+    const confirmation = owner
+      ? await dialog.showMessageBox(owner, {
+          type: "warning",
+          title: "恢复 Git Checkpoint",
+          message: "将工作区文件恢复到所选 Checkpoint？",
+          detail: `${preview.slice(0, 4_000)}${preview.length > 4_000 ? "\n…Diff 已截断" : ""}\n\n恢复前会自动创建安全 Checkpoint；现有未跟踪文件不会被删除。`,
+          buttons: ["取消", "创建安全快照并恢复"],
+          defaultId: 0,
+          cancelId: 0,
+        })
+      : { response: 0 };
+    if (confirmation.response !== 1) return commandResultSchema.parse({ ok: true });
+    return commandResultSchema.parse(await controller?.restoreGitCheckpoint(id));
+  });
   ipcMain.handle(IPC_CHANNELS.factoryReset, async (event) => {
     assertTrustedSender(event);
     const owner = BrowserWindow.fromWebContents(event.sender);
@@ -1618,6 +1715,7 @@ function requiresRuntimeReload(before: SettingsSnapshot, after: SettingsSnapshot
     skills: before.effective.skills,
     memory: before.effective.memory,
     permissions: before.effective.permissions,
+    workspace: before.effective.workspace,
   }) !== JSON.stringify({
     agent: after.effective.agent,
     advanced: after.effective.advanced,
@@ -1626,6 +1724,7 @@ function requiresRuntimeReload(before: SettingsSnapshot, after: SettingsSnapshot
     skills: after.effective.skills,
     memory: after.effective.memory,
     permissions: after.effective.permissions,
+    workspace: after.effective.workspace,
   });
 }
 

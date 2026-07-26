@@ -11,7 +11,9 @@
   },
   "scripts": {
     "dev": "pnpm --filter @deki-ai/desktop dev",
-    "build": "pnpm --filter @deki-ai/desktop build",
+    "build": "pnpm cli:build && pnpm --filter @deki-ai/desktop build",
+    "cli:build": "pnpm --filter @deki-ai/cli build",
+    "deki": "pnpm cli:build && node apps/cli/dist/deki.js",
     "package": "pnpm --filter @deki-ai/desktop package",
     "lint": "eslint .",
     "typecheck": "tsc -p tsconfig.json --noEmit",

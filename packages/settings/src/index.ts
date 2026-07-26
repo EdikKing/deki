@@ -47,6 +47,7 @@ const workspaceSchema = z.object({
   contextIgnore: z.array(z.string().max(500)).max(500),
   contextFiles: z.array(z.string().max(500)).max(50),
   detectGit: z.boolean(),
+  gitCheckpointBeforeWrite: z.boolean(),
   loadProjectMemory: z.boolean(),
 }).strict();
 
@@ -176,6 +177,7 @@ export const defaultSettings: DekiSettings = settingsSchema.parse({
     contextIgnore: ["node_modules", ".git", "dist", "out", "release"],
     contextFiles: ["AGENTS.md", "README.md"],
     detectGit: true,
+    gitCheckpointBeforeWrite: true,
     loadProjectMemory: true,
   },
   permissions: {

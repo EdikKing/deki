@@ -42,6 +42,25 @@ importers:
         specifier: 4.4.3
         version: 4.4.3
 
+  apps/cli:
+    dependencies:
+      '@deki-ai/config':
+        specifier: workspace:*
+        version: link:../../packages/config
+      '@deki-ai/git-checkpoint':
+        specifier: workspace:*
+        version: link:../../packages/git-checkpoint
+      '@deki-ai/mcp-manager':
+        specifier: workspace:*
+        version: link:../../packages/mcp-manager
+      '@deki-ai/settings':
+        specifier: workspace:*
+        version: link:../../packages/settings
+    devDependencies:
+      vite:
+        specifier: 7.3.6
+        version: 7.3.6(@types/node@24.13.3)(jiti@2.7.0)(yaml@2.9.0)
+
   apps/desktop:
     dependencies:
       '@deki-ai/agent-runtime':
@@ -50,6 +69,9 @@ importers:
       '@deki-ai/config':
         specifier: workspace:*
         version: link:../../packages/config
+      '@deki-ai/git-checkpoint':
+        specifier: workspace:*
+        version: link:../../packages/git-checkpoint
       '@deki-ai/mcp-manager':
         specifier: workspace:*
         version: link:../../packages/mcp-manager
@@ -117,6 +139,9 @@ importers:
       '@deki-ai/config':
         specifier: workspace:*
         version: link:../config
+      '@deki-ai/git-checkpoint':
+        specifier: workspace:*
+        version: link:../git-checkpoint
       '@deki-ai/mcp-manager':
         specifier: workspace:*
         version: link:../mcp-manager
@@ -153,6 +178,8 @@ importers:
       zod:
         specifier: 4.4.3
         version: 4.4.3
+
+  packages/git-checkpoint: {}
 
   packages/mcp-manager:
     dependencies:
@@ -459,7 +486,7 @@ packages:
     engines: {node: '>=22.12.0'}
 
   '@electron/node-gyp@https://codeload.github.com/electron/node-gyp/tar.gz/06b29aafb7708acef8b3669835c8a7857ebc92d2':
-    resolution: {gitHosted: true, tarball: https://codeload.github.com/electron/node-gyp/tar.gz/06b29aafb7708acef8b3669835c8a7857ebc92d2}
+    resolution: {gitHosted: true, integrity: sha512-MXgzlTDEEndJB3TBbvd5uFQO/8gaINo1Hfen8vef5rq/VHVPeB63uuv/uO5+8GFsAJ/rauu6XB79S6K4+aXc+w==, tarball: https://codeload.github.com/electron/node-gyp/tar.gz/06b29aafb7708acef8b3669835c8a7857ebc92d2}
     version: 10.2.0-electron.1
     engines: {node: '>=12.13.0'}
     hasBin: true

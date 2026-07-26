@@ -3,6 +3,7 @@ import type {
   DekiSettings,
   DataUsage,
   AuditRecordSummary,
+  GitCheckpoint,
   ModelProviderInput,
   McpServerEditor,
   McpToolSummary,
@@ -531,12 +532,49 @@ function AgentSettings({ value, source, zh, update }: SettingsComponentProps) {
 
 function WorkspaceSettings(props: SettingsComponentProps & { hasWorkspace: boolean; onRevoked: () => Promise<void> }) {
   const { zh, value, source, update } = props;
+  const [checkpoints, setCheckpoints] = useState<GitCheckpoint[]>([]);
+  const [checkpointMessage, setCheckpointMessage] = useState<string>();
+  const [checkpointDiff, setCheckpointDiff] = useState<string>();
+  const refreshCheckpoints = async () => {
+    if (props.hasWorkspace) setCheckpoints(await window.deki.listGitCheckpoints());
+  };
+  useEffect(() => {
+    void refreshCheckpoints();
+  }, [props.hasWorkspace]);
   return <>
     {!props.hasWorkspace && <p className="settings-warning">{zh ? "普通会话未关联项目；项目设置需要先选择并信任工作区。" : "General chat has no project. Select and trust a workspace for project settings."}</p>}
     <Setting title={zh ? "上下文忽略规则" : "Context ignore rules"} description={zh ? "每行一个目录或相对路径。" : "One directory or relative path per line."} source={source("workspace.contextIgnore")}><textarea value={value.workspace.contextIgnore.join("\n")} onChange={(event) => void update({ workspace: { contextIgnore: event.target.value.split("\n").map((item) => item.trim()).filter(Boolean) } })} /></Setting>
     <Setting title={zh ? "项目说明文件" : "Project context files"} description={zh ? "每行一个工作区内相对路径。" : "One workspace-relative path per line."} source={source("workspace.contextFiles")}><textarea value={value.workspace.contextFiles.join("\n")} onChange={(event) => void update({ workspace: { contextFiles: event.target.value.split("\n").map((item) => item.trim()).filter(Boolean) } })} /></Setting>
     <Toggle title={zh ? "检测 Git 工作区" : "Detect Git workspace"} path="workspace.detectGit" checked={value.workspace.detectGit} source={source} onChange={(detectGit) => update({ workspace: { detectGit } })} />
+    <Toggle title={zh ? "修改前自动创建 Git Checkpoint" : "Create a Git Checkpoint before changes"} description={zh ? "使用独立临时 index 保存到 refs/deki/checkpoints，不改变当前分支、HEAD 或暂存区。" : "Uses an isolated temporary index and refs/deki/checkpoints without changing the current branch, HEAD, or staging area."} path="workspace.gitCheckpointBeforeWrite" checked={value.workspace.gitCheckpointBeforeWrite} source={source} onChange={(gitCheckpointBeforeWrite) => update({ workspace: { gitCheckpointBeforeWrite } })} />
     <Toggle title={zh ? "加载项目记忆" : "Load project memory"} path="workspace.loadProjectMemory" checked={value.workspace.loadProjectMemory} source={source} onChange={(loadProjectMemory) => update({ workspace: { loadProjectMemory } })} />
+    {props.hasWorkspace && <div className="settings-subsection">
+      <div className="subsection-heading">
+        <div><h2>Git Checkpoints</h2><p>{zh ? "恢复前会再创建一个安全 Checkpoint，且不会删除现有未跟踪文件。" : "Restore creates a safety checkpoint first and never deletes existing untracked files."}</p></div>
+        <div className="button-group">
+          <button className="ghost small-action" onClick={() => void refreshCheckpoints()}>{zh ? "刷新" : "Refresh"}</button>
+          <button className="primary small-action" onClick={async () => {
+            const result = await window.deki.createGitCheckpoint(zh ? "手动 Checkpoint" : "Manual checkpoint");
+            setCheckpointMessage(result.ok ? (zh ? "Checkpoint 已创建" : "Checkpoint created") : result.error);
+            await refreshCheckpoints();
+          }}>{zh ? "立即创建" : "Create now"}</button>
+        </div>
+      </div>
+      {checkpointMessage && <p className="muted">{checkpointMessage}</p>}
+      {checkpoints.length === 0 && <p className="muted">{zh ? "暂无 Checkpoint，或当前项目不是 Git 仓库。" : "No checkpoints, or this project is not a Git repository."}</p>}
+      {checkpoints.slice(0, 20).map((checkpoint) => <div className="provider-card" key={checkpoint.id}>
+        <div><strong>{checkpoint.message}</strong><small>{checkpoint.id} · {new Date(checkpoint.createdAt).toLocaleString()}</small></div>
+        <div className="button-group">
+          <button className="ghost small-action" onClick={async () => setCheckpointDiff(await window.deki.previewGitCheckpoint(checkpoint.id))}>{zh ? "查看差异" : "Preview diff"}</button>
+          <button className="danger small-action" onClick={async () => {
+            const result = await window.deki.restoreGitCheckpoint(checkpoint.id);
+            setCheckpointMessage(result.ok ? (zh ? "已恢复；恢复前状态也已保存" : "Restored; the previous state was saved") : result.error);
+            await refreshCheckpoints();
+          }}>{zh ? "恢复" : "Restore"}</button>
+        </div>
+      </div>)}
+      {checkpointDiff !== undefined && <><div className="editor-actions"><button className="ghost small-action" onClick={() => setCheckpointDiff(undefined)}>{zh ? "关闭差异" : "Close diff"}</button></div><pre className="checkpoint-diff">{checkpointDiff || (zh ? "没有差异" : "No differences")}</pre></>}
+    </div>}
     {props.hasWorkspace && <Setting title={zh ? "撤销当前工作区信任" : "Revoke workspace trust"} description={zh ? "会立即停止 MCP、卸载项目 Skill 并关闭项目 Runtime。" : "Immediately stops MCP, unloads project skills, and closes the project runtime."} source="local"><button className="danger" onClick={() => void props.onRevoked()}>{zh ? "撤销信任" : "Revoke trust"}</button></Setting>}
   </>;
 }

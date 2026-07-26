@@ -6,6 +6,9 @@ import {
   commandResultSchema,
   clearDataInputSchema,
   dataUsageSchema,
+  gitCheckpointCreateInputSchema,
+  gitCheckpointIdInputSchema,
+  gitCheckpointSchema,
   IPC_CHANNELS,
   memoryRecordSchema,
   memoryMutationSchema,
@@ -288,6 +291,33 @@ const api: DekiDesktopApi = {
   async listAuditRecords() {
     return auditRecordSummarySchema.array().parse(
       await ipcRenderer.invoke(IPC_CHANNELS.listAuditRecords),
+    );
+  },
+  async listGitCheckpoints() {
+    return gitCheckpointSchema.array().parse(
+      await ipcRenderer.invoke(IPC_CHANNELS.listGitCheckpoints),
+    );
+  },
+  async createGitCheckpoint(message) {
+    return commandResultSchema.parse(
+      await ipcRenderer.invoke(
+        IPC_CHANNELS.createGitCheckpoint,
+        gitCheckpointCreateInputSchema.parse({ ...(message ? { message } : {}) }),
+      ),
+    );
+  },
+  async previewGitCheckpoint(id) {
+    return String(await ipcRenderer.invoke(
+      IPC_CHANNELS.previewGitCheckpoint,
+      gitCheckpointIdInputSchema.parse({ id }),
+    ));
+  },
+  async restoreGitCheckpoint(id) {
+    return commandResultSchema.parse(
+      await ipcRenderer.invoke(
+        IPC_CHANNELS.restoreGitCheckpoint,
+        gitCheckpointIdInputSchema.parse({ id }),
+      ),
     );
   },
   async factoryReset() {

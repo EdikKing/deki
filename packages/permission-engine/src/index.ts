@@ -316,15 +316,23 @@ export class WorkspaceToolsProvider implements CapabilityProvider {
   readonly #permissions: PermissionEngine;
   readonly #outputLimitBytes: number;
   readonly #ignore: string[];
+  readonly #beforeMutation:
+    | ((operation: "edit" | "write" | "delete" | "move" | "bash", context: ToolCallContext) => Promise<void>)
+    | undefined;
 
   constructor(
     permissions: PermissionEngine,
     outputLimitBytes = 1_000_000,
     ignore: string[] = [".git", "node_modules", "dist", "out", "release"],
+    beforeMutation?: (
+      operation: "edit" | "write" | "delete" | "move" | "bash",
+      context: ToolCallContext,
+    ) => Promise<void>,
   ) {
     this.#permissions = permissions;
     this.#outputLimitBytes = outputLimitBytes;
     this.#ignore = ignore;
+    this.#beforeMutation = beforeMutation;
   }
 
   async listTools(): Promise<ToolDefinition[]> {
@@ -516,6 +524,7 @@ export class WorkspaceToolsProvider implements CapabilityProvider {
       after,
     );
     const path = await this.#permissions.authorizePath(context.callId, "write", requestedPath, diff);
+    await this.#beforeMutation?.("edit", context);
     await writeFile(path, after, "utf8");
     await this.#permissions.recordDiff(context.callId, diff);
     return textResult(diff, this.#outputLimitBytes);
@@ -537,6 +546,7 @@ export class WorkspaceToolsProvider implements CapabilityProvider {
       content,
     );
     const path = await this.#permissions.authorizePath(context.callId, "write", requestedPath, diff);
+    await this.#beforeMutation?.("write", context);
     await mkdir(dirname(path), { recursive: true });
     await writeFile(path, content, "utf8");
     await this.#permissions.recordDiff(context.callId, diff);
@@ -546,6 +556,9 @@ export class WorkspaceToolsProvider implements CapabilityProvider {
   async #bash(params: Record<string, unknown>, context: ToolCallContext): Promise<ToolResult> {
     const command = stringParam(params, "command");
     await this.#permissions.authorizeShell(context.callId, command);
+    if (classifyShell(command) !== "shell.safe") {
+      await this.#beforeMutation?.("bash", context);
+    }
     const before = await snapshotWorkspace(this.#permissions.workspace, this.#ignore);
     try {
       const output = await runShell(command, this.#permissions.workspace, context.signal, this.#outputLimitBytes);
@@ -571,6 +584,7 @@ export class WorkspaceToolsProvider implements CapabilityProvider {
       : [...before.entries()].map(([path, content]) =>
           createUnifiedDiff(relativePathForSnapshot(relativePath, path), content, "")).join("\n");
     const path = await this.#permissions.authorizePath(context.callId, "delete", requestedPath, diff);
+    await this.#beforeMutation?.("delete", context);
     await rm(path, { recursive: true });
     await this.#permissions.recordDiff(context.callId, diff);
     return textResult(diff, this.#outputLimitBytes);
@@ -600,6 +614,7 @@ export class WorkspaceToolsProvider implements CapabilityProvider {
       destinationPath,
       diff,
     );
+    await this.#beforeMutation?.("move", context);
     await mkdir(dirname(authorized.destination), { recursive: true });
     await rename(authorized.source, authorized.destination);
     await this.#permissions.recordDiff(context.callId, diff);

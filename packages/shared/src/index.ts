@@ -48,6 +48,7 @@ const workspaceSettingsSchema = z.object({
   contextIgnore: z.array(z.string()),
   contextFiles: z.array(z.string()),
   detectGit: z.boolean(),
+  gitCheckpointBeforeWrite: z.boolean(),
   loadProjectMemory: z.boolean(),
 }).strict();
 const permissionsSettingsSchema = z.object({
@@ -479,6 +480,20 @@ export const auditRecordSummarySchema = z.object({
   diff: z.string().optional(),
 }).strict();
 export type AuditRecordSummary = z.infer<typeof auditRecordSummarySchema>;
+export const gitCheckpointSchema = z.object({
+  id: z.string(),
+  ref: z.string(),
+  commit: z.string(),
+  createdAt: z.string(),
+  message: z.string(),
+}).strict();
+export type GitCheckpoint = z.infer<typeof gitCheckpointSchema>;
+export const gitCheckpointCreateInputSchema = z.object({
+  message: z.string().trim().min(1).max(200).optional(),
+}).strict();
+export const gitCheckpointIdInputSchema = z.object({
+  id: z.string().trim().min(1).max(160),
+}).strict();
 export const clearDataInputSchema = z.object({
   category: z.enum(["sessions", "memories", "logs"]),
 }).strict();
@@ -535,6 +550,10 @@ export const IPC_CHANNELS = {
   moveMemory: "deki:move-memory",
   getDataUsage: "deki:get-data-usage",
   listAuditRecords: "deki:list-audit-records",
+  listGitCheckpoints: "deki:list-git-checkpoints",
+  createGitCheckpoint: "deki:create-git-checkpoint",
+  previewGitCheckpoint: "deki:preview-git-checkpoint",
+  restoreGitCheckpoint: "deki:restore-git-checkpoint",
   factoryReset: "deki:factory-reset",
   exportData: "deki:export-data",
   importData: "deki:import-data",
@@ -603,6 +622,10 @@ export interface DekiDesktopApi {
   ): Promise<MemoryRecord>;
   getDataUsage(): Promise<DataUsage>;
   listAuditRecords(): Promise<AuditRecordSummary[]>;
+  listGitCheckpoints(): Promise<GitCheckpoint[]>;
+  createGitCheckpoint(message?: string): Promise<CommandResult>;
+  previewGitCheckpoint(id: string): Promise<string>;
+  restoreGitCheckpoint(id: string): Promise<CommandResult>;
   factoryReset(): Promise<CommandResult>;
   exportData(): Promise<CommandResult>;
   importData(): Promise<CommandResult>;

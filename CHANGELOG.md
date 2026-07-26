@@ -6,6 +6,8 @@
 
 ### Added
 
+- 自有 Deki CLI，覆盖启动/恢复、doctor、模型、Skill、MCP、权限、审计和 Git Checkpoint 管理。
+- 基于 `refs/deki/checkpoints/*` 的分支无侵入 Checkpoint、Agent 修改前自动快照、Diff 预览和安全恢复。
 - 阶段 0 Electron + React 桌面 PoC。
 - Pi Agent Runtime、只读 Tool、stdio MCP 与 Skill 加载。
 - 工作区信任、SQLite 项目记忆和跨会话来源展示。

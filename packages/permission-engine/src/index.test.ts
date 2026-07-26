@@ -52,7 +52,15 @@ describe("PermissionEngine", () => {
       model: () => "provider/model",
       emit: (event) => events.push(event.type),
     });
-    const provider = new WorkspaceToolsProvider(engine);
+    const mutations: string[] = [];
+    const provider = new WorkspaceToolsProvider(
+      engine,
+      undefined,
+      undefined,
+      async (operation) => {
+        mutations.push(operation);
+      },
+    );
     const result = await provider.callTool(
       "write",
       { path: "hello.txt", content: "hello\n" },
@@ -62,6 +70,7 @@ describe("PermissionEngine", () => {
     expect(result.content[0]).toMatchObject({ type: "text" });
     expect(events).toContain("diff.available");
     expect(events).toContain("audit.recorded");
+    expect(mutations).toEqual(["write"]);
     const auditFile = join(root, "logs", `audit-${new Date().toISOString().slice(0, 10)}.jsonl`);
     const record = JSON.parse((await readFile(auditFile, "utf8")).trim()) as {
       execution: { status: string; result: { contentItems: number } };
@@ -72,6 +81,33 @@ describe("PermissionEngine", () => {
       result: { isError: false, contentItems: 1 },
     });
     expect(record.diff).toContain("+++ b/hello.txt");
+  });
+
+  it("does not checkpoint a known read-only shell command", async () => {
+    const root = await mkdtemp(join(tmpdir(), "deki-shell-readonly-"));
+    const engine = new PermissionEngine({
+      workspace: root,
+      logsRoot: join(root, "logs"),
+      settings: defaultSettings,
+      sessionId: () => "session",
+      model: () => "provider/model",
+      emit: () => {},
+    });
+    const mutations: string[] = [];
+    const provider = new WorkspaceToolsProvider(
+      engine,
+      undefined,
+      undefined,
+      async (operation) => {
+        mutations.push(operation);
+      },
+    );
+    await provider.callTool(
+      "bash",
+      { command: "pwd" },
+      { callId: "bash-readonly", workspace: root },
+    );
+    expect(mutations).toEqual([]);
   });
 
   it("audits an execution failure after permission was granted", async () => {

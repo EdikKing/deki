@@ -1,0 +1,23 @@
+{
+  "name": "@deki-ai/cli",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "license": "AGPL-3.0-or-later",
+  "bin": {
+    "deki": "./dist/deki.js"
+  },
+  "scripts": {
+    "build": "vite build",
+    "start": "node dist/deki.js"
+  },
+  "dependencies": {
+    "@deki-ai/config": "workspace:*",
+    "@deki-ai/git-checkpoint": "workspace:*",
+    "@deki-ai/mcp-manager": "workspace:*",
+    "@deki-ai/settings": "workspace:*"
+  },
+  "devDependencies": {
+    "vite": "7.3.6"
+  }
+}

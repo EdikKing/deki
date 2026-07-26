@@ -10,11 +10,12 @@
   "scripts": {
     "dev": "electron-vite dev",
     "build": "pnpm --dir ../.. license:generate && electron-vite build",
-    "package": "pnpm build && electron-builder --dir"
+    "package": "pnpm --dir ../.. cli:build && pnpm build && electron-builder --dir"
   },
   "dependencies": {
     "@deki-ai/agent-runtime": "workspace:*",
     "@deki-ai/config": "workspace:*",
+    "@deki-ai/git-checkpoint": "workspace:*",
     "@deki-ai/mcp-manager": "workspace:*",
     "@deki-ai/memory-engine": "workspace:*",
     "@deki-ai/permission-engine": "workspace:*",
@@ -52,6 +53,10 @@
       {
         "from": "resources/THIRD_PARTY_LICENSES.md",
         "to": "THIRD_PARTY_LICENSES.md"
+      },
+      {
+        "from": "../cli/dist/deki.js",
+        "to": "cli/deki.js"
       }
     ],
     "asar": true,

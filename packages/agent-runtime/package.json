@@ -6,6 +6,7 @@
   "exports": "./src/index.ts",
   "dependencies": {
     "@deki-ai/config": "workspace:*",
+    "@deki-ai/git-checkpoint": "workspace:*",
     "@deki-ai/mcp-manager": "workspace:*",
     "@deki-ai/memory-engine": "workspace:*",
     "@deki-ai/permission-engine": "workspace:*",

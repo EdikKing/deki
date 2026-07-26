@@ -35,6 +35,13 @@ pnpm package
 
 `pnpm package` 只生成当前平台未签名目录包到 `release/`，阶段 0 不生成正式安装器。
 
+`pnpm build` 同时构建 CLI 和 Electron。CLI 也可单独构建并运行：
+
+```bash
+pnpm cli:build
+node apps/cli/dist/deki.js --help
+```
+
 ## MCP Fixture
 
 `tests/fixtures/mcp-server.mjs` 只用于自动化测试，提供 `echo`、`fail` 和 `slow`。产品不会自动发现或安装该 Server。

@@ -48,6 +48,13 @@ period. Approval choices are one-time, session, project-local, or deny.
 Approval timeout is equivalent to deny. There is no `sandbox` policy value;
 legacy values migrate to `ask`.
 
+Trusted Git projects create a checkpoint after permission is granted and before
+the real mutation performed by each edit, write, delete, move, or potentially
+mutating shell Tool. Checkpoints use an isolated temporary index and live under
+`refs/deki/checkpoints/*`; they never move HEAD or change the user's branch or
+staging area. Automatic creation is enabled by default and can be overridden
+per project. Restore always creates a safety checkpoint first.
+
 Shell commands with explicit outside-workspace paths, sensitive paths, nested
 shells, inline interpreters, command substitution, or dynamic evaluation are
 denied before execution. Approved Shell commands snapshot workspace text files

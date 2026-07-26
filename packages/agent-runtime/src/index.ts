@@ -15,6 +15,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { loadMcpConfig, type DekiPaths } from "@deki-ai/config";
+import { GitCheckpointManager } from "@deki-ai/git-checkpoint";
 import { McpManager } from "@deki-ai/mcp-manager";
 import { MemoryEngine } from "@deki-ai/memory-engine";
 import {
@@ -51,6 +52,7 @@ export interface DekiAgentRuntimeOptions {
     grantKey?: string,
   ) => Promise<void>;
   onEvent: (event: AgentEvent) => void;
+  resumeLatest?: boolean;
 }
 
 export interface RuntimeSnapshot {
@@ -99,6 +101,7 @@ export class DekiAgentRuntime {
   #streaming = false;
   #permissions: PermissionEngine | undefined;
   #lastPrompt: string | undefined;
+  #checkpointManager: GitCheckpointManager | undefined;
 
   constructor(options: DekiAgentRuntimeOptions) {
     this.#options = options;
@@ -119,10 +122,34 @@ export class DekiAgentRuntime {
           ? { persistProjectGrant: this.#options.persistProjectGrant }
           : {}),
       });
+      if (
+        this.#options.settings.workspace.detectGit
+        && this.#options.settings.workspace.gitCheckpointBeforeWrite
+      ) {
+        const manager = new GitCheckpointManager(this.#options.workspace);
+        if (await manager.repositoryRoot()) {
+          this.#checkpointManager = manager;
+          this.#addDiagnostic("已启用修改前 Git Checkpoint");
+        }
+      }
       await this.#gateway.register(new WorkspaceToolsProvider(
         this.#permissions,
         this.#options.settings.advanced.toolOutputLimitBytes,
         this.#options.settings.workspace.contextIgnore,
+        this.#checkpointManager
+          ? async (operation) => {
+              const checkpoint = await this.#checkpointManager?.create(
+                `Before agent ${operation}`,
+              );
+              if (checkpoint) {
+                this.#emit({
+                  type: "diagnostic",
+                  level: "info",
+                  message: `已创建 Git Checkpoint: ${checkpoint.id}`,
+                });
+              }
+            }
+          : undefined,
       ));
 
       this.#recalledMemories = this.#options.settings.memory.projectMemoryEnabled
@@ -596,8 +623,11 @@ export class DekiAgentRuntime {
       this.#options.paths.sessionsRoot,
       this.#options.scopeId,
     );
-    const restoreRecent = this.#options.settings.general.restoreSession
-      && this.#options.settings.general.startupMode === "last-session";
+    const restoreRecent = this.#options.resumeLatest === true
+      || (
+        this.#options.settings.general.restoreSession
+        && this.#options.settings.general.startupMode === "last-session"
+      );
     this.#runtime = await createAgentSessionRuntime(createRuntime, {
       cwd: this.#options.workspace,
       agentDir: this.#options.paths.root,

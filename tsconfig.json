@@ -20,6 +20,7 @@
       "@deki-ai/tool-gateway": ["./packages/tool-gateway/src/index.ts"],
       "@deki-ai/mcp-manager": ["./packages/mcp-manager/src/index.ts"],
       "@deki-ai/memory-engine": ["./packages/memory-engine/src/index.ts"],
+      "@deki-ai/git-checkpoint": ["./packages/git-checkpoint/src/index.ts"],
       "@deki-ai/settings": ["./packages/settings/src/index.ts"],
       "@deki-ai/permission-engine": ["./packages/permission-engine/src/index.ts"],
       "@deki-ai/agent-runtime": ["./packages/agent-runtime/src/index.ts"]

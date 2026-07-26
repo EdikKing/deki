@@ -1,7 +1,9 @@
+import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { promisify } from "node:util";
 import {
   _electron as electron,
   expect,
@@ -11,6 +13,7 @@ import {
 
 const require = createRequire(import.meta.url);
 const electronPath = require("electron") as string;
+const execFileAsync = promisify(execFile);
 
 // Playwright requires an object-destructured fixtures parameter.
 // eslint-disable-next-line no-empty-pattern
@@ -131,6 +134,50 @@ test("trusts a workspace, streams fixture events, and recalls memory", async ({}
   } finally {
     await electronApp?.close();
     await rm(temporaryHome, { recursive: true, force: true });
+  }
+});
+
+// Playwright requires an object-destructured fixtures parameter.
+// eslint-disable-next-line no-empty-pattern
+test("creates and previews a branch-neutral Git checkpoint", async ({}) => {
+  const temporaryHome = await mkdtemp(resolve(tmpdir(), "deki-electron-checkpoint-home-"));
+  const workspace = await mkdtemp(resolve(tmpdir(), "deki-electron-checkpoint-workspace-"));
+  await seedChineseSettings(temporaryHome);
+  await execFileAsync("git", ["init"], { cwd: workspace });
+  await writeFile(join(workspace, "example.txt"), "before\n", "utf8");
+  await execFileAsync("git", ["add", "example.txt"], { cwd: workspace });
+  await execFileAsync("git", [
+    "-c", "user.name=Deki Test",
+    "-c", "user.email=test@deki.local",
+    "commit", "-m", "initial",
+  ], { cwd: workspace });
+  const initialHead = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: workspace })).stdout;
+  const electronApp = await electron.launch({
+    executablePath: electronPath,
+    args: [resolve("apps/desktop"), "--lang=zh-CN", "--workspace", workspace],
+    env: createTestEnvironment(temporaryHome),
+  });
+
+  try {
+    const window = await electronApp.firstWindow();
+    await window.getByRole("button", { name: /信任并继续|Trust and continue/ }).click();
+    await window.getByTestId("open-settings").click();
+    await window.getByTestId("settings-section-workspace").click();
+    await window.getByRole("button", { name: "立即创建" }).click();
+    await expect(window.getByText("Checkpoint 已创建")).toBeVisible();
+    await expect(window.locator(".provider-card", { hasText: "手动 Checkpoint" })).toHaveCount(1);
+
+    await writeFile(join(workspace, "example.txt"), "after\n", "utf8");
+    await window.getByRole("button", { name: "查看差异" }).click();
+    await expect(window.locator(".checkpoint-diff")).toContainText("+after");
+    expect((await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: workspace })).stdout)
+      .toBe(initialHead);
+    expect((await execFileAsync("git", ["diff", "--cached"], { cwd: workspace })).stdout)
+      .toBe("");
+  } finally {
+    await electronApp.close();
+    await rm(temporaryHome, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
   }
 });
 

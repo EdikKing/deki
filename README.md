@@ -19,6 +19,8 @@
 - 内置常用云模型 Provider 与自定义 OpenAI 兼容 Provider
 - 全局、项目共享、项目本机和会话设置、字段来源及修订冲突保护
 - 受权限网关保护的文件修改、Shell、MCP、完整 Diff Viewer、历史审计与脱敏诊断
+- 自有 `deki` CLI：启动/恢复、doctor、模型、Skill、MCP、权限、审计与 Checkpoint 管理
+- 修改前 Git Checkpoint：不移动 HEAD、不改变当前分支或暂存区，可预览并安全恢复
 
 当前版本不支持真实 Sandbox、本地模型、HTTP/OAuth MCP、内置 MCP Server 或自动更新下载。
 
@@ -36,6 +38,19 @@ pnpm install
 export OPENAI_API_KEY="..."
 pnpm dev
 ```
+
+CLI 在仓库中可通过以下方式使用：
+
+```bash
+pnpm deki -- --help
+pnpm deki -- doctor --workspace .
+pnpm deki -- checkpoint create --workspace . --message "before refactor"
+pnpm deki -- checkpoint list --workspace .
+```
+
+构建后的入口为 `apps/cli/dist/deki.js`。`deki [path]` 启动项目桌面会话，
+`deki resume [path]` 强制恢复该作用域最近一次会话；`--general` 启动普通会话。
+完整命令见 [CLI 文档](docs/cli.md)。
 
 Deki 不会读取 `~/.pi/agent/auth.json`。常用云模型只需在设置中填写对应 API Key；
 也可以配置自定义 OpenAI 兼容 Provider，或从启动 Deki 的终端进程传入 Pi 支持的模型环境变量。

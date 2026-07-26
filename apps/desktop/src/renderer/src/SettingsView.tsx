@@ -11,6 +11,12 @@ import type {
   SettingsScope,
   SettingsSnapshot,
 } from "@deki-ai/shared";
+import {
+  builtinModelProviders,
+  builtinProviderInput,
+  isBuiltinModelProvider,
+  type BuiltinModelProvider,
+} from "./builtinModelProviders";
 
 type Locale = "zh-CN" | "en-US";
 type SectionId =
@@ -271,6 +277,7 @@ function ModelSettings(props: SettingsComponentProps & {
   setError: (error: string | undefined) => void;
 }) {
   const { value, source, zh, update } = props;
+  const customProviders = props.providers.filter((provider) => !isBuiltinModelProvider(provider.id));
   const modelOptions = props.providers.flatMap((provider) => provider.models.map((model) => ({
     value: `${provider.id}/${model.id}`,
     label: `${model.name ?? model.id} · ${provider.name ?? provider.id}`,
@@ -282,9 +289,35 @@ function ModelSettings(props: SettingsComponentProps & {
     <Range title={zh ? "请求超时（秒）" : "Request timeout (seconds)"} path="models.timeoutMs" value={Math.round(value.models.timeoutMs / 1000)} min={1} max={600} source={source} onChange={(seconds) => update({ models: { timeoutMs: seconds * 1000 } })} />
     <Range title={zh ? "重试次数" : "Retries"} path="models.maxRetries" value={value.models.maxRetries} min={0} max={10} source={source} onChange={(maxRetries) => update({ models: { maxRetries } })} />
     <div className="settings-subsection">
-      <div className="subsection-heading"><div><h2>{zh ? "云模型提供方" : "Cloud providers"}</h2><p>{zh ? "API Key 明文保存在本机 0600 文件中，永不返回界面。" : "API keys are stored locally in a 0600 file and never returned to the UI."}</p></div><button className="primary small-action" onClick={() => props.setEditing(emptyProvider())}>{zh ? "添加" : "Add"}</button></div>
-      {props.providers.length === 0 && <p className="muted">{zh ? "尚未添加自定义 Provider。环境变量中的 Provider 仍可使用。" : "No custom provider yet. Environment providers remain available."}</p>}
-      {props.providers.map((provider) => (
+      <div className="subsection-heading"><div><h2>{zh ? "内置模型服务商" : "Built-in model providers"}</h2><p>{zh ? "地址、协议和模型列表已经配置好，只需填写对应的 API Key。" : "Endpoints, protocols, and model catalogs are configured. Only an API key is required."}</p></div></div>
+      <div className="builtin-provider-list">
+        {builtinModelProviders.map((definition) => (
+          <BuiltinProviderCard
+            key={definition.id}
+            definition={definition}
+            provider={props.providers.find((provider) => provider.id === definition.id)}
+            zh={zh}
+            onChanged={props.refreshProviders}
+            setError={props.setError}
+          />
+        ))}
+      </div>
+      <p className="provider-security-note">
+        {zh
+          ? "API Key 明文保存在本机权限为 0600 的配置文件中；界面、日志和导出只显示配置状态，不会回显密钥。"
+          : "API keys are stored in a local 0600 file. The UI, logs, and exports only expose configuration status, never the key."}
+      </p>
+    </div>
+    <div className="settings-subsection custom-provider-section">
+      <div className="subsection-heading">
+        <div>
+          <h2>{zh ? "自定义模型" : "Custom model"}</h2>
+          <p>{zh ? "用于其他 OpenAI、Anthropic 或兼容 API；可配置一个自定义服务商。" : "For another OpenAI, Anthropic, or compatible API. One custom provider can be configured."}</p>
+        </div>
+        {customProviders.length === 0 && !props.editing && <button className="primary small-action" onClick={() => props.setEditing(emptyProvider())}>{zh ? "添加自定义模型" : "Add custom model"}</button>}
+      </div>
+      {customProviders.length === 0 && !props.editing && <div className="custom-provider-empty">{zh ? "未配置自定义模型" : "No custom model configured"}</div>}
+      {customProviders.map((provider) => (
         <div className="provider-card" key={provider.id}>
           <div><strong>{provider.name ?? provider.id}</strong><small>{provider.baseUrl ?? "Default API"} · {provider.models.length} models · {provider.hasApiKey ? "Key ••••••••" : "No key"}</small></div>
           <div><button className="ghost small-action" onClick={() => props.setEditing(toProviderInput(provider))}>{zh ? "编辑" : "Edit"}</button><button className="danger small-action" onClick={async () => { const result = await window.deki.removeModelProvider(provider.id); if (!result.ok) props.setError(result.error); else await props.refreshProviders(); }}>{zh ? "删除" : "Delete"}</button></div>
@@ -295,11 +328,96 @@ function ModelSettings(props: SettingsComponentProps & {
   </>;
 }
 
+function BuiltinProviderCard(props: {
+  definition: BuiltinModelProvider;
+  provider: RedactedModelProvider | undefined;
+  zh: boolean;
+  onChanged: () => Promise<void>;
+  setError: (value: string | undefined) => void;
+}) {
+  const [apiKey, setApiKey] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const configured = props.provider?.hasApiKey ?? false;
+  const modelNames = props.definition.config.models.map((model) => model.name ?? model.id).join(" · ");
+
+  const updateKey = async (action: ModelProviderInput["apiKey"]) => {
+    setBusy(true);
+    setSaved(false);
+    props.setError(undefined);
+    try {
+      const result = await window.deki.upsertModelProvider(
+        builtinProviderInput(props.definition, action),
+      );
+      if (!result.ok) {
+        props.setError(result.error);
+        return;
+      }
+      setApiKey("");
+      setSaved(action.action === "set");
+      await props.onChanged();
+    } catch (reason) {
+      props.setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return <article className={`builtin-provider-card${configured ? " configured" : ""}`} data-provider-id={props.definition.id}>
+    <div className="provider-identity">
+      <span className="provider-logo" aria-hidden="true">{props.definition.shortName}</span>
+      <div>
+        <div className="provider-title">
+          <strong>{props.definition.name}</strong>
+          <span className={`provider-status ${configured ? "configured" : ""}`}>
+            {configured ? (props.zh ? "已配置" : "Configured") : (props.zh ? "未配置" : "Not configured")}
+          </span>
+        </div>
+        <p>{props.zh ? props.definition.description.zh : props.definition.description.en}</p>
+        <small title={modelNames}>{modelNames}</small>
+      </div>
+    </div>
+    <div className="provider-key-control">
+      <input
+        type="password"
+        value={apiKey}
+        autoComplete="new-password"
+        placeholder={configured
+          ? (props.zh ? "输入新 Key 以替换" : "Enter a new key to replace")
+          : (props.zh ? "填写 API Key" : "Enter API key")}
+        aria-label={`${props.definition.name} API Key`}
+        onChange={(event) => {
+          setApiKey(event.target.value);
+          setSaved(false);
+        }}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" && apiKey.trim() && !busy) {
+            void updateKey({ action: "set", value: apiKey.trim() });
+          }
+        }}
+      />
+      <button
+        className="primary small-action"
+        disabled={!apiKey.trim() || busy}
+        onClick={() => void updateKey({ action: "set", value: apiKey.trim() })}
+      >
+        {busy ? (props.zh ? "保存中…" : "Saving…") : (props.zh ? "保存" : "Save")}
+      </button>
+      {configured && <button className="ghost small-action" disabled={busy} onClick={() => void updateKey({ action: "clear" })}>{props.zh ? "清除" : "Clear"}</button>}
+      {saved && <span className="key-saved">{props.zh ? "已保存" : "Saved"}</span>}
+    </div>
+  </article>;
+}
+
 function ProviderEditor(props: { provider: ModelProviderInput; zh: boolean; onChange: (value: ModelProviderInput) => void; onCancel: () => void; onDone: () => Promise<void>; setError: (value: string | undefined) => void }) {
   const provider = props.provider;
   const firstModel = provider.models[0]!;
   const set = (patch: Partial<ModelProviderInput>) => props.onChange({ ...provider, ...patch });
   const run = async (kind: "save" | "test") => {
+    if (isBuiltinModelProvider(provider.id)) {
+      props.setError(props.zh ? "自定义模型 ID 不能与内置服务商重复" : "The custom model ID cannot match a built-in provider");
+      return;
+    }
     const result = kind === "save" ? await window.deki.upsertModelProvider(provider) : await window.deki.testModelProvider(provider);
     if (!result.ok) props.setError(result.error ?? "Operation failed");
     else if (kind === "save") await props.onDone();

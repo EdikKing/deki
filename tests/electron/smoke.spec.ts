@@ -40,6 +40,12 @@ test("starts a general chat without a workspace", async ({}, testInfo) => {
     await window.getByTestId("settings-section-appearance").click();
     await window.locator(".setting-row").filter({ has: window.locator("select option[value=light]") }).getByRole("combobox").selectOption("light");
     await expect(window.locator("html")).toHaveAttribute("data-theme", "light");
+    await window.getByTestId("settings-section-models").click();
+    await expect(window.locator(".builtin-provider-card")).toHaveCount(8);
+    await expect(window.locator(".builtin-provider-card").first()).toHaveAttribute("data-provider-id", "openai");
+    await expect(window.locator(".builtin-provider-card").last()).toHaveAttribute("data-provider-id", "openrouter");
+    await expect(window.getByRole("heading", { name: "自定义模型" })).toBeVisible();
+    await expect(window.locator(".builtin-provider-card input[type=password]")).toHaveCount(8);
     await window.screenshot({
       path: testInfo.outputPath("deki-empty-workspace.png"),
       fullPage: true,

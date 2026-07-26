@@ -1,0 +1,11 @@
+{
+  "name": "@deki-ai/permission-engine",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "@deki-ai/settings": "workspace:*",
+    "@deki-ai/shared": "workspace:*"
+  }
+}

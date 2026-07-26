@@ -1,0 +1,35 @@
+{
+  "name": "deki",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "license": "AGPL-3.0-or-later",
+  "packageManager": "pnpm@11.4.0",
+  "engines": {
+    "node": ">=22.19.0 <23",
+    "pnpm": "11.4.0"
+  },
+  "scripts": {
+    "dev": "pnpm --filter @deki-ai/desktop dev",
+    "build": "pnpm --filter @deki-ai/desktop build",
+    "package": "pnpm --filter @deki-ai/desktop package",
+    "lint": "eslint .",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:electron": "pnpm build && playwright test --config playwright.config.ts"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "@playwright/test": "1.62.0",
+    "@types/node": "22.19.15",
+    "electron": "43.2.0",
+    "eslint": "10.0.1",
+    "globals": "16.5.0",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.65.0",
+    "vitest": "4.1.10",
+    "zod": "4.4.3"
+  }
+}

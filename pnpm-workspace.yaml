@@ -1,0 +1,18 @@
+packages:
+  - apps/*
+  - packages/*
+
+blockExoticSubdeps: false
+
+allowBuilds:
+  '@google/genai': false
+  electron: true
+  electron-winstaller: true
+  esbuild: true
+  protobufjs: false
+
+minimumReleaseAgeExclude:
+  - '@earendil-works/pi-agent-core@0.82.1'
+  - '@earendil-works/pi-ai@0.82.1'
+  - '@earendil-works/pi-coding-agent@0.82.1'
+  - '@earendil-works/pi-tui@0.82.1'

@@ -1,0 +1,11 @@
+{
+  "name": "@deki-ai/tool-gateway",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "@deki-ai/shared": "workspace:*",
+    "ajv": "8.17.1"
+  }
+}

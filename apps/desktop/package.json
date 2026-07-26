@@ -9,7 +9,7 @@
   "license": "AGPL-3.0-or-later",
   "scripts": {
     "dev": "electron-vite dev",
-    "build": "pnpm --dir ../.. license:generate && electron-vite build",
+    "build": "pnpm --dir ../.. license:generate && electron-vite build && node ../../scripts/verify-desktop-bundle.mjs",
     "package": "pnpm --dir ../.. cli:build && pnpm build && electron-builder --dir"
   },
   "dependencies": {

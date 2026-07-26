@@ -1280,20 +1280,24 @@ html[data-density="compact"] .setting-row { min-height: 58px; padding-block: 9px
   flex-wrap: wrap;
 }
 
-html[data-theme="light"] { color-scheme: light; color: #16213a; background: #f3f6fb; }
+html[data-theme="light"] { color-scheme: light; color: var(--text-primary); background: var(--bg-app); }
 html[data-theme="light"] body,
 html[data-theme="light"] .settings-page,
-html[data-theme="light"] .settings-content { color: #16213a; background: #f3f6fb; }
+html[data-theme="light"] .settings-content { color: var(--text-primary); background: var(--bg-app); }
 html[data-theme="light"] .settings-nav,
-html[data-theme="light"] .navigation-sidebar,
+html[data-theme="light"] .navigation-sidebar {
+  color: var(--text-primary);
+  border-color: var(--border);
+  background: var(--bg-surface);
+}
 html[data-theme="light"] .topbar,
 html[data-theme="light"] .settings-footer {
-  color: #16213a;
-  border-color: #dbe2ee;
-  background: #f9fbfe;
+  color: var(--text-primary);
+  border-color: var(--border);
+  background: var(--bg-elevated);
 }
 html[data-theme="light"] .setting-row,
-html[data-theme="light"] .settings-toolbar { border-color: #dde4ef; }
+html[data-theme="light"] .settings-toolbar { border-color: var(--border); }
 html[data-theme="light"] input,
 html[data-theme="light"] textarea,
 html[data-theme="light"] select,
@@ -1304,9 +1308,9 @@ html[data-theme="light"] .provider-card,
 html[data-theme="light"] .builtin-provider-card,
 html[data-theme="light"] .provider-editor,
 html[data-theme="light"] .range-control output {
-  color: #17233d;
-  border-color: #ccd6e6;
-  background: white;
+  color: var(--text-primary);
+  border-color: var(--border-strong);
+  background: var(--bg-elevated);
 }
 html[data-high-contrast="true"] * { border-color: currentColor; }
 
@@ -1322,38 +1326,42 @@ html[data-high-contrast="true"] * { border-color: currentColor; }
 
 /* Unified theme tokens and interaction layers */
 :root {
-  --bg-app: #080d19;
-  --bg-surface: #0d1423;
-  --bg-elevated: #101827;
-  --bg-input: #10192a;
-  --bg-inspector: #0a101d;
-  --bg-code: #080f1d;
-  --bg-hover: #202b44;
-  --bg-active: #1b2740;
-  --text-primary: #e7edf8;
-  --text-secondary: #a8b6ce;
-  --text-muted: #71819d;
-  --border: #202b42;
-  --border-strong: #2b3a58;
-  --shadow: rgba(0, 0, 0, 0.45);
+  --bg-app: #111216;
+  --bg-surface: #17191e;
+  --bg-elevated: #1c1f25;
+  --bg-input: #1b1e24;
+  --bg-inspector: #15171b;
+  --bg-code: #0d0f12;
+  --bg-hover: #22252b;
+  --bg-active: #282c34;
+  --text-primary: #f1f3f5;
+  --text-secondary: #b6bbc4;
+  --text-muted: #818893;
+  --border: #2a2e35;
+  --border-strong: #393e47;
+  --control-track: #454a54;
+  --accent-soft: color-mix(in srgb, var(--accent) 16%, transparent);
+  --shadow: rgba(0, 0, 0, 0.38);
   color-scheme: dark;
 }
 
 html[data-theme="light"] {
-  --bg-app: #f3f6fb;
-  --bg-surface: #f9fbfe;
+  --bg-app: #fbfbfc;
+  --bg-surface: #f3f4f6;
   --bg-elevated: #ffffff;
   --bg-input: #ffffff;
-  --bg-inspector: #f7f9fd;
-  --bg-code: #eef2f8;
-  --bg-hover: #e8edf6;
-  --bg-active: #e0e8f5;
-  --text-primary: #16213a;
-  --text-secondary: #40506b;
-  --text-muted: #687792;
-  --border: #dbe2ee;
-  --border-strong: #c8d3e4;
-  --shadow: rgba(25, 40, 70, 0.14);
+  --bg-inspector: #f6f7f8;
+  --bg-code: #f2f3f5;
+  --bg-hover: #e9ebee;
+  --bg-active: #e3e6ea;
+  --text-primary: #20242a;
+  --text-secondary: #515862;
+  --text-muted: #737b86;
+  --border: #dedfe3;
+  --border-strong: #c9ccd2;
+  --control-track: #b7bdc7;
+  --accent-soft: color-mix(in srgb, var(--accent) 11%, transparent);
+  --shadow: rgba(26, 32, 44, 0.12);
 }
 
 html,
@@ -1365,9 +1373,7 @@ body,
 }
 
 body {
-  background:
-    radial-gradient(circle at 15% -20%, color-mix(in srgb, var(--accent) 15%, transparent), transparent 40%),
-    var(--bg-app);
+  background: var(--bg-app);
 }
 
 button,
@@ -1396,6 +1402,43 @@ textarea {
   box-shadow: 0 24px 70px var(--shadow);
 }
 
+.primary,
+.ghost,
+.danger {
+  border: 1px solid transparent;
+}
+
+.primary {
+  color: white;
+  background: var(--accent);
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--accent) 32%, transparent);
+}
+
+.primary:hover {
+  background: color-mix(in srgb, var(--accent) 88%, white);
+}
+
+.ghost {
+  color: var(--text-secondary);
+  border-color: var(--border-strong);
+  background: var(--bg-elevated);
+  box-shadow: 0 1px 1px var(--shadow);
+}
+
+.ghost:hover {
+  color: var(--text-primary);
+  background: var(--bg-hover);
+}
+
+.danger {
+  color: white;
+  background: #b33a52;
+}
+
+.danger:hover {
+  background: #c74760;
+}
+
 .trust-card h1,
 .approval-dialog h2,
 .empty-state h2,
@@ -1421,7 +1464,15 @@ textarea {
 .settings-footer {
   color: var(--text-primary);
   border-color: var(--border);
-  background: color-mix(in srgb, var(--bg-surface) 94%, transparent);
+  background: var(--bg-surface);
+}
+
+.sidebar-brand,
+.sidebar-footer,
+.navigation-heading,
+.settings-toolbar,
+.settings-footer {
+  border-color: var(--border);
 }
 
 .project-item,
@@ -1452,17 +1503,17 @@ textarea {
 .session-item.active,
 .settings-nav nav button.active {
   color: var(--text-primary);
-  border-color: var(--border-strong);
-  background: var(--bg-active);
+  border-color: color-mix(in srgb, var(--accent) 30%, var(--border));
+  background: var(--accent-soft);
 }
 
 .session-row.active,
 .session-actions {
-  background-color: var(--bg-active);
+  background-color: var(--accent-soft);
 }
 
 .session-actions {
-  background-image: linear-gradient(90deg, transparent, var(--bg-active) 25%);
+  background-image: linear-gradient(90deg, transparent, color-mix(in srgb, var(--accent) 12%, var(--bg-surface)) 25%);
 }
 
 .content-grid {
@@ -1500,6 +1551,51 @@ textarea,
   background: var(--bg-input);
 }
 
+select,
+textarea,
+.settings-search,
+.session-search,
+.memory-search,
+.field-grid input,
+.provider-key-control input,
+.setting-control input:not([type="checkbox"]):not([type="range"]),
+.setting-control textarea,
+.setting-control select {
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, white 2%, transparent), 0 1px 2px var(--shadow);
+}
+
+.toggle span {
+  background: var(--control-track);
+}
+
+.toggle input:focus-visible + span {
+  outline: 3px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  outline-offset: 2px;
+}
+
+input[type="range"] {
+  height: 20px;
+  appearance: none;
+  background: transparent;
+}
+
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 99px;
+  background: var(--control-track);
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  width: 14px;
+  height: 14px;
+  margin-top: -5px;
+  appearance: none;
+  border: 2px solid var(--bg-elevated);
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 1px 3px var(--shadow);
+}
+
 .message > span,
 .navigation-heading,
 .project-heading code,
@@ -1510,6 +1606,23 @@ textarea,
 .muted,
 .diagnostic {
   color: var(--text-muted);
+}
+
+.eyebrow {
+  color: color-mix(in srgb, var(--accent) 64%, var(--text-secondary));
+}
+
+.empty-state p {
+  color: var(--text-secondary);
+}
+
+.navigation-empty,
+.session-search,
+.workspace-path,
+.diff-entry,
+.approval-details,
+.approval-diff {
+  border-color: var(--border-strong);
 }
 
 .message.user > div,
@@ -1769,9 +1882,7 @@ textarea,
 
 .settings-content {
   color: var(--text-primary);
-  background:
-    radial-gradient(circle at 90% -10%, color-mix(in srgb, var(--accent) 9%, transparent), transparent 35%),
-    var(--bg-app);
+  background: var(--bg-app);
 }
 
 .settings-section {
@@ -1834,7 +1945,7 @@ textarea,
 
 .settings-tabs button.active {
   color: var(--text-primary);
-  background: var(--bg-active);
+  background: var(--accent-soft);
 }
 
 .memory-center {

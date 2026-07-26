@@ -44,8 +44,9 @@ test("starts a general chat without a workspace", async ({}, testInfo) => {
     await window.getByTestId("settings-section-appearance").click();
     await window.locator(".setting-row").filter({ has: window.locator("select option[value=light]") }).getByRole("combobox").selectOption("light");
     await expect(window.locator("html")).toHaveAttribute("data-theme", "light");
-    await expect(window.locator(".settings-page")).toHaveCSS("color", "rgb(22, 33, 58)");
-    await expect(window.locator(".settings-nav")).toHaveCSS("background-color", "rgb(249, 251, 254)");
+    await expect(window.locator(".settings-page")).toHaveCSS("color", "rgb(32, 36, 42)");
+    await expect(window.locator(".settings-nav")).toHaveCSS("background-color", "rgb(243, 244, 246)");
+    await expect(window.getByRole("button", { name: "恢复本分类" })).toHaveCSS("background-color", "rgb(255, 255, 255)");
     await window.locator(".settings-search").fill("证书");
     await expect(window.getByRole("heading", { name: "高级与诊断" })).toBeVisible();
     await expect(window.getByText("自定义 CA 证书")).toBeVisible();

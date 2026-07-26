@@ -16,6 +16,7 @@ export default defineConfig({
           "@deki-ai/memory-engine",
           "@deki-ai/settings",
           "@deki-ai/permission-engine",
+          "@deki-ai/git-checkpoint",
           "@deki-ai/agent-runtime",
         ],
       }),

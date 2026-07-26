@@ -6,6 +6,7 @@ import {
   readdir,
   readFile,
   realpath,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
@@ -57,6 +58,12 @@ interface PendingApproval {
   timeout: ReturnType<typeof setTimeout>;
 }
 
+interface AuthorizedOperation {
+  request: PermissionRequest;
+  policy: PermissionPolicy;
+  decision: ApprovalDecision;
+}
+
 export class PermissionDeniedError extends Error {
   constructor(message: string) {
     super(message);
@@ -68,9 +75,15 @@ export class PermissionEngine {
   readonly #options: PermissionEngineOptions;
   readonly #pending = new Map<string, PendingApproval>();
   readonly #sessionGrants = new Set<PermissionCategory>();
+  readonly #authorized = new Map<string, AuthorizedOperation>();
+  readonly #cleanupPromise: Promise<void>;
 
   constructor(options: PermissionEngineOptions) {
     this.#options = options;
+    this.#cleanupPromise = cleanupAuditLogs(
+      options.logsRoot,
+      options.settings.permissions.auditRetentionDays,
+    );
   }
 
   get workspace(): string {
@@ -89,10 +102,13 @@ export class PermissionEngine {
       await this.#options.persistProjectGrant?.(request.category);
     }
     if (policy === "deny" || decision === "deny") {
-      await this.#audit(request, policy, decision, "denied");
+      await this.#audit(request, policy, decision, {
+        status: "denied",
+        error: "权限策略拒绝了操作",
+      });
       throw new PermissionDeniedError(`权限策略拒绝了操作：${request.title}`);
     }
-    await this.#audit(request, policy, decision, "allowed");
+    this.#authorized.set(request.callId, { request, policy, decision });
   }
 
   async authorizePath(
@@ -162,6 +178,24 @@ export class PermissionEngine {
     this.#emit({ type: "diff.available", callId, diff });
   }
 
+  async recordExecution(
+    callId: string,
+    status: "succeeded" | "failed",
+    detail?: unknown,
+  ): Promise<void> {
+    const authorized = this.#authorized.get(callId);
+    if (!authorized) return;
+    this.#authorized.delete(callId);
+    await this.#audit(
+      authorized.request,
+      authorized.policy,
+      authorized.decision,
+      status === "succeeded"
+        ? { status, result: detail }
+        : { status, error: detail instanceof Error ? detail.message : String(detail) },
+    );
+  }
+
   async #ask(request: PermissionRequest): Promise<ApprovalDecision> {
     const requestId = randomUUID();
     const expiresAt = new Date(
@@ -196,8 +230,13 @@ export class PermissionEngine {
     request: PermissionRequest,
     policy: PermissionPolicy,
     decision: ApprovalDecision,
-    result: "allowed" | "denied",
+    execution: {
+      status: "denied" | "succeeded" | "failed";
+      result?: unknown;
+      error?: string;
+    },
   ): Promise<void> {
+    await this.#cleanupPromise;
     const recordId = randomUUID();
     const day = new Date().toISOString().slice(0, 10);
     const record = {
@@ -210,7 +249,7 @@ export class PermissionEngine {
       category: request.category,
       policy,
       decision,
-      result,
+      execution: redactValue(execution),
       details: redactValue(request.details),
       ...(request.diff ? { diff: redactText(request.diff) } : {}),
     };
@@ -310,15 +349,26 @@ export class WorkspaceToolsProvider implements CapabilityProvider {
     input: unknown,
     context: ToolCallContext,
   ): Promise<ToolResult> {
-    const params = asRecord(input);
-    if (name === "read") return this.#read(params, context);
-    if (name === "ls") return this.#ls(params, context);
-    if (name === "find") return this.#find(params, context);
-    if (name === "grep") return this.#grep(params, context);
-    if (name === "edit") return this.#edit(params, context);
-    if (name === "write") return this.#write(params, context);
-    if (name === "bash") return this.#bash(params, context);
-    throw new Error(`未知工作区 Tool: ${name}`);
+    try {
+      const params = asRecord(input);
+      let result: ToolResult;
+      if (name === "read") result = await this.#read(params, context);
+      else if (name === "ls") result = await this.#ls(params, context);
+      else if (name === "find") result = await this.#find(params, context);
+      else if (name === "grep") result = await this.#grep(params, context);
+      else if (name === "edit") result = await this.#edit(params, context);
+      else if (name === "write") result = await this.#write(params, context);
+      else if (name === "bash") result = await this.#bash(params, context);
+      else throw new Error(`未知工作区 Tool: ${name}`);
+      await this.#permissions.recordExecution(context.callId, "succeeded", {
+        isError: result.isError === true,
+        contentItems: result.content.length,
+      });
+      return result;
+    } catch (error) {
+      await this.#permissions.recordExecution(context.callId, "failed", error);
+      throw error;
+    }
   }
 
   async healthCheck(): Promise<HealthStatus> {
@@ -403,7 +453,11 @@ export class WorkspaceToolsProvider implements CapabilityProvider {
     const matches = before.split(oldText).length - 1;
     if (matches !== 1) throw new Error(`oldText 必须精确匹配一次，当前匹配 ${matches} 次`);
     const after = before.replace(oldText, newText);
-    const diff = createUnifiedDiff(relative(this.#permissions.workspace, resolved), before, after);
+    const diff = createUnifiedDiff(
+      relative(await realpath(this.#permissions.workspace), resolved),
+      before,
+      after,
+    );
     const path = await this.#permissions.authorizePath(context.callId, "write", requestedPath, diff);
     await writeFile(path, after, "utf8");
     await this.#permissions.recordDiff(context.callId, diff);
@@ -420,7 +474,11 @@ export class WorkspaceToolsProvider implements CapabilityProvider {
     } catch (error) {
       if (!isNotFound(error)) throw error;
     }
-    const diff = createUnifiedDiff(relative(this.#permissions.workspace, resolved), before, content);
+    const diff = createUnifiedDiff(
+      relative(await realpath(this.#permissions.workspace), resolved),
+      before,
+      content,
+    );
     const path = await this.#permissions.authorizePath(context.callId, "write", requestedPath, diff);
     await mkdir(dirname(path), { recursive: true });
     await writeFile(path, content, "utf8");
@@ -523,6 +581,29 @@ function redactValue(value: unknown): unknown {
     ]));
   }
   return value;
+}
+
+async function cleanupAuditLogs(logsRoot: string, retentionDays: number): Promise<void> {
+  let entries;
+  try {
+    entries = await readdir(logsRoot, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  const cutoff = new Date();
+  cutoff.setUTCDate(cutoff.getUTCDate() - retentionDays);
+  const cutoffDay = cutoff.toISOString().slice(0, 10);
+  await Promise.all(entries
+    .filter((entry) => entry.isFile())
+    .map(async (entry) => {
+      const match = /^audit-(\d{4}-\d{2}-\d{2})\.jsonl$/u.exec(entry.name);
+      if (!match?.[1] || match[1] >= cutoffDay) return;
+      try {
+        await unlink(resolve(logsRoot, entry.name));
+      } catch {
+        // Retention cleanup must not block a tool call.
+      }
+    }));
 }
 
 function isWithin(workspace: string, path: string): boolean {

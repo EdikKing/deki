@@ -31,41 +31,86 @@ export class McpManager {
     return [...this.#providers.values()];
   }
 
-  async start(config: McpConfig): Promise<CapabilityProvider[]> {
+  async start(config: McpConfig, startupTimeoutMs = 20_000): Promise<CapabilityProvider[]> {
     await this.dispose();
     this.#statuses.clear();
 
     const enabled = Object.entries(config.mcpServers).filter(([, server]) => server.enabled);
     await Promise.all(
-      enabled.map(async ([id, server]) => {
-        this.#setStatus({ id, state: "starting", toolCount: 0 });
-        const provider = new McpProvider(id, server, (error) => {
-          this.#providers.delete(id);
-          this.#setStatus({
-            id,
-            state: "error",
-            toolCount: 0,
-            error,
-          });
-        });
-        try {
-          await provider.connect();
-          this.#providers.set(id, provider);
-          const tools = await provider.listTools();
-          this.#setStatus({ id, state: "ready", toolCount: tools.length });
-        } catch (error) {
-          await provider.dispose();
-          this.#setStatus({
-            id,
-            state: "error",
-            toolCount: 0,
-            error: formatError(error),
-          });
-        }
-      }),
+      enabled.map(([id, server]) => this.startServer(id, server, startupTimeoutMs)),
     );
 
     return this.getProviders();
+  }
+
+  async startServer(
+    id: string,
+    server: McpServerConfig,
+    startupTimeoutMs = 20_000,
+  ): Promise<CapabilityProvider | undefined> {
+    await this.stopServer(id);
+    this.#setStatus({ id, state: "starting", toolCount: 0 });
+    const provider = new McpProvider(id, server, (error) => {
+      this.#providers.delete(id);
+      this.#setStatus({ id, state: "error", toolCount: 0, error });
+    });
+    try {
+      await provider.connect(startupTimeoutMs);
+      this.#providers.set(id, provider);
+      const tools = await provider.listTools();
+      this.#setStatus({ id, state: "ready", toolCount: tools.length });
+      return provider;
+    } catch (error) {
+      await provider.dispose();
+      this.#setStatus({
+        id,
+        state: "error",
+        toolCount: 0,
+        error: formatError(error),
+      });
+      return undefined;
+    }
+  }
+
+  async stopServer(id: string): Promise<void> {
+    const provider = this.#providers.get(id);
+    this.#providers.delete(id);
+    if (provider) await provider.dispose();
+    if (this.#statuses.has(id)) {
+      this.#setStatus({ id, state: "stopped", toolCount: 0 });
+    }
+  }
+
+  async restartServer(
+    id: string,
+    server: McpServerConfig,
+    startupTimeoutMs = 20_000,
+  ): Promise<CapabilityProvider | undefined> {
+    return this.startServer(id, server, startupTimeoutMs);
+  }
+
+  async listServerTools(id: string): Promise<ToolDefinition[]> {
+    return this.#providers.get(id)?.listTools() ?? [];
+  }
+
+  async testServer(
+    id: string,
+    server: McpServerConfig,
+    startupTimeoutMs = 20_000,
+  ): Promise<{ state: "ready" | "error"; toolCount: number; error?: string }> {
+    const probe = new McpProvider(id, server, () => {});
+    try {
+      await probe.connect(startupTimeoutMs);
+      const tools = await probe.listTools();
+      const health = await probe.healthCheck();
+      return health.state === "ready"
+        ? { state: "ready", toolCount: tools.length }
+        : { state: "error", toolCount: 0, error: health.message ?? "健康检查失败" };
+    } catch (error) {
+      return { state: "error", toolCount: 0, error: formatError(error) };
+    } finally {
+      await probe.dispose();
+    }
   }
 
   async dispose(): Promise<void> {
@@ -101,7 +146,7 @@ class McpProvider implements CapabilityProvider {
     this.#onDisconnect = onDisconnect;
   }
 
-  async connect(): Promise<void> {
+  async connect(startupTimeoutMs = 20_000): Promise<void> {
     const client = new Client({
       name: "deki",
       version: "0.0.0",
@@ -123,7 +168,7 @@ class McpProvider implements CapabilityProvider {
       }
     };
 
-    await client.connect(transport);
+    await client.connect(transport, { signal: AbortSignal.timeout(startupTimeoutMs) });
     const response = await client.listTools();
     this.#client = client;
     this.#transport = transport;

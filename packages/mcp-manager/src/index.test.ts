@@ -134,4 +134,29 @@ describe("McpManager", () => {
     });
     expect(manager.getProviders()).toHaveLength(0);
   });
+
+  it("starts, stops, restarts, tests, and lists a single server", async () => {
+    const manager = new McpManager();
+    managers.push(manager);
+    const fixture = resolve(process.cwd(), "tests/fixtures/mcp-server.mjs");
+    const config = {
+      command: process.execPath,
+      args: [fixture],
+      cwd: process.cwd(),
+      enabled: true,
+    };
+    await expect(manager.startServer("fixture", config, 5_000)).resolves.toBeDefined();
+    await expect(manager.listServerTools("fixture")).resolves.toHaveLength(4);
+    await manager.stopServer("fixture");
+    expect(manager.getStatuses()).toContainEqual({
+      id: "fixture",
+      state: "stopped",
+      toolCount: 0,
+    });
+    await expect(manager.restartServer("fixture", config, 5_000)).resolves.toBeDefined();
+    await expect(manager.testServer("probe", config, 5_000)).resolves.toEqual({
+      state: "ready",
+      toolCount: 4,
+    });
+  });
 });

@@ -8,9 +8,17 @@ import {
   IPC_CHANNELS,
   memoryRecordSchema,
   memoryMutationSchema,
+  memoryListInputSchema,
+  memoryMoveInputSchema,
   mcpServerEditorSchema,
+  mcpToolSummarySchema,
   modelProviderInputSchema,
   redactedModelProviderSchema,
+  conversationMessageSchema,
+  renameSessionInputSchema,
+  sessionIdInputSchema,
+  sessionSummarySchema,
+  skillStatusSchema,
   settingsPatchSchema,
   settingsScopeSchema,
   settingsSnapshotSchema,
@@ -53,13 +61,50 @@ const api: DekiDesktopApi = {
       await ipcRenderer.invoke(IPC_CHANNELS.newSession),
     );
   },
+  async listSessions() {
+    return sessionSummarySchema.array().parse(
+      await ipcRenderer.invoke(IPC_CHANNELS.listSessions),
+    );
+  },
+  async getSessionHistory() {
+    return conversationMessageSchema.array().parse(
+      await ipcRenderer.invoke(IPC_CHANNELS.getSessionHistory),
+    );
+  },
+  async switchSession(id) {
+    return commandResultSchema.parse(
+      await ipcRenderer.invoke(
+        IPC_CHANNELS.switchSession,
+        sessionIdInputSchema.parse({ id }),
+      ),
+    );
+  },
+  async renameSession(id, name) {
+    return commandResultSchema.parse(
+      await ipcRenderer.invoke(
+        IPC_CHANNELS.renameSession,
+        renameSessionInputSchema.parse({ id, name }),
+      ),
+    );
+  },
+  async deleteSession(id) {
+    return commandResultSchema.parse(
+      await ipcRenderer.invoke(
+        IPC_CHANNELS.deleteSession,
+        sessionIdInputSchema.parse({ id }),
+      ),
+    );
+  },
   async remember(content) {
     return commandResultSchema.parse(
       await ipcRenderer.invoke(IPC_CHANNELS.remember, { content }),
     );
   },
-  async listMemories() {
-    const result = await ipcRenderer.invoke(IPC_CHANNELS.listMemories);
+  async listMemories(scope) {
+    const result = await ipcRenderer.invoke(
+      IPC_CHANNELS.listMemories,
+      memoryListInputSchema.parse({ ...(scope ? { scope } : {}) }),
+    );
     return memoryRecordSchema.array().parse(result);
   },
   async selectModel(provider, id) {
@@ -162,6 +207,41 @@ const api: DekiDesktopApi = {
       await ipcRenderer.invoke(IPC_CHANNELS.reloadMcpServers),
     );
   },
+  async startMcpServer(id) {
+    return commandResultSchema.parse(
+      await ipcRenderer.invoke(IPC_CHANNELS.startMcpServer, { id }),
+    );
+  },
+  async stopMcpServer(id) {
+    return commandResultSchema.parse(
+      await ipcRenderer.invoke(IPC_CHANNELS.stopMcpServer, { id }),
+    );
+  },
+  async restartMcpServer(id) {
+    return commandResultSchema.parse(
+      await ipcRenderer.invoke(IPC_CHANNELS.restartMcpServer, { id }),
+    );
+  },
+  async testMcpServer(id) {
+    return commandResultSchema.parse(
+      await ipcRenderer.invoke(IPC_CHANNELS.testMcpServer, { id }),
+    );
+  },
+  async listMcpServerTools(id) {
+    return mcpToolSummarySchema.array().parse(
+      await ipcRenderer.invoke(IPC_CHANNELS.listMcpServerTools, { id }),
+    );
+  },
+  async listSkills() {
+    return skillStatusSchema.array().parse(
+      await ipcRenderer.invoke(IPC_CHANNELS.listSkills),
+    );
+  },
+  async reloadSkills() {
+    return commandResultSchema.parse(
+      await ipcRenderer.invoke(IPC_CHANNELS.reloadSkills),
+    );
+  },
   async updateMemory(input) {
     return memoryRecordSchema.parse(
       await ipcRenderer.invoke(
@@ -170,9 +250,20 @@ const api: DekiDesktopApi = {
       ),
     );
   },
-  async deleteMemory(id) {
+  async deleteMemory(id, scope) {
     return commandResultSchema.parse(
-      await ipcRenderer.invoke(IPC_CHANNELS.deleteMemory, { id }),
+      await ipcRenderer.invoke(IPC_CHANNELS.deleteMemory, {
+        id,
+        ...(scope ? { scope } : {}),
+      }),
+    );
+  },
+  async moveMemory(id, from, to) {
+    return memoryRecordSchema.parse(
+      await ipcRenderer.invoke(
+        IPC_CHANNELS.moveMemory,
+        memoryMoveInputSchema.parse({ id, from, to }),
+      ),
     );
   },
   async getDataUsage() {

@@ -95,6 +95,19 @@ test("trusts a workspace, streams fixture events, and recalls memory", async ({}
     await expect(window.locator(".timeline-item strong").first()).toHaveText(
       "deki__project_info",
     );
+    await expect(window.getByRole("heading", { name: "变更 Diff" })).toBeVisible();
+    await expect(window.locator(".diff-entry pre")).toContainText("+++ b/example.txt");
+
+    await window.getByTestId("open-settings").click();
+    await window.getByTestId("settings-section-mcp").click();
+    const mcpCard = window.locator(".mcp-server-card", { hasText: "fixture" });
+    await expect(mcpCard).toContainText("ready");
+    await mcpCard.getByRole("button", { name: "Tools" }).click();
+    await expect(mcpCard.getByText("echo", { exact: true })).toBeVisible();
+    await window.getByTestId("settings-section-skills").click();
+    const skillCard = window.locator(".skill-card", { hasText: "test-skill" });
+    await expect(skillCard).toContainText("valid");
+    await window.getByRole("button", { name: "返回" }).click();
 
     const memoryText = "Electron 冒烟测试记忆";
     await window.locator("textarea").fill(`/remember ${memoryText}`);

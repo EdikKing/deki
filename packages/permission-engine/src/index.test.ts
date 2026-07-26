@@ -56,6 +56,40 @@ describe("PermissionEngine", () => {
     expect(result.content[0]).toMatchObject({ type: "text" });
     expect(events).toContain("diff.available");
     expect(events).toContain("audit.recorded");
+    const auditFile = join(root, "logs", `audit-${new Date().toISOString().slice(0, 10)}.jsonl`);
+    const record = JSON.parse((await readFile(auditFile, "utf8")).trim()) as {
+      execution: { status: string; result: { contentItems: number } };
+      diff: string;
+    };
+    expect(record.execution).toEqual({
+      status: "succeeded",
+      result: { isError: false, contentItems: 1 },
+    });
+    expect(record.diff).toContain("+++ b/hello.txt");
+  });
+
+  it("audits an execution failure after permission was granted", async () => {
+    const root = await mkdtemp(join(tmpdir(), "deki-tools-failure-"));
+    const engine = new PermissionEngine({
+      workspace: root,
+      logsRoot: join(root, "logs"),
+      settings: defaultSettings,
+      sessionId: () => "session",
+      model: () => "provider/model",
+      emit: () => {},
+    });
+    const provider = new WorkspaceToolsProvider(engine);
+    await expect(provider.callTool(
+      "bash",
+      { command: "ls path-that-does-not-exist" },
+      { callId: "bash-failure", workspace: root },
+    )).rejects.toThrow("命令退出");
+    const auditFile = join(root, "logs", `audit-${new Date().toISOString().slice(0, 10)}.jsonl`);
+    const record = JSON.parse((await readFile(auditFile, "utf8")).trim()) as {
+      execution: { status: string; error: string };
+    };
+    expect(record.execution.status).toBe("failed");
+    expect(record.execution.error).toContain("path-that-does-not-exist");
   });
 
   it("generates a complete diff", () => {

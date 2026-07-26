@@ -26,8 +26,10 @@ import {
   DEKI_VERSION,
   type AgentEvent,
   type CapabilityProvider,
+  type ConversationMessage,
   type MemoryRecord,
   type ModelSummary,
+  type SessionSummary,
   type ToolCallContext,
   type ToolDefinition,
   type ToolResult,
@@ -132,7 +134,10 @@ export class DekiAgentRuntime {
 
       if (this.#options.settings.mcp.startEnabledServers) {
         const mcpConfig = await loadMcpConfig(this.#options.workspace);
-        const mcpProviders = await this.#options.mcpManager.start(mcpConfig);
+        const mcpProviders = await this.#options.mcpManager.start(
+          mcpConfig,
+          this.#options.settings.mcp.startupTimeoutMs,
+        );
         for (const provider of mcpProviders) {
           try {
             await this.#gateway.register(provider);
@@ -180,7 +185,7 @@ export class DekiAgentRuntime {
 
     if (!this.#selectedModel) {
       this.#addDiagnostic(
-        "未发现可用云模型。请在终端设置 OPENAI_API_KEY、ANTHROPIC_API_KEY 等环境变量后重新启动。",
+        "未发现可用云模型。请在“设置 → 模型与提供方”中填写 API Key，或通过进程环境变量提供凭据。",
         "warning",
       );
       return;
@@ -218,6 +223,12 @@ export class DekiAgentRuntime {
     }
     if (runtime.session.isStreaming) {
       throw new Error("Agent 正在运行，请等待完成或先停止");
+    }
+    if (
+      this.#options.settings.agent.autoNameSessions
+      && !runtime.session.sessionName
+    ) {
+      runtime.session.setSessionName(createSessionTitle(trimmed));
     }
 
     this.#streaming = true;
@@ -298,6 +309,107 @@ export class DekiAgentRuntime {
     });
   }
 
+  async listSessions(): Promise<SessionSummary[]> {
+    const runtime = this.#runtime;
+    const directory = join(this.#options.paths.sessionsRoot, this.#options.scopeId);
+    const sessions = await SessionManager.list(this.#options.workspace, directory);
+    return sessions
+      .sort((left, right) => right.modified.getTime() - left.modified.getTime())
+      .map((session) => ({
+        id: session.id,
+        ...(session.name ? { name: session.name } : {}),
+        createdAt: session.created.toISOString(),
+        updatedAt: session.modified.toISOString(),
+        messageCount: session.messageCount,
+        firstMessage: session.firstMessage,
+        current: session.id === runtime?.session.sessionId,
+      }));
+  }
+
+  getSessionHistory(): ConversationMessage[] {
+    const messages = this.#runtime?.session.messages ?? [];
+    return messages.flatMap((message, index) => {
+      const value = asUnknownRecord(message);
+      if (value.role !== "user" && value.role !== "assistant") return [];
+      const content = extractMessageText(value.content);
+      if (!content) return [];
+      return [{
+        id: `${this.#runtime?.session.sessionId ?? "session"}-${index}`,
+        role: value.role,
+        content,
+      }];
+    });
+  }
+
+  async switchSession(id: string): Promise<void> {
+    const runtime = this.#runtime;
+    if (!runtime) throw new Error("Agent 尚未就绪");
+    if (runtime.session.isStreaming) throw new Error("Agent 正在运行，无法切换会话");
+    const session = await this.#findSession(id);
+    const result = await runtime.switchSession(session.path);
+    if (result.cancelled) return;
+    this.#emit({
+      type: "session.ready",
+      model: this.#selectedModel ? toModelSummary(this.#selectedModel) : undefined,
+    });
+  }
+
+  async renameSession(id: string, name: string): Promise<void> {
+    const runtime = this.#runtime;
+    if (!runtime) throw new Error("Agent 尚未就绪");
+    const normalized = name.trim();
+    if (!normalized) throw new Error("会话名称不能为空");
+    if (id === runtime.session.sessionId) {
+      runtime.session.setSessionName(normalized);
+      return;
+    }
+    const session = await this.#findSession(id);
+    SessionManager.open(
+      session.path,
+      join(this.#options.paths.sessionsRoot, this.#options.scopeId),
+      this.#options.workspace,
+    ).appendSessionInfo(normalized);
+  }
+
+  async getSessionPath(id: string): Promise<string> {
+    return (await this.#findSession(id)).path;
+  }
+
+  async startMcpServer(id: string): Promise<void> {
+    if (!this.#projectFeaturesEnabled()) throw new Error("普通会话不支持 MCP");
+    const config = await loadMcpConfig(this.#options.workspace);
+    const server = config.mcpServers[id];
+    if (!server) throw new Error("未找到 MCP Server");
+    await this.#gateway.unregister(id, false);
+    const provider = await this.#options.mcpManager.startServer(
+      id,
+      server,
+      this.#options.settings.mcp.startupTimeoutMs,
+    );
+    if (!provider) throw new Error(this.#options.mcpManager.getStatuses().find((item) => item.id === id)?.error ?? "MCP 启动失败");
+    await this.#gateway.register(provider);
+    this.#syncActiveTools();
+  }
+
+  async stopMcpServer(id: string): Promise<void> {
+    await this.#gateway.unregister(id, false);
+    await this.#options.mcpManager.stopServer(id);
+    this.#syncActiveTools();
+  }
+
+  async reloadMcpServers(): Promise<void> {
+    for (const status of this.#options.mcpManager.getStatuses()) {
+      await this.#gateway.unregister(status.id, false);
+    }
+    const config = await loadMcpConfig(this.#options.workspace);
+    const providers = await this.#options.mcpManager.start(
+      config,
+      this.#options.settings.mcp.startupTimeoutMs,
+    );
+    for (const provider of providers) await this.#gateway.register(provider);
+    this.#syncActiveTools();
+  }
+
   async selectModel(provider: string, id: string): Promise<void> {
     const model = this.#models.find(
       (candidate) => candidate.provider === provider && candidate.id === id,
@@ -340,10 +452,6 @@ export class DekiAgentRuntime {
     const selectedModel = this.#selectedModel;
     if (!modelRuntime || !selectedModel) return;
 
-    const sessionDirectory = join(
-      this.#options.paths.sessionsRoot,
-      this.#options.scopeId,
-    );
     const createRuntime = async ({
       cwd,
       sessionManager,
@@ -426,10 +534,18 @@ export class DekiAgentRuntime {
       };
     };
 
+    const sessionDirectory = join(
+      this.#options.paths.sessionsRoot,
+      this.#options.scopeId,
+    );
+    const restoreRecent = this.#options.settings.general.restoreSession
+      && this.#options.settings.general.startupMode === "last-session";
     this.#runtime = await createAgentSessionRuntime(createRuntime, {
       cwd: this.#options.workspace,
       agentDir: this.#options.paths.root,
-      sessionManager: SessionManager.create(this.#options.workspace, sessionDirectory),
+      sessionManager: restoreRecent
+        ? SessionManager.continueRecent(this.#options.workspace, sessionDirectory)
+        : SessionManager.create(this.#options.workspace, sessionDirectory),
     });
     this.#runtime.session.setAutoCompactionEnabled(
       this.#options.settings.agent.compactionEnabled,
@@ -465,7 +581,8 @@ export class DekiAgentRuntime {
           workspace: this.#options.workspace,
           ...(signal ? { signal } : {}),
         };
-        if (tool.providerId !== "workspace" && tool.providerId !== "deki") {
+        const permissionControlled = tool.providerId !== "workspace" && tool.providerId !== "deki";
+        if (permissionControlled) {
           const readOnly = /^(?:get|list|read|search|find|query|status|health)/i.test(
             tool.providerToolName,
           );
@@ -479,16 +596,29 @@ export class DekiAgentRuntime {
             details: { provider: tool.providerId, tool: tool.providerToolName, input: params },
           });
         }
-        const result = await this.#gateway.call(
-          tool.modelName,
-          params,
-          context,
-          this.#options.settings.mcp.callTimeoutMs,
-        );
-        return {
-          content: result.content,
-          details: result.details ?? {},
-        };
+        try {
+          const result = await this.#gateway.call(
+            tool.modelName,
+            params,
+            context,
+            this.#options.settings.mcp.callTimeoutMs,
+          );
+          if (permissionControlled) {
+            await this.#permissions?.recordExecution(toolCallId, "succeeded", {
+              isError: result.isError === true,
+              contentItems: result.content.length,
+            });
+          }
+          return {
+            content: result.content,
+            details: result.details ?? {},
+          };
+        } catch (error) {
+          if (permissionControlled) {
+            await this.#permissions?.recordExecution(toolCallId, "failed", error);
+          }
+          throw error;
+        }
       },
     });
   }
@@ -502,7 +632,7 @@ export class DekiAgentRuntime {
   #handleSessionEvent(event: AgentSessionEvent): void {
     if (event.type === "agent_end") {
       this.#streaming = false;
-      this.#createAutomaticMemoryCandidate();
+      void this.#createAutomaticMemoryCandidates();
     }
     const translated = translatePiAgentEvent(event);
     if (translated) {
@@ -510,29 +640,58 @@ export class DekiAgentRuntime {
     }
   }
 
-  #createAutomaticMemoryCandidate(): void {
+  async #createAutomaticMemoryCandidates(): Promise<void> {
     const prompt = this.#lastPrompt;
     this.#lastPrompt = undefined;
     if (!prompt || !this.#options.settings.memory.automaticCandidates) return;
     const project = this.#projectFeaturesEnabled();
     if (!project && !this.#options.settings.memory.userMemoryEnabled) return;
+    const modelRuntime = this.#modelRuntime;
+    const model = this.#selectedModel;
+    if (!modelRuntime || !model) return;
     try {
-      const content = prompt.length > 500 ? `${prompt.slice(0, 500)}…` : prompt;
-      const memory = this.#options.memoryEngine.createMemory({
-        scope: project ? "project" : "user",
-        scopeId: project ? this.#options.scopeId : "user",
-        content,
-        source: {
-          kind: "agent_candidate",
-          ...(this.#runtime?.session.sessionId
-            ? { sessionId: this.#runtime.session.sessionId }
-            : {}),
-          detail: "成功任务结束后生成，等待用户确认",
-        },
-        type: "experience",
-        status: "pending",
+      const recentAssistant = [...(this.#runtime?.session.messages ?? [])]
+        .reverse()
+        .find((message) => message.role === "assistant");
+      const response = await modelRuntime.completeSimple(model, {
+        systemPrompt: [
+          "你是长期记忆提取器。",
+          "只提取以后仍有帮助、用户未必会再次说明的稳定事实、偏好、决定或经验。",
+          "不要保存密钥、令牌、密码、源码内容、临时任务状态或可从项目文件重新获取的信息。",
+          "输出严格 JSON 数组，最多 3 项；每项格式为 {\"content\":\"...\",\"type\":\"preference|fact|decision|experience\"}。",
+          "没有值得保存的内容时输出 []。",
+        ].join("\n"),
+        messages: [{
+          role: "user",
+          timestamp: Date.now(),
+          content: [
+            `用户任务：${prompt.slice(0, 4_000)}`,
+            `任务结果：${extractMessageText(asUnknownRecord(recentAssistant).content).slice(0, 4_000)}`,
+          ].join("\n\n"),
+        }],
+      }, {
+        maxTokens: Math.min(1_200, this.#options.settings.models.maxOutputTokens),
+        timeoutMs: this.#options.settings.models.timeoutMs,
+        maxRetries: this.#options.settings.models.maxRetries,
       });
-      this.#emit({ type: "memory.saved", memory });
+      const parsed = parseMemoryCandidates(extractMessageText(response.content));
+      for (const candidate of parsed.slice(0, 3)) {
+        const memory = this.#options.memoryEngine.createMemory({
+          scope: project ? "project" : "user",
+          scopeId: project ? this.#options.scopeId : "user",
+          content: candidate.content,
+          source: {
+            kind: "agent_candidate",
+            ...(this.#runtime?.session.sessionId
+              ? { sessionId: this.#runtime.session.sessionId }
+              : {}),
+            detail: `由 ${model.provider}/${model.id} 在成功任务结束后生成，等待用户确认`,
+          },
+          type: candidate.type,
+          status: "pending",
+        });
+        this.#emit({ type: "memory.saved", memory });
+      }
     } catch (error) {
       this.#addDiagnostic(`自动记忆候选未保存: ${formatError(error)}`, "warning");
     }
@@ -561,6 +720,20 @@ export class DekiAgentRuntime {
 
   #projectFeaturesEnabled(): boolean {
     return this.#options.projectFeatures !== false;
+  }
+
+  #syncActiveTools(): void {
+    this.#runtime?.session.setActiveToolsByName(
+      this.#gateway.listTools().map((tool) => tool.modelName),
+    );
+  }
+
+  async #findSession(id: string) {
+    const directory = join(this.#options.paths.sessionsRoot, this.#options.scopeId);
+    const sessions = await SessionManager.list(this.#options.workspace, directory);
+    const session = sessions.find((candidate) => candidate.id === id);
+    if (!session) throw new Error("未找到会话");
+    return session;
   }
 }
 
@@ -704,4 +877,51 @@ function toModelSummary(model: ModelType): ModelSummary {
 
 function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function createSessionTitle(prompt: string): string {
+  const firstLine = prompt.split("\n", 1)[0]?.trim() ?? prompt;
+  return firstLine.length > 42 ? `${firstLine.slice(0, 42)}…` : firstLine;
+}
+
+function asUnknownRecord(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function extractMessageText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.flatMap((item) => {
+    const record = asUnknownRecord(item);
+    return record.type === "text" && typeof record.text === "string"
+      ? [record.text]
+      : [];
+  }).join("");
+}
+
+function parseMemoryCandidates(value: string): Array<{
+  content: string;
+  type: "preference" | "fact" | "decision" | "experience";
+}> {
+  const start = value.indexOf("[");
+  const end = value.lastIndexOf("]");
+  if (start < 0 || end < start) return [];
+  const parsed: unknown = JSON.parse(value.slice(start, end + 1));
+  if (!Array.isArray(parsed)) return [];
+  const allowed = new Set(["preference", "fact", "decision", "experience"]);
+  return parsed.flatMap((item) => {
+    const record = asUnknownRecord(item);
+    if (
+      typeof record.content !== "string"
+      || !record.content.trim()
+      || typeof record.type !== "string"
+      || !allowed.has(record.type)
+    ) return [];
+    return [{
+      content: record.content.trim().slice(0, 2_000),
+      type: record.type as "preference" | "fact" | "decision" | "experience",
+    }];
+  });
 }

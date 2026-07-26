@@ -12,12 +12,14 @@ import {
   type IpcMainInvokeEvent,
 } from "electron";
 import { DekiAgentRuntime } from "@deki-ai/agent-runtime";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import {
   ensureDekiDirectories,
   formatError,
   getDekiPaths,
   isWorkspaceTrusted,
   listRecentWorkspaces,
+  loadMcpConfig,
   readMcpConfig,
   revokeWorkspaceTrust,
   resolveWorkspace,
@@ -47,10 +49,18 @@ import {
   dataUsageSchema,
   IPC_CHANNELS,
   mcpServerEditorSchema,
+  mcpToolSummarySchema,
   memoryMutationSchema,
+  memoryListInputSchema,
+  memoryMoveInputSchema,
   openWorkspaceInputSchema,
   modelProviderInputSchema,
   redactedModelProviderSchema,
+  conversationMessageSchema,
+  renameSessionInputSchema,
+  sessionIdInputSchema,
+  sessionSummarySchema,
+  skillStatusSchema,
   rememberInputSchema,
   removeModelProviderInputSchema,
   resetSettingsInputSchema,
@@ -132,6 +142,11 @@ class DesktopController {
     });
     const settingsSnapshot = await settings.initialize();
     applyNativeSettings(settingsSnapshot);
+    await cleanupExpiredSessions(
+      runtimeWorkspace,
+      join(paths.sessionsRoot, scopeId),
+      settingsSnapshot.effective.agent.sessionRetentionDays,
+    );
     const instance = new DesktopController(
       workspace,
       runtimeWorkspace,
@@ -202,6 +217,36 @@ class DesktopController {
     return this.#run(async (runtime) => runtime.newSession());
   }
 
+  async listSessions() {
+    return this.#runtime?.listSessions() ?? [];
+  }
+
+  getSessionHistory() {
+    return this.#runtime?.getSessionHistory() ?? [];
+  }
+
+  async switchSession(id: string): Promise<CommandResult> {
+    return this.#run(async (runtime) => runtime.switchSession(id));
+  }
+
+  async renameSession(id: string, name: string): Promise<CommandResult> {
+    return this.#run(async (runtime) => runtime.renameSession(id, name));
+  }
+
+  async deleteSession(id: string): Promise<CommandResult> {
+    const runtime = this.#runtime;
+    if (!runtime) return { ok: false, error: "Agent Runtime 尚未就绪" };
+    if (runtime.snapshot().sessionId === id) {
+      return { ok: false, error: "不能删除当前会话，请先切换到其他会话" };
+    }
+    try {
+      await shell.trashItem(await runtime.getSessionPath(id));
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: formatError(error) };
+    }
+  }
+
   async remember(content: string): Promise<CommandResult> {
     return this.#run(async (runtime) => {
       runtime.remember(content);
@@ -224,6 +269,7 @@ class DesktopController {
     if (!this.#workspace && scope !== "global") {
       throw new Error("普通会话只能修改全局设置");
     }
+    assertSettingsScopePatch(scope, patch);
     const before = this.#settings.snapshot();
     const snapshot = await this.#settings.update(scope, patch, expectedRevision);
     if (requiresRuntimeReload(before, snapshot)) {
@@ -431,12 +477,8 @@ class DesktopController {
     }
   }
 
-  listMemories() {
-    const scope = this.#projectFeatures ? "project" : "user";
-    const scopeId = this.#projectFeatures ? this.#scopeId : "user";
-    if (!this.#projectFeatures && !this.#settings.snapshot().effective.memory.userMemoryEnabled) {
-      return [];
-    }
+  listMemories(requestedScope?: "user" | "project") {
+    const { scope, scopeId } = this.#resolveMemoryScope(requestedScope);
     return [
       ...this.#memory.listMemories(scope, scopeId),
       ...this.#memory.listMemories(scope, scopeId, { status: "pending" }),
@@ -446,13 +488,20 @@ class DesktopController {
   async listMcpServers(): Promise<McpServerEditor[]> {
     if (!this.#workspace || !this.#trusted) return [];
     const config = await readMcpConfig(this.#workspace);
-    return Object.entries(config.mcpServers).map(([id, server]) => ({
-      id,
-      command: server.command,
-      args: server.args,
-      ...(server.cwd ? { cwd: server.cwd } : {}),
-      enabled: server.enabled,
-    }));
+    const statuses = new Map(this.#mcp.getStatuses().map((status) => [status.id, status]));
+    return Object.entries(config.mcpServers).map(([id, server]) => {
+      const status = statuses.get(id);
+      return {
+        id,
+        command: server.command,
+        args: server.args,
+        ...(server.cwd ? { cwd: server.cwd } : {}),
+        enabled: server.enabled,
+        state: status?.state ?? "stopped",
+        toolCount: status?.toolCount ?? 0,
+        ...(status?.error ? { error: status.error } : {}),
+      };
+    });
   }
 
   async upsertMcpServer(server: McpServerEditor): Promise<CommandResult> {
@@ -498,6 +547,126 @@ class DesktopController {
       return { ok: false, error: "MCP 只在受信任项目中可用" };
     }
     try {
+      await this.#runtime?.reloadMcpServers();
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: formatError(error) };
+    }
+  }
+
+  async startMcpServer(id: string): Promise<CommandResult> {
+    return this.#setMcpServerEnabled(id, true);
+  }
+
+  async stopMcpServer(id: string): Promise<CommandResult> {
+    return this.#setMcpServerEnabled(id, false);
+  }
+
+  async restartMcpServer(id: string): Promise<CommandResult> {
+    return this.#setMcpServerEnabled(id, true);
+  }
+
+  async testMcpServer(id: string): Promise<CommandResult> {
+    if (!this.#workspace || !this.#trusted) return { ok: false, error: "MCP 只在受信任项目中可用" };
+    const server = (await loadMcpConfig(this.#workspace)).mcpServers[id];
+    if (!server) return { ok: false, error: "未找到 MCP Server" };
+    const result = await this.#mcp.testServer(
+      `probe-${id}`,
+      server,
+      this.#settings.snapshot().effective.mcp.startupTimeoutMs,
+    );
+    return result.state === "ready"
+      ? { ok: true, error: `连接成功，发现 ${result.toolCount} 个 Tool` }
+      : { ok: false, error: result.error ?? "连接失败" };
+  }
+
+  async #setMcpServerEnabled(id: string, enabled: boolean): Promise<CommandResult> {
+    if (!this.#workspace || !this.#trusted) {
+      return { ok: false, error: "MCP 只在受信任项目中可用" };
+    }
+    try {
+      const config = await readMcpConfig(this.#workspace);
+      const server = config.mcpServers[id];
+      if (!server) return { ok: false, error: "未找到 MCP Server" };
+      server.enabled = enabled;
+      await writeMcpConfig(this.#workspace, config);
+      await this.#reloadRuntimeWhenIdle();
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: formatError(error) };
+    }
+  }
+
+  async listMcpServerTools(id: string) {
+    return (await this.#mcp.listServerTools(id)).map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+    }));
+  }
+
+  async listSkills() {
+    const settings = this.#settings.snapshot().effective.skills;
+    const roots = [
+      ...(this.#workspace && this.#trusted
+        ? [
+            { path: join(this.#workspace, ".deki", "skills"), source: "project" as const },
+            { path: join(this.#workspace, ".agents", "skills"), source: "project" as const },
+            { path: join(this.#workspace, ".pi", "skills"), source: "project" as const },
+          ]
+        : []),
+      ...settings.globalPaths.map((path) => ({ path, source: "global" as const })),
+    ];
+    const skills: Array<{
+      name: string;
+      path: string;
+      source: "project" | "global";
+      enabled: boolean;
+      valid: boolean;
+      trusted: boolean;
+      diagnostics: string[];
+    }> = [];
+    for (const root of roots) {
+      let entries;
+      try {
+        entries = await readdir(root.path, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const skillFile = join(root.path, entry.name, "SKILL.md");
+        const diagnostics: string[] = [];
+        let name = entry.name;
+        try {
+          const content = await readFile(skillFile, "utf8");
+          const declared = /^---[\s\S]*?^name:\s*(.+?)\s*$[\s\S]*?^---/mu.exec(content)?.[1];
+          const description = /^---[\s\S]*?^description:\s*(.+?)\s*$[\s\S]*?^---/mu.exec(content)?.[1];
+          if (declared) name = declared.trim();
+          else diagnostics.push("缺少 frontmatter name");
+          if (!description) diagnostics.push("缺少 frontmatter description");
+        } catch {
+          diagnostics.push("缺少或无法读取 SKILL.md");
+        }
+        skills.push({
+          name,
+          path: skillFile,
+          source: root.source,
+          enabled: settings.enabled && !settings.disabledNames.includes(name),
+          valid: diagnostics.length === 0,
+          trusted: root.source === "project" ? this.#trusted : true,
+          diagnostics,
+        });
+      }
+    }
+    const counts = new Map<string, number>();
+    for (const skill of skills) counts.set(skill.name, (counts.get(skill.name) ?? 0) + 1);
+    return skills.map((skill) => counts.get(skill.name)! > 1
+      ? { ...skill, valid: false, diagnostics: [...skill.diagnostics, "Skill 名称冲突"] }
+      : skill);
+  }
+
+  async reloadSkills(): Promise<CommandResult> {
+    try {
       await this.#reloadRuntimeWhenIdle();
       return { ok: true };
     } catch (error) {
@@ -507,12 +676,12 @@ class DesktopController {
 
   async updateMemory(input: {
     id: string;
+    scope?: "user" | "project";
     content?: string;
     pinned?: boolean;
     status?: "active" | "pending" | "superseded" | "archived";
   }) {
-    const scope = this.#projectFeatures ? "project" : "user";
-    const scopeId = this.#projectFeatures ? this.#scopeId : "user";
+    const { scope, scopeId } = this.#resolveMemoryScope(input.scope);
     return this.#memory.updateMemory(scope, scopeId, input.id, {
       ...(input.content ? { content: input.content } : {}),
       ...(input.pinned === undefined ? {} : { pinned: input.pinned }),
@@ -520,12 +689,27 @@ class DesktopController {
     });
   }
 
-  deleteMemory(id: string): CommandResult {
-    const scope = this.#projectFeatures ? "project" : "user";
-    const scopeId = this.#projectFeatures ? this.#scopeId : "user";
+  deleteMemory(id: string, requestedScope?: "user" | "project"): CommandResult {
+    const { scope, scopeId } = this.#resolveMemoryScope(requestedScope);
     return this.#memory.deleteMemory(scope, scopeId, id)
       ? { ok: true }
       : { ok: false, error: "未找到记忆" };
+  }
+
+  moveMemory(
+    id: string,
+    from: "user" | "project",
+    to: "user" | "project",
+  ) {
+    const source = this.#resolveMemoryScope(from);
+    const target = this.#resolveMemoryScope(to);
+    return this.#memory.moveMemory(
+      source.scope,
+      source.scopeId,
+      id,
+      target.scope,
+      target.scopeId,
+    );
   }
 
   async getDataUsage() {
@@ -640,6 +824,58 @@ class DesktopController {
         },
       },
     }, snapshot.revision);
+  }
+
+  #resolveMemoryScope(requested?: "user" | "project"): {
+    scope: "user" | "project";
+    scopeId: string;
+  } {
+    const scope = requested ?? (this.#projectFeatures ? "project" : "user");
+    if (scope === "project") {
+      if (!this.#projectFeatures) throw new Error("普通会话没有项目记忆作用域");
+      return { scope, scopeId: this.#scopeId };
+    }
+    return { scope: "user", scopeId: "user" };
+  }
+}
+
+function assertSettingsScopePatch(scope: SettingsScope, patch: SettingsPatch): void {
+  if (scope === "global") return;
+  const allowed = new Set([
+    "models",
+    "agent",
+    "workspace",
+    "permissions",
+    "mcp",
+    "skills",
+    "memory",
+  ]);
+  const invalid = Object.keys(patch).filter((key) => !allowed.has(key));
+  if (invalid.length > 0) {
+    throw new Error(`项目作用域不能保存这些设置：${invalid.join(", ")}`);
+  }
+  if (patch.skills?.globalPaths !== undefined) {
+    throw new Error("额外全局 Skill 路径只能保存在全局设置中");
+  }
+}
+
+async function cleanupExpiredSessions(
+  cwd: string,
+  sessionDirectory: string,
+  retentionDays: number,
+): Promise<void> {
+  try {
+    const sessions = await SessionManager.list(cwd, sessionDirectory);
+    if (sessions.length <= 1) return;
+    const cutoff = Date.now() - retentionDays * 86_400_000;
+    const sorted = sessions.sort(
+      (left, right) => right.modified.getTime() - left.modified.getTime(),
+    );
+    await Promise.allSettled(sorted.slice(1)
+      .filter((session) => session.modified.getTime() < cutoff)
+      .map((session) => shell.trashItem(session.path)));
+  } catch {
+    // A malformed historical session must not prevent the desktop app from starting.
   }
 }
 
@@ -772,14 +1008,38 @@ function registerIpcHandlers(): void {
     assertTrustedSender(event);
     return commandResultSchema.parse(await controller?.newSession());
   });
+  ipcMain.handle(IPC_CHANNELS.listSessions, async (event) => {
+    assertTrustedSender(event);
+    return sessionSummarySchema.array().parse(await controller?.listSessions() ?? []);
+  });
+  ipcMain.handle(IPC_CHANNELS.getSessionHistory, (event) => {
+    assertTrustedSender(event);
+    return conversationMessageSchema.array().parse(controller?.getSessionHistory() ?? []);
+  });
+  ipcMain.handle(IPC_CHANNELS.switchSession, async (event, raw) => {
+    assertTrustedSender(event);
+    const { id } = sessionIdInputSchema.parse(raw);
+    return commandResultSchema.parse(await controller?.switchSession(id));
+  });
+  ipcMain.handle(IPC_CHANNELS.renameSession, async (event, raw) => {
+    assertTrustedSender(event);
+    const { id, name } = renameSessionInputSchema.parse(raw);
+    return commandResultSchema.parse(await controller?.renameSession(id, name));
+  });
+  ipcMain.handle(IPC_CHANNELS.deleteSession, async (event, raw) => {
+    assertTrustedSender(event);
+    const { id } = sessionIdInputSchema.parse(raw);
+    return commandResultSchema.parse(await controller?.deleteSession(id));
+  });
   ipcMain.handle(IPC_CHANNELS.remember, async (event, raw) => {
     assertTrustedSender(event);
     const { content } = rememberInputSchema.parse(raw);
     return commandResultSchema.parse(await controller?.remember(content));
   });
-  ipcMain.handle(IPC_CHANNELS.listMemories, (event) => {
+  ipcMain.handle(IPC_CHANNELS.listMemories, (event, raw) => {
     assertTrustedSender(event);
-    return controller?.listMemories() ?? [];
+    const { scope } = memoryListInputSchema.parse(raw ?? {});
+    return controller?.listMemories(scope) ?? [];
   });
   ipcMain.handle(IPC_CHANNELS.selectModel, async (event, raw) => {
     assertTrustedSender(event);
@@ -877,12 +1137,44 @@ function registerIpcHandlers(): void {
         ?? { ok: false, error: "Runtime 尚未就绪" },
     );
   });
+  for (const [channel, action] of [
+    [IPC_CHANNELS.startMcpServer, (id: string) => controller?.startMcpServer(id)],
+    [IPC_CHANNELS.stopMcpServer, (id: string) => controller?.stopMcpServer(id)],
+    [IPC_CHANNELS.restartMcpServer, (id: string) => controller?.restartMcpServer(id)],
+    [IPC_CHANNELS.testMcpServer, (id: string) => controller?.testMcpServer(id)],
+  ] as const) {
+    ipcMain.handle(channel, async (event, raw) => {
+      assertTrustedSender(event);
+      const { id } = removeModelProviderInputSchema.parse(raw);
+      return commandResultSchema.parse(
+        await action(id) ?? { ok: false, error: "MCP Manager 尚未就绪" },
+      );
+    });
+  }
+  ipcMain.handle(IPC_CHANNELS.listMcpServerTools, async (event, raw) => {
+    assertTrustedSender(event);
+    const { id } = removeModelProviderInputSchema.parse(raw);
+    return mcpToolSummarySchema.array().parse(
+      await controller?.listMcpServerTools(id) ?? [],
+    );
+  });
+  ipcMain.handle(IPC_CHANNELS.listSkills, async (event) => {
+    assertTrustedSender(event);
+    return skillStatusSchema.array().parse(await controller?.listSkills() ?? []);
+  });
+  ipcMain.handle(IPC_CHANNELS.reloadSkills, async (event) => {
+    assertTrustedSender(event);
+    return commandResultSchema.parse(
+      await controller?.reloadSkills() ?? { ok: false, error: "Skill Loader 尚未就绪" },
+    );
+  });
   ipcMain.handle(IPC_CHANNELS.updateMemory, (event, raw) => {
     assertTrustedSender(event);
     if (!controller) throw new Error("Memory Engine 尚未就绪");
     const input = memoryMutationSchema.parse(raw);
     return controller.updateMemory({
       id: input.id,
+      ...(input.scope ? { scope: input.scope } : {}),
       ...(input.content ? { content: input.content } : {}),
       ...(input.pinned === undefined ? {} : { pinned: input.pinned }),
       ...(input.status ? { status: input.status } : {}),
@@ -890,10 +1182,16 @@ function registerIpcHandlers(): void {
   });
   ipcMain.handle(IPC_CHANNELS.deleteMemory, (event, raw) => {
     assertTrustedSender(event);
-    const { id } = removeModelProviderInputSchema.parse(raw);
+    const input = memoryMutationSchema.pick({ id: true, scope: true }).parse(raw);
     return commandResultSchema.parse(
-      controller?.deleteMemory(id) ?? { ok: false, error: "Memory Engine 尚未就绪" },
+      controller?.deleteMemory(input.id, input.scope) ?? { ok: false, error: "Memory Engine 尚未就绪" },
     );
+  });
+  ipcMain.handle(IPC_CHANNELS.moveMemory, (event, raw) => {
+    assertTrustedSender(event);
+    if (!controller) throw new Error("Memory Engine 尚未就绪");
+    const input = memoryMoveInputSchema.parse(raw);
+    return controller.moveMemory(input.id, input.from, input.to);
   });
   ipcMain.handle(IPC_CHANNELS.getDataUsage, async (event) => {
     assertTrustedSender(event);
@@ -1056,12 +1354,14 @@ function applyNativeSettings(snapshot: SettingsSnapshot): void {
 
 function requiresRuntimeReload(before: SettingsSnapshot, after: SettingsSnapshot): boolean {
   return JSON.stringify({
+    agent: before.effective.agent,
     models: before.effective.models,
     mcp: before.effective.mcp,
     skills: before.effective.skills,
     memory: before.effective.memory,
     permissions: before.effective.permissions,
   }) !== JSON.stringify({
+    agent: after.effective.agent,
     models: after.effective.models,
     mcp: after.effective.mcp,
     skills: after.effective.skills,
@@ -1164,6 +1464,13 @@ function emitE2eFixtureEvents(): void {
     toolName: "deki__project_info",
     isError: false,
     result: { content: [{ type: "text", text: "fixture" }] },
+  });
+  broadcastEvent({
+    ...base,
+    type: "diff.available",
+    eventId: crypto.randomUUID(),
+    callId: "e2e-tool-call",
+    diff: "--- a/example.txt\n+++ b/example.txt\n@@ -1,1 +1,1 @@\n-old\n+new",
   });
   broadcastEvent({
     ...base,

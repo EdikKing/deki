@@ -61,6 +61,19 @@ export class ToolGateway {
     return [...this.#tools.values()];
   }
 
+  async unregister(providerId: string, dispose = true): Promise<boolean> {
+    const provider = this.#providers.get(providerId);
+    if (!provider) return false;
+    this.#providers.delete(providerId);
+    for (const [modelName, tool] of this.#tools) {
+      if (tool.providerId !== providerId) continue;
+      this.#tools.delete(modelName);
+      this.#validators.delete(modelName);
+    }
+    if (dispose) await provider.dispose();
+    return true;
+  }
+
   subscribe(listener: ToolGatewayListener): () => void {
     this.#listeners.add(listener);
     return () => this.#listeners.delete(listener);

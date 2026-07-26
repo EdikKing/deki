@@ -3,16 +3,14 @@ import type {
   AgentEvent,
   BootstrapState,
   CommandResult,
+  ConversationMessage,
   MemoryRecord,
+  SessionSummary,
   SettingsSnapshot,
 } from "@deki-ai/shared";
 import { SettingsView } from "./SettingsView";
 
-interface ChatMessage {
-  id: string;
-  role: "user" | "assistant";
-  content: string;
-}
+type ChatMessage = ConversationMessage;
 
 export function App() {
   const [state, setState] = useState<BootstrapState>();
@@ -24,9 +22,15 @@ export function App() {
   const [settings, setSettings] = useState<SettingsSnapshot>();
   const [showSettings, setShowSettings] = useState(false);
   const [approval, setApproval] = useState<Extract<AgentEvent, { type: "approval.requested" }>>();
+  const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [sessionQuery, setSessionQuery] = useState("");
 
   async function refresh() {
     setState(await window.deki.getBootstrapState());
+  }
+
+  async function refreshSessions() {
+    setSessions(await window.deki.listSessions());
   }
 
   useEffect(() => {
@@ -39,6 +43,7 @@ export function App() {
       }
       if (event.type === "run.completed" || event.type === "run.failed") {
         setBusy(false);
+        void refreshSessions();
       }
       if (event.type === "run.failed") {
         setError(event.error);
@@ -65,10 +70,28 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    if (!state) return;
+    void refreshSessions().catch((reason) => setError(String(reason)));
+    if (!state.sessionId) {
+      setMessages([]);
+      return;
+    }
+    void window.deki.getSessionHistory()
+      .then(setMessages)
+      .catch((reason) => setError(String(reason)));
+  }, [state?.trusted, state?.workspace, state?.sessionId]);
+
+  useEffect(() => {
     if (!settings) return;
     const appearance = settings.effective.appearance;
     const root = document.documentElement;
-    root.dataset.theme = appearance.theme;
+    const media = window.matchMedia("(prefers-color-scheme: light)");
+    const applyTheme = () => {
+      root.dataset.theme = appearance.theme === "system"
+        ? (media.matches ? "light" : "dark")
+        : appearance.theme;
+    };
+    applyTheme();
     root.dataset.accent = appearance.accent;
     root.dataset.density = appearance.density;
     root.dataset.highContrast = String(appearance.highContrast);
@@ -76,10 +99,19 @@ export function App() {
     root.style.setProperty("--code-font", appearance.codeFont);
     root.style.setProperty("--sidebar-width", `${appearance.sidebarWidth}px`);
     root.classList.toggle("reduce-motion", appearance.reduceMotion);
+    media.addEventListener("change", applyTheme);
+    return () => media.removeEventListener("change", applyTheme);
   }, [settings]);
 
   const toolEvents = useMemo(
     () => events.filter((event) => event.type.startsWith("tool.")),
+    [events],
+  );
+  const diffs = useMemo(
+    () => events.filter(
+      (event): event is Extract<AgentEvent, { type: "diff.available" }> =>
+        event.type === "diff.available",
+    ),
     [events],
   );
   const locale = resolveLocale(settings);
@@ -90,6 +122,10 @@ export function App() {
   const projectName = state?.workspace
     ? getWorkspaceName(state.workspace)
     : (zh ? "普通会话" : "General chat");
+  const visibleSessions = sessions.filter((session) => {
+    const query = sessionQuery.trim().toLocaleLowerCase();
+    return !query || `${session.name ?? ""} ${session.firstMessage}`.toLocaleLowerCase().includes(query);
+  });
 
   if (!state) {
     return <main className="loading">正在启动 Deki…</main>;
@@ -127,7 +163,10 @@ export function App() {
         hasWorkspace={Boolean(state.workspace && state.trusted)}
         locale={locale}
         onChanged={setSettings}
-        onClose={() => setShowSettings(false)}
+        onClose={() => {
+          setShowSettings(false);
+          void refresh();
+        }}
         onRefreshState={refresh}
       />
     );
@@ -236,17 +275,57 @@ export function App() {
                 +
               </button>
             </header>
-            <button className="session-item active">
-              <span className="navigation-icon chat-icon" aria-hidden="true" />
-              <span className="navigation-copy">
-                <strong>{messages.length > 0 ? getSessionTitle(messages) : (zh ? "新会话" : "New chat")}</strong>
-                <small>
-                  {state.sessionId
-                    ? `会话 ${state.sessionId.slice(0, 8)}`
-                    : (zh ? "等待模型就绪" : "Waiting for a model")}
-                </small>
-              </span>
-            </button>
+            {sessions.length > 4 && <input className="session-search" value={sessionQuery} onChange={(event) => setSessionQuery(event.target.value)} placeholder={zh ? "搜索会话…" : "Search sessions…"} />}
+            <div className="session-list">
+              {visibleSessions.map((session) => (
+                <div className={`session-row${session.current ? " active" : ""}`} key={session.id}>
+                  <button
+                    className="session-item"
+                    disabled={busy}
+                    onClick={() => {
+                      if (session.current) return;
+                      setMessages([]);
+                      setEvents([]);
+                      void runCommand(window.deki.switchSession(session.id), setError, refresh);
+                    }}
+                  >
+                    <span className="navigation-icon chat-icon" aria-hidden="true" />
+                    <span className="navigation-copy">
+                      <strong>{session.name || session.firstMessage || (zh ? "新会话" : "New chat")}</strong>
+                      <small>{session.messageCount} {zh ? "条消息" : "messages"} · {new Date(session.updatedAt).toLocaleDateString()}</small>
+                    </span>
+                  </button>
+                  <div className="session-actions">
+                    <button
+                      className="icon-button"
+                      aria-label={zh ? "重命名会话" : "Rename session"}
+                      onClick={() => {
+                        const name = window.prompt(zh ? "输入会话名称" : "Session name", session.name ?? session.firstMessage);
+                        if (name?.trim()) void runCommand(window.deki.renameSession(session.id, name.trim()), setError, refreshSessions);
+                      }}
+                    >✎</button>
+                    {!session.current && <button
+                      className="icon-button danger-text"
+                      aria-label={zh ? "删除会话" : "Delete session"}
+                      onClick={() => {
+                        if (window.confirm(zh ? "将此会话移到废纸篓？" : "Move this session to the trash?")) {
+                          void runCommand(window.deki.deleteSession(session.id), setError, refreshSessions);
+                        }
+                      }}
+                    >×</button>}
+                  </div>
+                </div>
+              ))}
+              {visibleSessions.length === 0 && (
+                <button className="session-item active" disabled>
+                  <span className="navigation-icon chat-icon" aria-hidden="true" />
+                  <span className="navigation-copy">
+                    <strong>{zh ? "新会话" : "New chat"}</strong>
+                    <small>{state.ready ? (zh ? "尚未保存消息" : "No saved messages") : (zh ? "等待模型就绪" : "Waiting for a model")}</small>
+                  </span>
+                </button>
+              )}
+            </div>
           </section>
         </nav>
 
@@ -366,6 +445,16 @@ export function App() {
           </section>
 
           <aside className="side-panel">
+            {diffs.length > 0 && (
+              <Panel title={zh ? "变更 Diff" : "Change diffs"} count={diffs.length}>
+                {diffs.slice(-3).reverse().map((event, index) => (
+                  <details className="diff-entry" key={event.eventId} open={index === 0}>
+                    <summary>{zh ? "文件修改" : "File change"} · {event.callId.slice(0, 8)}</summary>
+                    <pre>{event.diff}</pre>
+                  </details>
+                ))}
+              </Panel>
+            )}
             <Panel title="Tool Timeline" count={toolEvents.length}>
               {toolEvents.length === 0
                 ? <EmptyLine text="等待工具调用" />
@@ -527,12 +616,4 @@ function formatEventType(type: AgentEvent["type"]): string {
 function getWorkspaceName(workspace: string): string {
   const normalized = workspace.replace(/[\\/]+$/, "");
   return normalized.split(/[\\/]/).at(-1) || workspace;
-}
-
-function getSessionTitle(messages: ChatMessage[]): string {
-  const firstUserMessage = messages.find((message) => message.role === "user");
-  if (!firstUserMessage) return "当前会话";
-  return firstUserMessage.content.length > 22
-    ? `${firstUserMessage.content.slice(0, 22)}…`
-    : firstUserMessage.content;
 }

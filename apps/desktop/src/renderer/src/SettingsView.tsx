@@ -10,6 +10,7 @@ import type {
   SettingsPatch,
   SettingsScope,
   SettingsSnapshot,
+  SkillStatus,
 } from "@deki-ai/shared";
 import {
   builtinModelProviders,
@@ -47,6 +48,15 @@ const sectionMeta: Array<{ id: SectionId; zh: string; en: string; keywords: stri
   { id: "advanced", zh: "高级与诊断", en: "Advanced & Diagnostics", keywords: "logs proxy certificate diagnostics experimental 日志 代理 诊断" },
   { id: "about", zh: "关于", en: "About", keywords: "version license agpl update 版本 许可证" },
 ];
+const projectScopedSections = new Set<SectionId>([
+  "models",
+  "agent",
+  "workspace",
+  "permissions",
+  "mcp",
+  "skills",
+  "memory",
+]);
 
 const permissionLabels: Record<PermissionCategory, [string, string]> = {
   "workspace.read": ["工作区读取", "Workspace read"],
@@ -91,6 +101,10 @@ export function SettingsView(props: {
   useEffect(() => {
     if (!props.hasWorkspace && scope !== "global") setScope("global");
   }, [props.hasWorkspace, scope]);
+
+  useEffect(() => {
+    if (scope !== "global" && !projectScopedSections.has(section)) setScope("global");
+  }, [scope, section]);
 
   const visibleSections = useMemo(() => {
     const needle = query.trim().toLocaleLowerCase();
@@ -167,8 +181,8 @@ export function SettingsView(props: {
             <label>{zh ? "作用域" : "Scope"}</label>
             <select value={scope} onChange={(event) => setScope(event.target.value as SettingsScope)}>
               <option value="global">{zh ? "全局" : "Global"}</option>
-              <option value="projectShared" disabled={!props.hasWorkspace}>{zh ? "当前项目（共享）" : "Current project (shared)"}</option>
-              <option value="projectLocal" disabled={!props.hasWorkspace}>{zh ? "当前项目（本机）" : "Current project (local)"}</option>
+              <option value="projectShared" disabled={!props.hasWorkspace || !projectScopedSections.has(section)}>{zh ? "当前项目（共享）" : "Current project (shared)"}</option>
+              <option value="projectLocal" disabled={!props.hasWorkspace || !projectScopedSections.has(section)}>{zh ? "当前项目（本机）" : "Current project (local)"}</option>
             </select>
             <button className="ghost small-action" disabled={saving} onClick={() => void reset([section])}>
               {zh ? "恢复本分类" : "Reset section"}
@@ -212,9 +226,9 @@ export function SettingsView(props: {
           )}
           {section === "permissions" && <PermissionSettings value={value} source={source} zh={zh} update={update} />}
           {section === "mcp" && <McpSettings value={value} source={source} zh={zh} update={update} hasWorkspace={props.hasWorkspace} />}
-          {section === "skills" && <SkillSettings value={value} source={source} zh={zh} update={update} />}
+          {section === "skills" && <SkillSettings value={value} source={source} zh={zh} update={update} scope={scope} />}
           {section === "memory" && <MemorySettings value={value} source={source} zh={zh} update={update} hasWorkspace={props.hasWorkspace} />}
-          {section === "privacy" && <PrivacySettings value={value} source={source} zh={zh} update={update} />}
+          {section === "privacy" && <PrivacySettings source={source} zh={zh} />}
           {section === "advanced" && <AdvancedSettings value={value} source={source} zh={zh} update={update} />}
           {section === "about" && <AboutSettings value={value} zh={zh} update={update} />}
         </div>
@@ -252,7 +266,7 @@ function GeneralSettings({ value, source, zh, update }: SettingsComponentProps) 
     <Toggle title={zh ? "恢复上次会话" : "Restore last session"} path="general.restoreSession" checked={value.general.restoreSession} source={source} onChange={(restoreSession) => update({ general: { restoreSession } })} />
     <Setting title={zh ? "关闭窗口时" : "When closing the window"} source={source("general.closeBehavior")}><select value={value.general.closeBehavior} onChange={(e) => void update({ general: { closeBehavior: e.target.value as "quit" | "keep-running" } })}><option value="quit">{zh ? "退出应用" : "Quit app"}</option><option value="keep-running">{zh ? "保持后台运行" : "Keep running"}</option></select></Setting>
     <Toggle title={zh ? "开机启动" : "Launch at login"} path="general.launchAtLogin" checked={value.general.launchAtLogin} source={source} onChange={(launchAtLogin) => update({ general: { launchAtLogin } })} />
-    <Toggle title={zh ? "检查更新" : "Check for updates"} description={zh ? "当前尚未配置发布源。" : "No release source is configured yet."} path="general.checkUpdates" checked={value.general.checkUpdates} source={source} onChange={(checkUpdates) => update({ general: { checkUpdates } })} />
+    <Toggle title={zh ? "检查更新" : "Check for updates"} description={zh ? "当前尚未配置发布源，因此暂不可用。" : "No release source is configured, so this is currently unavailable."} path="general.checkUpdates" checked={value.general.checkUpdates} disabled source={source} onChange={() => Promise.resolve()} />
   </>;
 }
 
@@ -286,8 +300,7 @@ function ModelSettings(props: SettingsComponentProps & {
     <Setting title={zh ? "普通会话默认模型" : "Default general model"} source={source("models.generalModel")}><select value={value.models.generalModel} onChange={(e) => void update({ models: { generalModel: e.target.value } })}><option value="">{zh ? "自动选择" : "Auto-select"}</option>{modelOptions.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select></Setting>
     <Setting title={zh ? "项目会话默认模型" : "Default project model"} source={source("models.projectModel")}><select value={value.models.projectModel} onChange={(e) => void update({ models: { projectModel: e.target.value } })}><option value="">{zh ? "自动选择" : "Auto-select"}</option>{modelOptions.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select></Setting>
     <Setting title={zh ? "思考强度" : "Thinking level"} source={source("models.thinkingLevel")}><select value={value.models.thinkingLevel} onChange={(e) => void update({ models: { thinkingLevel: e.target.value as DekiSettings["models"]["thinkingLevel"] } })}>{["off", "minimal", "low", "medium", "high", "xhigh"].map((item) => <option value={item} key={item}>{item}</option>)}</select></Setting>
-    <Range title={zh ? "请求超时（秒）" : "Request timeout (seconds)"} path="models.timeoutMs" value={Math.round(value.models.timeoutMs / 1000)} min={1} max={600} source={source} onChange={(seconds) => update({ models: { timeoutMs: seconds * 1000 } })} />
-    <Range title={zh ? "重试次数" : "Retries"} path="models.maxRetries" value={value.models.maxRetries} min={0} max={10} source={source} onChange={(maxRetries) => update({ models: { maxRetries } })} />
+    <Toggle title={zh ? "自动重试" : "Automatic retry"} description={zh ? "使用 Pi Runtime 的安全重试策略。" : "Uses the Pi Runtime safe retry policy."} path="models.maxRetries" checked={value.models.maxRetries > 0} source={source} onChange={(enabled) => update({ models: { maxRetries: enabled ? 2 : 0 } })} />
     <div className="settings-subsection">
       <div className="subsection-heading"><div><h2>{zh ? "内置模型服务商" : "Built-in model providers"}</h2><p>{zh ? "地址、协议和模型列表已经配置好，只需填写对应的 API Key。" : "Endpoints, protocols, and model catalogs are configured. Only an API key is required."}</p></div></div>
       <div className="builtin-provider-list">
@@ -441,20 +454,15 @@ function AgentSettings({ value, source, zh, update }: SettingsComponentProps) {
   return <>
     <Toggle title={zh ? "自动命名会话" : "Auto-name sessions"} path="agent.autoNameSessions" checked={value.agent.autoNameSessions} source={source} onChange={(autoNameSessions) => update({ agent: { autoNameSessions } })} />
     <Toggle title={zh ? "上下文压缩" : "Context compaction"} path="agent.compactionEnabled" checked={value.agent.compactionEnabled} source={source} onChange={(compactionEnabled) => update({ agent: { compactionEnabled } })} />
-    <Range title={zh ? "最大并发运行" : "Concurrent runs"} path="agent.maxConcurrentRuns" value={value.agent.maxConcurrentRuns} min={1} max={8} source={source} onChange={(maxConcurrentRuns) => update({ agent: { maxConcurrentRuns } })} />
-    <Toggle title={zh ? "显示思考摘要" : "Show thinking summary"} path="agent.showThinkingSummary" checked={value.agent.showThinkingSummary} source={source} onChange={(showThinkingSummary) => update({ agent: { showThinkingSummary } })} />
     <Range title={zh ? "会话保留天数" : "Session retention days"} path="agent.sessionRetentionDays" value={value.agent.sessionRetentionDays} min={1} max={3650} source={source} onChange={(sessionRetentionDays) => update({ agent: { sessionRetentionDays } })} />
   </>;
 }
 
 function WorkspaceSettings(props: SettingsComponentProps & { hasWorkspace: boolean; onRevoked: () => Promise<void> }) {
-  const { value, source, zh, update } = props;
+  const { zh } = props;
   return <>
     {!props.hasWorkspace && <p className="settings-warning">{zh ? "普通会话未关联项目；项目设置需要先选择并信任工作区。" : "General chat has no project. Select and trust a workspace for project settings."}</p>}
-    <Toggle title={zh ? "检测 Git 仓库" : "Detect Git repositories"} path="workspace.detectGit" checked={value.workspace.detectGit} source={source} onChange={(detectGit) => update({ workspace: { detectGit } })} />
-    <Toggle title={zh ? "加载项目记忆" : "Load project memory"} path="workspace.loadProjectMemory" checked={value.workspace.loadProjectMemory} source={source} onChange={(loadProjectMemory) => update({ workspace: { loadProjectMemory } })} />
-    <Setting title={zh ? "上下文忽略规则" : "Context ignore rules"} description={zh ? "每行一个路径或模式" : "One path or pattern per line"} source={source("workspace.contextIgnore")}><textarea value={value.workspace.contextIgnore.join("\n")} onChange={(e) => void update({ workspace: { contextIgnore: e.target.value.split("\n").map((item) => item.trim()).filter(Boolean) } })} /></Setting>
-    <Setting title={zh ? "项目说明文件" : "Project context files"} source={source("workspace.contextFiles")}><textarea value={value.workspace.contextFiles.join("\n")} onChange={(e) => void update({ workspace: { contextFiles: e.target.value.split("\n").map((item) => item.trim()).filter(Boolean) } })} /></Setting>
+    <p className="muted">{zh ? "项目上下文由受信任工作区中的 AGENTS.md 和 Skill 资源管理。" : "Project context is managed by AGENTS.md and skill resources in the trusted workspace."}</p>
     {props.hasWorkspace && <Setting title={zh ? "撤销当前工作区信任" : "Revoke workspace trust"} description={zh ? "会立即停止 MCP、卸载项目 Skill 并关闭项目 Runtime。" : "Immediately stops MCP, unloads project skills, and closes the project runtime."} source="local"><button className="danger" onClick={() => void props.onRevoked()}>{zh ? "撤销信任" : "Revoke trust"}</button></Setting>}
   </>;
 }
@@ -474,7 +482,7 @@ function PermissionSettings({ value, source, zh, update }: SettingsComponentProp
     ))}
     <Range title={zh ? "审批超时（秒）" : "Approval timeout (seconds)"} path="permissions.approvalTimeoutMs" value={value.permissions.approvalTimeoutMs / 1000} min={5} max={600} source={source} onChange={(seconds) => update({ permissions: { approvalTimeoutMs: seconds * 1000 } })} />
     <Range title={zh ? "审计保留天数" : "Audit retention days"} path="permissions.auditRetentionDays" value={value.permissions.auditRetentionDays} min={1} max={365} source={source} onChange={(auditRetentionDays) => update({ permissions: { auditRetentionDays } })} />
-    <Toggle title={zh ? "修改后始终显示完整 Diff" : "Always show full diff after changes"} path="permissions.showDiffAfterWrite" checked={value.permissions.showDiffAfterWrite} source={source} onChange={(showDiffAfterWrite) => update({ permissions: { showDiffAfterWrite } })} />
+    <Toggle title={zh ? "修改后始终显示完整 Diff" : "Always show full diff after changes"} description={zh ? "安全要求，固定开启。" : "Required by the safety policy and always enabled."} path="permissions.showDiffAfterWrite" checked disabled source={source} onChange={() => Promise.resolve()} />
   </>;
 }
 
@@ -482,6 +490,7 @@ function McpSettings({ value, source, zh, update, hasWorkspace }: SettingsCompon
   const [servers, setServers] = useState<McpServerEditor[]>([]);
   const [editing, setEditing] = useState<McpServerEditor>();
   const [message, setMessage] = useState<string>();
+  const [tools, setTools] = useState<Record<string, Array<{ name: string; description: string }>>>({});
   const refresh = async () => setServers(await window.deki.listMcpServers());
   useEffect(() => {
     if (hasWorkspace) void refresh();
@@ -495,6 +504,22 @@ function McpSettings({ value, source, zh, update, hasWorkspace }: SettingsCompon
       await refresh();
     }
   };
+  const runServerAction = async (
+    id: string,
+    action: "start" | "stop" | "restart" | "test",
+  ) => {
+    const result = action === "start"
+      ? await window.deki.startMcpServer(id)
+      : action === "stop"
+        ? await window.deki.stopMcpServer(id)
+        : action === "restart"
+          ? await window.deki.restartMcpServer(id)
+          : await window.deki.testMcpServer(id);
+    setMessage(result.ok
+      ? (result.error ?? (zh ? "操作成功" : "Operation succeeded"))
+      : result.error);
+    await refresh();
+  };
   return <>
     <p className="settings-warning">{zh ? "仅支持项目 .deki/mcp.json 中的 stdio Server；不内置示例，不支持 HTTP 或 OAuth。" : "Only stdio servers in project .deki/mcp.json are supported. No built-in examples, HTTP, or OAuth."}</p>
     <Toggle title={zh ? "启动已启用的 Server" : "Start enabled servers"} path="mcp.startEnabledServers" checked={value.mcp.startEnabledServers} source={source} onChange={(startEnabledServers) => update({ mcp: { startEnabledServers } })} />
@@ -503,27 +528,93 @@ function McpSettings({ value, source, zh, update, hasWorkspace }: SettingsCompon
     <div className="settings-subsection">
       <div className="subsection-heading"><div><h2>stdio Servers</h2><p>{hasWorkspace ? ".deki/mcp.json" : (zh ? "普通会话不可用" : "Unavailable in general chat")}</p></div><div><button className="ghost small-action" disabled={!hasWorkspace} onClick={() => void window.deki.reloadMcpServers()}>{zh ? "重载" : "Reload"}</button> <button className="primary small-action" disabled={!hasWorkspace} onClick={() => setEditing({ id: "server", command: "", args: [], enabled: true })}>{zh ? "添加" : "Add"}</button></div></div>
       {message && <p className="muted">{message}</p>}
-      {servers.map((server) => <div className="provider-card" key={server.id}><div><strong>{server.id}</strong><small>{server.command} {server.args.join(" ")} · {server.enabled ? "enabled" : "disabled"}</small></div><div><button className="ghost small-action" onClick={() => setEditing(server)}>{zh ? "编辑" : "Edit"}</button><button className="danger small-action" onClick={async () => { const result = await window.deki.removeMcpServer(server.id); setMessage(result.error); await refresh(); }}>{zh ? "删除" : "Remove"}</button></div></div>)}
+      {servers.map((server) => <div className="mcp-server-card" key={server.id}>
+        <div className="mcp-server-summary">
+          <div>
+            <strong>{server.id}</strong>
+            <span className={`provider-status ${server.state === "ready" ? "configured" : ""}`}>{server.state ?? "stopped"}</span>
+          </div>
+          <small>{server.command} {server.args.join(" ")} · {server.toolCount ?? 0} tools · {server.enabled ? "enabled" : "disabled"}</small>
+          {server.error && <p className="error compact">{server.error}</p>}
+        </div>
+        <div className="mcp-server-actions">
+          {server.state === "ready"
+            ? <button className="ghost small-action" onClick={() => void runServerAction(server.id, "stop")}>{zh ? "停止" : "Stop"}</button>
+            : <button className="ghost small-action" onClick={() => void runServerAction(server.id, "start")}>{zh ? "启动" : "Start"}</button>}
+          <button className="ghost small-action" onClick={() => void runServerAction(server.id, "restart")}>{zh ? "重启" : "Restart"}</button>
+          <button className="ghost small-action" onClick={() => void runServerAction(server.id, "test")}>{zh ? "测试" : "Test"}</button>
+          <button className="ghost small-action" onClick={async () => {
+            const listed = await window.deki.listMcpServerTools(server.id);
+            setTools((current) => ({ ...current, [server.id]: current[server.id] ? [] : listed }));
+          }}>{zh ? "Tools" : "Tools"}</button>
+          <button className="ghost small-action" onClick={() => setEditing(server)}>{zh ? "编辑" : "Edit"}</button>
+          <button className="danger small-action" onClick={async () => { const result = await window.deki.removeMcpServer(server.id); setMessage(result.error); await refresh(); }}>{zh ? "删除" : "Remove"}</button>
+        </div>
+        {(tools[server.id]?.length ?? 0) > 0 && <div className="mcp-tool-list">
+          {tools[server.id]?.map((tool) => <div key={tool.name}><strong>{tool.name}</strong><span>{tool.description}</span></div>)}
+        </div>}
+      </div>)}
       {editing && <div className="provider-editor"><div className="field-grid"><label><span>ID</span><input value={editing.id} onChange={(e) => setEditing({ ...editing, id: e.target.value })} /></label><label><span>{zh ? "命令" : "Command"}</span><input value={editing.command} onChange={(e) => setEditing({ ...editing, command: e.target.value })} /></label><label className="wide"><span>{zh ? "参数（每行一个）" : "Arguments (one per line)"}</span><textarea value={editing.args.join("\n")} onChange={(e) => setEditing({ ...editing, args: e.target.value.split("\n") })} /></label><label><span>cwd</span><input value={editing.cwd ?? ""} onChange={(e) => { const { cwd: _cwd, ...rest } = editing; setEditing(e.target.value ? { ...rest, cwd: e.target.value } : rest); }} /></label><label><span>enabled</span><input type="checkbox" checked={editing.enabled} onChange={(e) => setEditing({ ...editing, enabled: e.target.checked })} /></label></div><div className="editor-actions"><button className="ghost" onClick={() => setEditing(undefined)}>{zh ? "取消" : "Cancel"}</button><button className="primary" onClick={() => void save()}>{zh ? "保存" : "Save"}</button></div></div>}
     </div>
   </>;
 }
 
-function SkillSettings({ value, source, zh, update }: SettingsComponentProps) {
+function SkillSettings({ value, source, zh, update, scope }: SettingsComponentProps & { scope: SettingsScope }) {
+  const [skills, setSkills] = useState<SkillStatus[]>([]);
+  const [message, setMessage] = useState<string>();
+  const refresh = async () => setSkills(await window.deki.listSkills());
+  useEffect(() => {
+    void refresh();
+  }, [value.skills.enabled, value.skills.globalPaths, value.skills.disabledNames]);
   return <>
     <Toggle title={zh ? "启用 Skills" : "Enable skills"} path="skills.enabled" checked={value.skills.enabled} source={source} onChange={(enabled) => update({ skills: { enabled } })} />
-    <Setting title={zh ? "额外全局来源" : "Additional global paths"} description={zh ? "每行一个本机绝对路径" : "One local absolute path per line"} source={source("skills.globalPaths")}><textarea value={value.skills.globalPaths.join("\n")} onChange={(e) => void update({ skills: { globalPaths: e.target.value.split("\n").map((item) => item.trim()).filter(Boolean) } })} /></Setting>
-    <Setting title={zh ? "禁用的 Skill 名称" : "Disabled skill names"} source={source("skills.disabledNames")}><textarea value={value.skills.disabledNames.join("\n")} onChange={(e) => void update({ skills: { disabledNames: e.target.value.split("\n").map((item) => item.trim()).filter(Boolean) } })} /></Setting>
-    <p className="muted">{zh ? "保存后会校验并重新加载资源；冲突与缺失依赖会显示在运行诊断中。" : "Resources are validated and reloaded after saving; conflicts and missing dependencies appear in diagnostics."}</p>
+    <Setting title={zh ? "额外全局来源" : "Additional global paths"} description={scope === "global" ? (zh ? "每行一个本机绝对路径" : "One local absolute path per line") : (zh ? "机器路径只能在全局作用域修改" : "Machine paths can only be changed in global scope")} source={source("skills.globalPaths")}><textarea disabled={scope !== "global"} value={value.skills.globalPaths.join("\n")} onChange={(e) => void update({ skills: { globalPaths: e.target.value.split("\n").map((item) => item.trim()).filter(Boolean) } })} /></Setting>
+    <div className="settings-subsection">
+      <div className="subsection-heading">
+        <div><h2>{zh ? "已发现的 Skills" : "Discovered skills"}</h2><p>{zh ? "展示来源、格式、冲突和可信状态。" : "Shows source, format, conflicts, and trust."}</p></div>
+        <button className="ghost small-action" onClick={async () => {
+          const result = await window.deki.reloadSkills();
+          setMessage(result.ok ? (zh ? "Skills 已重新加载" : "Skills reloaded") : result.error);
+          await refresh();
+        }}>{zh ? "重新加载" : "Reload"}</button>
+      </div>
+      {message && <p className="muted">{message}</p>}
+      {skills.length === 0 && <div className="custom-provider-empty">{zh ? "未发现 Skill" : "No skills found"}</div>}
+      {skills.map((skill) => <div className="skill-card" key={`${skill.source}:${skill.path}`}>
+        <div>
+          <strong>{skill.name}</strong>
+          <span className={`provider-status ${skill.valid && skill.trusted ? "configured" : ""}`}>{skill.valid ? (skill.trusted ? "valid" : "untrusted") : "invalid"}</span>
+          <small>{skill.source} · {skill.path}</small>
+          {skill.diagnostics.map((diagnostic) => <p className="error compact" key={diagnostic}>{diagnostic}</p>)}
+        </div>
+        <label className="toggle">
+          <input type="checkbox" checked={skill.enabled} onChange={async (event) => {
+            const disabled = event.target.checked
+              ? value.skills.disabledNames.filter((name) => name !== skill.name)
+              : [...new Set([...value.skills.disabledNames, skill.name])];
+            await update({ skills: { disabledNames: disabled } });
+          }} />
+          <span />
+        </label>
+      </div>)}
+    </div>
   </>;
 }
 
 function MemorySettings({ value, source, zh, update, hasWorkspace }: SettingsComponentProps & { hasWorkspace: boolean }) {
   const [memories, setMemories] = useState<import("@deki-ai/shared").MemoryRecord[]>([]);
-  const refresh = async () => setMemories(await window.deki.listMemories());
+  const [memoryScope, setMemoryScope] = useState<"user" | "project">(hasWorkspace ? "project" : "user");
+  const [memoryQuery, setMemoryQuery] = useState("");
+  const refresh = async () => setMemories(await window.deki.listMemories(memoryScope));
   useEffect(() => {
+    if (!hasWorkspace && memoryScope === "project") {
+      setMemoryScope("user");
+      return;
+    }
     void refresh();
-  }, [hasWorkspace, value.memory.userMemoryEnabled, value.memory.projectMemoryEnabled]);
+  }, [hasWorkspace, memoryScope, value.memory.userMemoryEnabled, value.memory.projectMemoryEnabled]);
+  const visibleMemories = memories.filter((memory) =>
+    memory.content.toLocaleLowerCase().includes(memoryQuery.trim().toLocaleLowerCase()));
   return <>
     <Toggle title={zh ? "普通会话用户记忆" : "User memory in general chats"} path="memory.userMemoryEnabled" checked={value.memory.userMemoryEnabled} source={source} onChange={(userMemoryEnabled) => update({ memory: { userMemoryEnabled } })} />
     <Toggle title={zh ? "项目记忆" : "Project memory"} path="memory.projectMemoryEnabled" checked={value.memory.projectMemoryEnabled} source={source} onChange={(projectMemoryEnabled) => update({ memory: { projectMemoryEnabled } })} />
@@ -533,14 +624,25 @@ function MemorySettings({ value, source, zh, update, hasWorkspace }: SettingsCom
     <Range title={zh ? "项目记忆召回数量" : "Project recall count"} path="memory.projectRecallLimit" value={value.memory.projectRecallLimit} min={0} max={10} source={source} onChange={(projectRecallLimit) => update({ memory: { projectRecallLimit } })} />
     <Range title={zh ? "项目记忆字符预算" : "Project memory character budget"} path="memory.projectCharacterBudget" value={value.memory.projectCharacterBudget} min={0} max={10000} step={100} source={source} onChange={(projectCharacterBudget) => update({ memory: { projectCharacterBudget } })} />
     <div className="settings-subsection">
-      <div className="subsection-heading"><div><h2>{zh ? "记忆中心" : "Memory center"}</h2><p>{hasWorkspace ? (zh ? "当前项目作用域" : "Current project scope") : (zh ? "用户作用域" : "User scope")}</p></div><button className="ghost small-action" onClick={() => void refresh()}>{zh ? "刷新" : "Refresh"}</button></div>
-      {memories.length === 0 && <p className="muted">{zh ? "没有可管理的记忆。" : "No memories to manage."}</p>}
-      {memories.map((memory) => <div className="provider-card" key={memory.id}><div><strong>{memory.content}</strong><small>{memory.scope} · {memory.status} · {new Date(memory.updatedAt).toLocaleString()}</small></div><div>{memory.status === "pending" ? <><button className="primary small-action" onClick={async () => { await window.deki.updateMemory({ id: memory.id, status: "active" }); await refresh(); }}>{zh ? "确认" : "Accept"}</button><button className="danger small-action" onClick={async () => { await window.deki.deleteMemory(memory.id); await refresh(); }}>{zh ? "拒绝" : "Reject"}</button></> : <><button className="ghost small-action" onClick={async () => { await window.deki.updateMemory({ id: memory.id, pinned: !memory.pinned }); await refresh(); }}>{memory.pinned ? (zh ? "取消置顶" : "Unpin") : (zh ? "置顶" : "Pin")}</button><button className="ghost small-action" onClick={async () => { await window.deki.updateMemory({ id: memory.id, status: "archived" }); await refresh(); }}>{zh ? "归档" : "Archive"}</button><button className="danger small-action" onClick={async () => { await window.deki.deleteMemory(memory.id); await refresh(); }}>{zh ? "彻底删除" : "Delete"}</button></>}</div></div>)}
+      <div className="subsection-heading"><div><h2>{zh ? "记忆中心" : "Memory center"}</h2><p>{memoryScope === "project" ? (zh ? "当前项目作用域" : "Current project scope") : (zh ? "用户作用域" : "User scope")}</p></div><div className="button-group">{hasWorkspace && <select value={memoryScope} onChange={(event) => setMemoryScope(event.target.value as "user" | "project")}><option value="project">{zh ? "当前项目" : "Project"}</option><option value="user">{zh ? "用户" : "User"}</option></select>}<button className="ghost small-action" onClick={() => void refresh()}>{zh ? "刷新" : "Refresh"}</button></div></div>
+      <input className="memory-search" value={memoryQuery} onChange={(event) => setMemoryQuery(event.target.value)} placeholder={zh ? "搜索记忆…" : "Search memories…"} />
+      {visibleMemories.length === 0 && <p className="muted">{zh ? "没有可管理的记忆。" : "No memories to manage."}</p>}
+      {visibleMemories.map((memory) => <div className="provider-card" key={memory.id}><div><strong>{memory.content}</strong><small>{memory.scope} · {memory.status} · {new Date(memory.updatedAt).toLocaleString()}</small></div><div>{memory.status === "pending" ? <><button className="primary small-action" onClick={async () => { await window.deki.updateMemory({ id: memory.id, scope: memoryScope, status: "active" }); await refresh(); }}>{zh ? "确认" : "Accept"}</button><button className="danger small-action" onClick={async () => { await window.deki.deleteMemory(memory.id, memoryScope); await refresh(); }}>{zh ? "拒绝" : "Reject"}</button></> : <><button className="ghost small-action" onClick={async () => {
+        const content = window.prompt(zh ? "编辑记忆" : "Edit memory", memory.content);
+        if (content?.trim()) {
+          await window.deki.updateMemory({ id: memory.id, scope: memoryScope, content: content.trim() });
+          await refresh();
+        }
+      }}>{zh ? "编辑" : "Edit"}</button><button className="ghost small-action" onClick={async () => { await window.deki.updateMemory({ id: memory.id, scope: memoryScope, pinned: !memory.pinned }); await refresh(); }}>{memory.pinned ? (zh ? "取消置顶" : "Unpin") : (zh ? "置顶" : "Pin")}</button><button className="ghost small-action" onClick={async () => { await window.deki.updateMemory({ id: memory.id, scope: memoryScope, status: "archived" }); await refresh(); }}>{zh ? "归档" : "Archive"}</button>{hasWorkspace && <button className="ghost small-action" onClick={async () => {
+        const target = memoryScope === "project" ? "user" : "project";
+        await window.deki.moveMemory(memory.id, memoryScope, target);
+        await refresh();
+      }}>{memoryScope === "project" ? (zh ? "移到用户" : "Move to user") : (zh ? "移到项目" : "Move to project")}</button>}<button className="danger small-action" onClick={async () => { await window.deki.deleteMemory(memory.id, memoryScope); await refresh(); }}>{zh ? "彻底删除" : "Delete"}</button></>}</div></div>)}
     </div>
   </>;
 }
 
-function PrivacySettings({ value, source, zh, update }: SettingsComponentProps) {
+function PrivacySettings({ source, zh }: Pick<SettingsComponentProps, "source" | "zh">) {
   const [usage, setUsage] = useState<DataUsage>();
   useEffect(() => {
     void window.deki.getDataUsage().then(setUsage);
@@ -548,7 +650,6 @@ function PrivacySettings({ value, source, zh, update }: SettingsComponentProps) 
   return <>
     <Setting title={zh ? "本地数据占用" : "Local data usage"} description={usage ? `${formatBytes(usage.totalBytes)} · sessions ${formatBytes(usage.sessionsBytes)} · memory ${formatBytes(usage.memoryBytes)} · logs ${formatBytes(usage.logsBytes)}` : (zh ? "正在统计…" : "Calculating…")} source="local"><button className="ghost" onClick={() => void window.deki.getDataUsage().then(setUsage)}>{zh ? "刷新" : "Refresh"}</button></Setting>
     <Toggle title={zh ? "遥测" : "Telemetry"} description={zh ? "固定关闭，不会发送使用数据。" : "Always off; no usage data is sent."} path="privacy.telemetry" checked={false} disabled source={source} onChange={() => Promise.resolve()} />
-    <Range title={zh ? "日志保留天数" : "Log retention days"} path="privacy.logRetentionDays" value={value.privacy.logRetentionDays} min={1} max={365} source={source} onChange={(logRetentionDays) => update({ privacy: { logRetentionDays } })} />
     <Setting title={zh ? "数据目录" : "Data directory"} description="~/.deki/" source="local"><button className="ghost" onClick={() => void window.deki.openDataDirectory()}>{zh ? "在文件管理器中打开" : "Open in file manager"}</button></Setting>
     <Setting title={zh ? "脱敏诊断导出" : "Redacted diagnostics export"} description={zh ? "不包含 API Key、项目源码或完整审计 Diff。" : "Excludes API keys, project source, and full audit diffs."} source="local"><button className="ghost" onClick={() => void window.deki.exportDiagnostics()}>{zh ? "导出诊断包" : "Export diagnostics"}</button></Setting>
     <Setting title={zh ? "数据导出 / 导入" : "Data export / import"} description={zh ? "导出设置、脱敏 Provider 元数据和当前作用域记忆；不包含 API Key、源码、审计 Diff 或机器路径。导入前会预览数量。" : "Exports settings, redacted provider metadata, and current-scope memories. API keys, source, audit diffs, and machine paths are excluded. Import shows a preview."} source="local"><div className="button-group"><button className="ghost" onClick={() => void window.deki.exportData()}>{zh ? "导出" : "Export"}</button><button className="ghost" onClick={() => void window.deki.importData()}>{zh ? "导入" : "Import"}</button></div></Setting>
@@ -559,11 +660,8 @@ function PrivacySettings({ value, source, zh, update }: SettingsComponentProps) 
 
 function AdvancedSettings({ value, source, zh, update }: SettingsComponentProps) {
   return <>
-    <Setting title={zh ? "日志级别" : "Log level"} source={source("advanced.logLevel")}><select value={value.advanced.logLevel} onChange={(e) => void update({ advanced: { logLevel: e.target.value as DekiSettings["advanced"]["logLevel"] } })}>{["error", "warn", "info", "debug"].map((level) => <option key={level}>{level}</option>)}</select></Setting>
-    <Setting title={zh ? "代理 URL" : "Proxy URL"} source={source("advanced.proxyUrl")}><input placeholder="http://127.0.0.1:7890" value={value.advanced.proxyUrl} onChange={(e) => void update({ advanced: { proxyUrl: e.target.value } })} /></Setting>
-    <Setting title={zh ? "自定义 CA 证书路径" : "Custom CA certificate path"} source={source("advanced.customCaPath")}><input value={value.advanced.customCaPath} onChange={(e) => void update({ advanced: { customCaPath: e.target.value } })} /></Setting>
     <Range title={zh ? "Tool 输出上限（KB）" : "Tool output limit (KB)"} path="advanced.toolOutputLimitBytes" value={Math.round(value.advanced.toolOutputLimitBytes / 1024)} min={1} max={97656} source={source} onChange={(kb) => update({ advanced: { toolOutputLimitBytes: kb * 1024 } })} />
-    <Toggle title={zh ? "实验功能" : "Experimental features"} path="advanced.experimentalFeatures" checked={value.advanced.experimentalFeatures} source={source} onChange={(experimentalFeatures) => update({ advanced: { experimentalFeatures } })} />
+    <p className="muted">{zh ? "代理、证书和详细日志设置将在相应运行时支持完成后提供。" : "Proxy, certificate, and detailed logging settings will appear when runtime support is available."}</p>
   </>;
 }
 
@@ -571,6 +669,7 @@ function AboutSettings({ value, zh, update }: Pick<SettingsComponentProps, "valu
   return <>
     <div className="about-card"><div className="brand-mark">D</div><div><h2>Deki 0.0.0</h2><p>Electron 43.2.0 · Pi SDK 0.82.1 · MCP SDK 1.29.0</p></div></div>
     <Setting title={zh ? "开源许可证" : "Open-source license"} description="AGPL-3.0-or-later" source="product"><span className="value-text">GNU Affero General Public License v3.0 or later</span></Setting>
+    <Setting title={zh ? "主要第三方许可证" : "Key third-party licenses"} description={zh ? "完整清单会随正式发布包生成。" : "The complete inventory will be generated with release packages."} source="product"><details className="license-summary"><summary>{zh ? "查看" : "View"}</summary><p>Electron — MIT<br />React — MIT<br />Pi Coding Agent — MIT<br />Model Context Protocol SDK — MIT<br />Zod — MIT</p></details></Setting>
     <Setting title={zh ? "更新通道" : "Update channel"} description={zh ? "尚未配置发布源；不会自动下载更新。" : "No release source configured; updates are not downloaded."} source="global"><select value={value.updates.channel} onChange={(e) => void update({ updates: { channel: e.target.value as "stable" | "beta" } })}><option value="stable">Stable</option><option value="beta">Beta</option></select></Setting>
   </>;
 }

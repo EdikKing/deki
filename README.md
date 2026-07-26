@@ -11,14 +11,14 @@
 - Pi `AgentSessionRuntime` 流式消息和工具事件
 - 会话搜索、恢复、切换、重命名、删除与保留期限清理
 - 工作区信任门禁
-- 受控工作区工具：`read`、`grep`、`find`、`ls`、`edit`、`write`、`bash`
-- stdio MCP Server 的配置、启停、重启、测试和 Tool 列表
+- 受控工作区工具：`read`、`grep`、`find`、`ls`、`edit`、`write`、`delete`、`move`、`bash`
+- stdio MCP Server 的配置、启停、重启、测试、Tool 权限/开关/超时和本机环境变量
 - `.deki/skills`、`.agents/skills`、项目内 `.pi/skills` 的发现、校验和重载
 - `/remember`、模型生成的待确认记忆候选和用户/项目记忆中心
 - 本地 SQLite 记忆库和 Pi JSONL 会话
 - 内置常用云模型 Provider 与自定义 OpenAI 兼容 Provider
-- 全局、项目共享和项目本机设置、字段来源及修订冲突保护
-- 受权限网关保护的文件修改、Shell、MCP、完整 Diff Viewer 与脱敏审计
+- 全局、项目共享、项目本机和会话设置、字段来源及修订冲突保护
+- 受权限网关保护的文件修改、Shell、MCP、完整 Diff Viewer、历史审计与脱敏诊断
 
 当前版本不支持真实 Sandbox、本地模型、HTTP/OAuth MCP、内置 MCP Server 或自动更新下载。
 
@@ -65,6 +65,7 @@ Deki 用户数据只保存在 `~/.deki/`：
 - `memory/memory.db`：长期记忆
 - `models.json`：自定义云模型配置（权限 `0600`）
 - `projects/`：项目本机设置
+- `projects/<workspace-hash>/mcp-local.json`：本机 MCP 环境变量（权限 `0600`）
 - `logs/audit-*.jsonl`：脱敏权限审计与 Diff
 
 设置分层、密钥边界和权限规则详见

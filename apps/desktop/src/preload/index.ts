@@ -1,6 +1,7 @@
 import { contextBridge, ipcRenderer } from "electron";
 import {
   agentEventSchema,
+  auditRecordSummarySchema,
   bootstrapStateSchema,
   commandResultSchema,
   clearDataInputSchema,
@@ -184,6 +185,11 @@ const api: DekiDesktopApi = {
       await ipcRenderer.invoke(IPC_CHANNELS.openDataDirectory),
     );
   },
+  async openThirdPartyLicenses() {
+    return commandResultSchema.parse(
+      await ipcRenderer.invoke(IPC_CHANNELS.openThirdPartyLicenses),
+    );
+  },
   async listMcpServers() {
     return mcpServerEditorSchema.array().parse(
       await ipcRenderer.invoke(IPC_CHANNELS.listMcpServers),
@@ -258,6 +264,14 @@ const api: DekiDesktopApi = {
       }),
     );
   },
+  async clearMemoryScope(scope) {
+    return commandResultSchema.parse(
+      await ipcRenderer.invoke(
+        IPC_CHANNELS.clearMemoryScope,
+        memoryListInputSchema.parse({ scope }),
+      ),
+    );
+  },
   async moveMemory(id, from, to) {
     return memoryRecordSchema.parse(
       await ipcRenderer.invoke(
@@ -269,6 +283,11 @@ const api: DekiDesktopApi = {
   async getDataUsage() {
     return dataUsageSchema.parse(
       await ipcRenderer.invoke(IPC_CHANNELS.getDataUsage),
+    );
+  },
+  async listAuditRecords() {
+    return auditRecordSummarySchema.array().parse(
+      await ipcRenderer.invoke(IPC_CHANNELS.listAuditRecords),
     );
   },
   async factoryReset() {

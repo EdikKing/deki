@@ -36,6 +36,7 @@ test("starts a general chat without a workspace", async ({}, testInfo) => {
     await expect(window.getByTestId("settings-page")).toBeVisible();
     await expect(window.getByRole("heading", { name: /通用|General/ })).toBeVisible();
     const scope = window.locator(".scope-picker select");
+    await expect(scope.locator("option[value=session]")).toHaveCount(1);
     await expect(scope.locator("option[value=projectShared]")).toBeDisabled();
     await window.getByTestId("settings-section-appearance").click();
     await window.locator(".setting-row").filter({ has: window.locator("select option[value=light]") }).getByRole("combobox").selectOption("light");
@@ -104,6 +105,7 @@ test("trusts a workspace, streams fixture events, and recalls memory", async ({}
     await expect(mcpCard).toContainText("ready");
     await mcpCard.getByRole("button", { name: "Tools" }).click();
     await expect(mcpCard.getByText("echo", { exact: true })).toBeVisible();
+    await expect(mcpCard.locator(".mcp-tool-rule", { hasText: "echo" })).toContainText("read-only");
     await window.getByTestId("settings-section-skills").click();
     const skillCard = window.locator(".skill-card", { hasText: "test-skill" });
     await expect(skillCard).toContainText("valid");

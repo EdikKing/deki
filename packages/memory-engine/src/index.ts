@@ -225,6 +225,12 @@ export class MemoryEngine {
     ).run(id, scope, scopeId).changes > 0;
   }
 
+  clearScope(scope: "user" | "project", scopeId: string): number {
+    return Number(this.#database.prepare(
+      "DELETE FROM memories WHERE scope = ? AND scope_id = ?",
+    ).run(scope, scopeId).changes);
+  }
+
   archiveProjectMemory(scopeId: string, id: string): boolean {
     const result = this.#database.prepare(`
       UPDATE memories

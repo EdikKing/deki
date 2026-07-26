@@ -1,5 +1,5 @@
-import { mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
-import { isAbsolute, join, normalize, resolve, sep } from "node:path";
+import { appendFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { delimiter, isAbsolute, join, normalize, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   app,
@@ -8,6 +8,7 @@ import {
   ipcMain,
   net,
   protocol,
+  session,
   shell,
   type IpcMainInvokeEvent,
 } from "electron";
@@ -21,10 +22,12 @@ import {
   listRecentWorkspaces,
   loadMcpConfig,
   readMcpConfig,
+  readMcpLocalConfig,
   revokeWorkspaceTrust,
   resolveWorkspace,
   trustWorkspace,
   writeMcpConfig,
+  writeMcpLocalConfig,
   workspaceId,
   type DekiPaths,
 } from "@deki-ai/config";
@@ -42,6 +45,7 @@ import {
 } from "@deki-ai/settings";
 import {
   agentEventSchema,
+  auditRecordSummarySchema,
   approvalDecisionInputSchema,
   bootstrapStateSchema,
   commandResultSchema,
@@ -84,6 +88,7 @@ protocol.registerSchemesAsPrivileged([{
 }]);
 
 let controller: DesktopController | undefined;
+let quitting = false;
 
 class DesktopController {
   readonly #workspace: string | undefined;
@@ -100,6 +105,7 @@ class DesktopController {
   #starting: Promise<void> | undefined;
   #diagnostics: string[] = [];
   #reloadPending = false;
+  #activeRuns = 0;
   #recentWorkspaces: string[];
 
   private constructor(
@@ -142,6 +148,10 @@ class DesktopController {
     });
     const settingsSnapshot = await settings.initialize();
     applyNativeSettings(settingsSnapshot);
+    await cleanupGeneralLogs(
+      paths.logsRoot,
+      settingsSnapshot.effective.privacy.logRetentionDays,
+    );
     await cleanupExpiredSessions(
       runtimeWorkspace,
       join(paths.sessionsRoot, scopeId),
@@ -206,7 +216,16 @@ class DesktopController {
   }
 
   async sendPrompt(prompt: string): Promise<CommandResult> {
-    return this.#run(async (runtime) => runtime.prompt(prompt));
+    const limit = this.#settings.snapshot().effective.agent.maxConcurrentRuns;
+    if (this.#activeRuns >= limit) {
+      return { ok: false, error: `已达到并发运行上限（${limit}）` };
+    }
+    this.#activeRuns += 1;
+    try {
+      return await this.#run(async (runtime) => runtime.prompt(prompt));
+    } finally {
+      this.#activeRuns -= 1;
+    }
   }
 
   async abort(): Promise<CommandResult> {
@@ -266,8 +285,8 @@ class DesktopController {
     patch: SettingsPatch,
     expectedRevision: string,
   ): Promise<SettingsSnapshot> {
-    if (!this.#workspace && scope !== "global") {
-      throw new Error("普通会话只能修改全局设置");
+    if (!this.#workspace && scope !== "global" && scope !== "session") {
+      throw new Error("普通会话只能修改全局或当前会话设置");
     }
     assertSettingsScopePatch(scope, patch);
     const before = this.#settings.snapshot();
@@ -283,8 +302,8 @@ class DesktopController {
     keys: string[] | undefined,
     expectedRevision: string,
   ): Promise<SettingsSnapshot> {
-    if (!this.#workspace && scope !== "global") {
-      throw new Error("普通会话只能修改全局设置");
+    if (!this.#workspace && scope !== "global" && scope !== "session") {
+      throw new Error("普通会话只能修改全局或当前会话设置");
     }
     const before = this.#settings.snapshot();
     const snapshot = await this.#settings.reset(scope, keys, expectedRevision);
@@ -360,6 +379,14 @@ class DesktopController {
     return error ? { ok: false, error } : { ok: true };
   }
 
+  async openThirdPartyLicenses(): Promise<CommandResult> {
+    const file = app.isPackaged
+      ? join(process.resourcesPath, "THIRD_PARTY_LICENSES.md")
+      : join(app.getAppPath(), "resources", "THIRD_PARTY_LICENSES.md");
+    const error = await shell.openPath(file);
+    return error ? { ok: false, error } : { ok: true };
+  }
+
   async exportDiagnostics(owner?: BrowserWindow): Promise<CommandResult> {
     const selection = owner
       ? await dialog.showSaveDialog(owner, {
@@ -383,6 +410,14 @@ class DesktopController {
       settings: redactSettingsForExport(this.#settings.snapshot()),
       providers: await this.#models.list(),
       runtime: this.getState(),
+      recentAudit: (await this.listAuditRecords()).slice(0, 20).map((record) => ({
+        id: record.id,
+        timestamp: record.timestamp,
+        category: record.category,
+        policy: record.policy,
+        decision: record.decision,
+        status: record.status,
+      })),
     };
     await writeFile(selection.filePath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
     return { ok: true };
@@ -439,24 +474,34 @@ class DesktopController {
       }
       const globalSettings = settingsPatchSchema.parse(raw.globalSettings ?? {});
       const memories = Array.isArray(raw.memories) ? raw.memories : [];
+      const providers = redactedModelProviderSchema.array().parse(
+        Array.isArray(raw.providers) ? raw.providers : [],
+      );
       const confirmation = owner
         ? await dialog.showMessageBox(owner, {
             type: "question",
             title: "确认导入",
-            message: "导入全局设置和记忆？",
-            detail: `设置分类 ${Object.keys(globalSettings).length} 个，记忆 ${memories.length} 条。API Key 不会从导出文件导入。`,
-            buttons: ["取消", "导入"],
+            message: "导入全局设置、Provider 元数据和记忆？",
+            detail: `设置分类 ${Object.keys(globalSettings).length} 个，Provider ${providers.length} 个，记忆 ${memories.length} 条。可选择合并或替换当前作用域；API Key 不会导入。`,
+            buttons: ["取消", "合并", "替换当前作用域"],
             defaultId: 0,
             cancelId: 0,
           })
         : { response: 1 };
-      if (confirmation.response !== 1) return { ok: true };
-      const snapshot = this.#settings.snapshot();
+      if (confirmation.response === 0) return { ok: true };
+      let snapshot = this.#settings.snapshot();
+      if (confirmation.response === 2) {
+        snapshot = await this.#settings.reset("global", undefined, snapshot.revision);
+      }
       await this.#settings.update("global", globalSettings, snapshot.revision);
       const scope = this.#projectFeatures ? "project" : "user";
       const scopeId = this.#projectFeatures ? this.#scopeId : "user";
+      if (confirmation.response === 2) this.#memory.clearScope(scope, scopeId);
+      const existing = new Set(this.#memory.listMemories(scope, scopeId, { limit: 10_000 })
+        .map((memory) => memory.content));
       for (const candidate of memories) {
         if (!isRecord(candidate) || typeof candidate.content !== "string") continue;
+        if (existing.has(candidate.content.trim())) continue;
         try {
           this.#memory.createMemory({
             scope,
@@ -469,6 +514,18 @@ class DesktopController {
         } catch {
           // Invalid or sensitive entries are skipped; no secret is forced into memory.
         }
+      }
+      for (const provider of providers) {
+        await this.#models.upsert({
+          id: provider.id,
+          ...(provider.name ? { name: provider.name } : {}),
+          ...(provider.baseUrl ? { baseUrl: provider.baseUrl } : {}),
+          ...(provider.api ? { api: provider.api } : {}),
+          apiKey: { action: "keep" },
+          ...(provider.authHeader === undefined ? {} : { authHeader: provider.authHeader }),
+          ...(provider.headers ? { headers: provider.headers } : {}),
+          models: provider.models,
+        });
       }
       await this.#reloadRuntimeWhenIdle();
       return { ok: true };
@@ -488,6 +545,7 @@ class DesktopController {
   async listMcpServers(): Promise<McpServerEditor[]> {
     if (!this.#workspace || !this.#trusted) return [];
     const config = await readMcpConfig(this.#workspace);
+    const local = await readMcpLocalConfig(this.#mcpLocalFile());
     const statuses = new Map(this.#mcp.getStatuses().map((status) => [status.id, status]));
     return Object.entries(config.mcpServers).map(([id, server]) => {
       const status = statuses.get(id);
@@ -497,6 +555,14 @@ class DesktopController {
         args: server.args,
         ...(server.cwd ? { cwd: server.cwd } : {}),
         enabled: server.enabled,
+        tools: server.tools,
+        ...(local.servers[id]?.environment
+          ? {
+              environment: Object.fromEntries(
+                Object.keys(local.servers[id].environment).map((key) => [key, "[REDACTED]"]),
+              ),
+            }
+          : {}),
         state: status?.state ?? "stopped",
         toolCount: status?.toolCount ?? 0,
         ...(status?.error ? { error: status.error } : {}),
@@ -513,14 +579,34 @@ class DesktopController {
     }
     try {
       const config = await readMcpConfig(this.#workspace);
+      const previous = config.mcpServers[server.id];
+      const local = await readMcpLocalConfig(this.#mcpLocalFile());
+      const previousEnvironment = local.servers[server.id]?.environment ?? {};
+      const environment = Object.fromEntries(Object.entries(server.environment ?? {})
+        .flatMap(([key, value]) => {
+          const resolvedValue = value === "[REDACTED]" ? previousEnvironment[key] ?? "" : value;
+          return key.trim() && resolvedValue ? [[key, resolvedValue] as const] : [];
+        }));
+      if (Object.keys(environment).length > 0) {
+        local.servers[server.id] = { environment };
+      } else {
+        delete local.servers[server.id];
+      }
       config.mcpServers[server.id] = {
         command: server.command,
         args: server.args,
         ...(server.cwd ? { cwd: server.cwd } : {}),
         enabled: server.enabled,
+        tools: server.tools,
       };
       await writeMcpConfig(this.#workspace, config);
-      await this.#reloadRuntimeWhenIdle();
+      await writeMcpLocalConfig(this.#mcpLocalFile(), local);
+      if (server.enabled) {
+        const definitionsChanged = await this.#runtime?.startMcpServer(server.id);
+        if (definitionsChanged) await this.#reloadRuntimeWhenIdle();
+      } else if (previous?.enabled) {
+        await this.#runtime?.stopMcpServer(server.id);
+      }
       return { ok: true };
     } catch (error) {
       return { ok: false, error: formatError(error) };
@@ -535,7 +621,10 @@ class DesktopController {
       const config = await readMcpConfig(this.#workspace);
       delete config.mcpServers[id];
       await writeMcpConfig(this.#workspace, config);
-      await this.#reloadRuntimeWhenIdle();
+      const local = await readMcpLocalConfig(this.#mcpLocalFile());
+      delete local.servers[id];
+      await writeMcpLocalConfig(this.#mcpLocalFile(), local);
+      await this.#runtime?.stopMcpServer(id);
       return { ok: true };
     } catch (error) {
       return { ok: false, error: formatError(error) };
@@ -570,9 +659,11 @@ class DesktopController {
     if (!this.#workspace || !this.#trusted) return { ok: false, error: "MCP 只在受信任项目中可用" };
     const server = (await loadMcpConfig(this.#workspace)).mcpServers[id];
     if (!server) return { ok: false, error: "未找到 MCP Server" };
+    const environment = (await readMcpLocalConfig(this.#mcpLocalFile()))
+      .servers[id]?.environment;
     const result = await this.#mcp.testServer(
       `probe-${id}`,
-      server,
+      { ...server, ...(environment ? { environment } : {}) },
       this.#settings.snapshot().effective.mcp.startupTimeoutMs,
     );
     return result.state === "ready"
@@ -590,7 +681,12 @@ class DesktopController {
       if (!server) return { ok: false, error: "未找到 MCP Server" };
       server.enabled = enabled;
       await writeMcpConfig(this.#workspace, config);
-      await this.#reloadRuntimeWhenIdle();
+      if (enabled) {
+        const definitionsChanged = await this.#runtime?.startMcpServer(id);
+        if (definitionsChanged) await this.#reloadRuntimeWhenIdle();
+      } else {
+        await this.#runtime?.stopMcpServer(id);
+      }
       return { ok: true };
     } catch (error) {
       return { ok: false, error: formatError(error) };
@@ -601,6 +697,10 @@ class DesktopController {
     return (await this.#mcp.listServerTools(id)).map((tool) => ({
       name: tool.name,
       description: tool.description,
+      ...(tool.readOnlyHint === undefined ? {} : { readOnlyHint: tool.readOnlyHint }),
+      enabled: tool.enabled !== false,
+      ...(tool.permission ? { permission: tool.permission } : {}),
+      ...(tool.timeoutMs ? { timeoutMs: tool.timeoutMs } : {}),
     }));
   }
 
@@ -644,6 +744,11 @@ class DesktopController {
           if (declared) name = declared.trim();
           else diagnostics.push("缺少 frontmatter name");
           if (!description) diagnostics.push("缺少 frontmatter description");
+          diagnostics.push(...await validateSkillDependencies(
+            content,
+            resolve(skillFile, ".."),
+            this.#workspace,
+          ));
         } catch {
           diagnostics.push("缺少或无法读取 SKILL.md");
         }
@@ -696,6 +801,12 @@ class DesktopController {
       : { ok: false, error: "未找到记忆" };
   }
 
+  clearMemoryScope(requestedScope: "user" | "project"): CommandResult {
+    const { scope, scopeId } = this.#resolveMemoryScope(requestedScope);
+    const count = this.#memory.clearScope(scope, scopeId);
+    return { ok: true, error: `已清理 ${count} 条记忆` };
+  }
+
   moveMemory(
     id: string,
     from: "user" | "project",
@@ -733,6 +844,43 @@ class DesktopController {
     };
   }
 
+  async listAuditRecords() {
+    let files;
+    try {
+      files = (await readdir(this.#paths.logsRoot))
+        .filter((file) => /^audit-\d{4}-\d{2}-\d{2}\.jsonl$/u.test(file))
+        .sort()
+        .reverse()
+        .slice(0, 7);
+    } catch {
+      return [];
+    }
+    const records = [];
+    for (const file of files) {
+      try {
+        for (const line of (await readFile(join(this.#paths.logsRoot, file), "utf8"))
+          .split("\n").filter(Boolean).reverse()) {
+          const raw: unknown = JSON.parse(line);
+          if (!isRecord(raw) || !isRecord(raw.execution)) continue;
+          records.push(auditRecordSummarySchema.parse({
+            id: String(raw.id ?? ""),
+            timestamp: String(raw.timestamp ?? ""),
+            category: String(raw.category ?? ""),
+            policy: String(raw.policy ?? ""),
+            decision: String(raw.decision ?? ""),
+            status: String(raw.execution.status ?? ""),
+            ...(raw.details === undefined ? {} : { details: raw.details }),
+            ...(typeof raw.diff === "string" ? { diff: raw.diff } : {}),
+          }));
+          if (records.length >= 100) return records;
+        }
+      } catch {
+        // A malformed historical line is skipped without hiding valid audit records.
+      }
+    }
+    return records;
+  }
+
   async dispose(): Promise<void> {
     await this.#runtime?.dispose();
     this.#runtime = undefined;
@@ -764,9 +912,22 @@ class DesktopController {
         memoryEngine: this.#memory,
         mcpManager: this.#mcp,
         settings: this.#settings.snapshot().effective,
-        persistProjectGrant: async (category) => this.#persistProjectGrant(category),
+        mcpEnvironment: this.#workspace
+          ? Object.fromEntries(Object.entries(
+              (await readMcpLocalConfig(this.#mcpLocalFile())).servers,
+            ).map(([id, value]) => [id, value.environment]))
+          : {},
+        persistProjectGrant: async (category, grantKey) =>
+          this.#persistProjectGrant(category, grantKey),
         onEvent: (event) => {
           broadcastEvent(event);
+          if (event.type === "diagnostic") {
+            void writeDiagnosticLog(
+              this.#paths.logsRoot,
+              this.#settings.snapshot().effective.advanced.logLevel,
+              event,
+            );
+          }
           if (
             this.#reloadPending
             && (event.type === "run.completed" || event.type === "run.failed")
@@ -813,9 +974,20 @@ class DesktopController {
     }
   }
 
-  async #persistProjectGrant(category: PermissionCategory): Promise<void> {
+  async #persistProjectGrant(category: PermissionCategory, grantKey?: string): Promise<void> {
     if (!this.#workspace) return;
     const snapshot = this.#settings.snapshot();
+    if (grantKey?.includes(".")) {
+      await this.#settings.update("projectLocal", {
+        mcp: {
+          toolPolicies: {
+            ...snapshot.effective.mcp.toolPolicies,
+            [grantKey]: "allow",
+          },
+        },
+      }, snapshot.revision);
+      return;
+    }
     await this.#settings.update("projectLocal", {
       permissions: {
         policies: {
@@ -837,10 +1009,14 @@ class DesktopController {
     }
     return { scope: "user", scopeId: "user" };
   }
+
+  #mcpLocalFile(): string {
+    return join(this.#paths.projectsRoot, this.#scopeId, "mcp-local.json");
+  }
 }
 
 function assertSettingsScopePatch(scope: SettingsScope, patch: SettingsPatch): void {
-  if (scope === "global") return;
+  if (scope === "global" || scope === "session") return;
   const allowed = new Set([
     "models",
     "agent",
@@ -879,6 +1055,41 @@ async function cleanupExpiredSessions(
   }
 }
 
+async function cleanupGeneralLogs(logsRoot: string, retentionDays: number): Promise<void> {
+  try {
+    const cutoff = Date.now() - retentionDays * 86_400_000;
+    const files = await readdir(logsRoot, { withFileTypes: true });
+    await Promise.allSettled(files
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".log"))
+      .map(async (entry) => {
+        const path = join(logsRoot, entry.name);
+        if ((await stat(path)).mtimeMs < cutoff) await rm(path);
+      }));
+  } catch {
+    // Log retention cleanup must not prevent startup.
+  }
+}
+
+async function writeDiagnosticLog(
+  logsRoot: string,
+  configuredLevel: "error" | "warn" | "info" | "debug",
+  event: Extract<AgentEvent, { type: "diagnostic" }>,
+): Promise<void> {
+  const weights = { error: 0, warning: 1, info: 2 } as const;
+  const threshold = configuredLevel === "error" ? 0 : configuredLevel === "warn" ? 1 : 2;
+  if (weights[event.level] > threshold) return;
+  try {
+    await mkdir(logsRoot, { recursive: true });
+    await appendFile(
+      join(logsRoot, "deki.log"),
+      `${event.timestamp} ${event.level.toUpperCase()} ${event.message}\n`,
+      { encoding: "utf8", mode: 0o600 },
+    );
+  } catch {
+    // Logging must not affect runtime behavior.
+  }
+}
+
 async function bootstrap(): Promise<void> {
   const workspace = await resolveStartupWorkspace(process.argv);
   controller = await DesktopController.create(workspace);
@@ -904,6 +1115,15 @@ function createWindow(): BrowserWindow {
   });
 
   window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  window.on("close", () => {
+    if (
+      process.platform === "darwin"
+      && !quitting
+      && controller?.getSettings().effective.general.closeBehavior === "quit"
+    ) {
+      app.quit();
+    }
+  });
   window.webContents.on("will-navigate", (event, url) => {
     if (!isAllowedRendererUrl(url)) {
       event.preventDefault();
@@ -1110,6 +1330,13 @@ function registerIpcHandlers(): void {
     assertTrustedSender(event);
     return commandResultSchema.parse(await controller?.openDataDirectory());
   });
+  ipcMain.handle(IPC_CHANNELS.openThirdPartyLicenses, async (event) => {
+    assertTrustedSender(event);
+    return commandResultSchema.parse(
+      await controller?.openThirdPartyLicenses()
+        ?? { ok: false, error: "设置系统尚未就绪" },
+    );
+  });
   ipcMain.handle(IPC_CHANNELS.exportDiagnostics, async (event) => {
     assertTrustedSender(event);
     return commandResultSchema.parse(
@@ -1187,6 +1414,14 @@ function registerIpcHandlers(): void {
       controller?.deleteMemory(input.id, input.scope) ?? { ok: false, error: "Memory Engine 尚未就绪" },
     );
   });
+  ipcMain.handle(IPC_CHANNELS.clearMemoryScope, (event, raw) => {
+    assertTrustedSender(event);
+    const { scope } = memoryListInputSchema.parse(raw);
+    return commandResultSchema.parse(
+      controller?.clearMemoryScope(scope ?? "user")
+        ?? { ok: false, error: "Memory Engine 尚未就绪" },
+    );
+  });
   ipcMain.handle(IPC_CHANNELS.moveMemory, (event, raw) => {
     assertTrustedSender(event);
     if (!controller) throw new Error("Memory Engine 尚未就绪");
@@ -1202,6 +1437,12 @@ function registerIpcHandlers(): void {
       logsBytes: 0,
       configBytes: 0,
     });
+  });
+  ipcMain.handle(IPC_CHANNELS.listAuditRecords, async (event) => {
+    assertTrustedSender(event);
+    return auditRecordSummarySchema.array().parse(
+      await controller?.listAuditRecords() ?? [],
+    );
   });
   ipcMain.handle(IPC_CHANNELS.factoryReset, async (event) => {
     assertTrustedSender(event);
@@ -1350,11 +1591,28 @@ function broadcastSettings(raw: SettingsSnapshot): void {
 
 function applyNativeSettings(snapshot: SettingsSnapshot): void {
   app.setLoginItemSettings({ openAtLogin: snapshot.effective.general.launchAtLogin });
+  const proxyUrl = snapshot.effective.advanced.proxyUrl.trim();
+  if (proxyUrl) {
+    process.env.HTTP_PROXY = proxyUrl;
+    process.env.HTTPS_PROXY = proxyUrl;
+  } else {
+    delete process.env.HTTP_PROXY;
+    delete process.env.HTTPS_PROXY;
+  }
+  const caPath = snapshot.effective.advanced.customCaPath.trim();
+  if (caPath) process.env.NODE_EXTRA_CA_CERTS = caPath;
+  else delete process.env.NODE_EXTRA_CA_CERTS;
+  if (app.isReady()) {
+    void session.defaultSession.setProxy(proxyUrl
+      ? { proxyRules: proxyUrl }
+      : { mode: "direct" });
+  }
 }
 
 function requiresRuntimeReload(before: SettingsSnapshot, after: SettingsSnapshot): boolean {
   return JSON.stringify({
     agent: before.effective.agent,
+    advanced: before.effective.advanced,
     models: before.effective.models,
     mcp: before.effective.mcp,
     skills: before.effective.skills,
@@ -1362,6 +1620,7 @@ function requiresRuntimeReload(before: SettingsSnapshot, after: SettingsSnapshot
     permissions: before.effective.permissions,
   }) !== JSON.stringify({
     agent: after.effective.agent,
+    advanced: after.effective.advanced,
     models: after.effective.models,
     mcp: after.effective.mcp,
     skills: after.effective.skills,
@@ -1403,6 +1662,62 @@ async function fileSize(path: string): Promise<number> {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+async function validateSkillDependencies(
+  content: string,
+  skillDirectory: string,
+  workspace: string | undefined,
+): Promise<string[]> {
+  const raw = /^---[\s\S]*?^dependencies:\s*(.+?)\s*$[\s\S]*?^---/mu.exec(content)?.[1];
+  if (!raw) return [];
+  const dependencies = raw.replaceAll(/^\[|\]$/g, "")
+    .split(",")
+    .map((item) => item.trim().replaceAll(/^["']|["']$/g, ""))
+    .filter(Boolean);
+  const diagnostics: string[] = [];
+  for (const dependency of dependencies) {
+    let found = false;
+    if (dependency.startsWith("./") || dependency.startsWith("../")) {
+      try {
+        await stat(resolve(skillDirectory, dependency));
+        found = true;
+      } catch {
+        found = false;
+      }
+    } else if (dependency.startsWith("npm:")) {
+      const packageName = dependency.slice(4);
+      const candidates = [
+        workspace ? join(workspace, "node_modules", packageName, "package.json") : "",
+        join(process.cwd(), "node_modules", packageName, "package.json"),
+      ].filter(Boolean);
+      for (const candidate of candidates) {
+        try {
+          await stat(candidate);
+          found = true;
+          break;
+        } catch {
+          // Continue checking available package roots.
+        }
+      }
+    } else if (dependency.startsWith("command:")) {
+      const command = dependency.slice(8);
+      for (const directory of (process.env.PATH ?? "").split(delimiter)) {
+        try {
+          await stat(join(directory, command));
+          found = true;
+          break;
+        } catch {
+          // Continue searching PATH.
+        }
+      }
+    } else {
+      diagnostics.push(`无法识别依赖声明：${dependency}`);
+      continue;
+    }
+    if (!found) diagnostics.push(`缺少依赖：${dependency}`);
+  }
+  return diagnostics;
 }
 
 function isMemoryType(
@@ -1500,6 +1815,7 @@ app.on("window-all-closed", () => {
 });
 
 app.on("before-quit", () => {
+  quitting = true;
   void controller?.dispose();
 });
 

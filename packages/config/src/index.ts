@@ -17,6 +17,11 @@ export const mcpServerConfigSchema = z.object({
   args: z.array(z.string()).default([]),
   cwd: z.string().optional(),
   enabled: z.boolean().default(true),
+  tools: z.record(z.string(), z.object({
+    enabled: z.boolean().default(true),
+    permission: z.enum(["allow", "ask", "deny"]).optional(),
+    timeoutMs: z.number().int().min(1_000).max(600_000).optional(),
+  }).strict()).default({}),
 }).strict();
 
 export const mcpConfigSchema = z.object({
@@ -25,6 +30,12 @@ export const mcpConfigSchema = z.object({
 
 export type McpServerConfig = z.infer<typeof mcpServerConfigSchema>;
 export type McpConfig = z.infer<typeof mcpConfigSchema>;
+const mcpLocalConfigSchema = z.object({
+  servers: z.record(z.string(), z.object({
+    environment: z.record(z.string(), z.string()).default({}),
+  }).strict()).default({}),
+}).strict();
+export type McpLocalConfig = z.infer<typeof mcpLocalConfigSchema>;
 
 export interface DekiPaths {
   root: string;
@@ -175,6 +186,29 @@ export async function writeMcpConfig(
   await writeFile(temporary, `${JSON.stringify(parsed, null, 2)}\n`, {
     encoding: "utf8",
     mode: 0o644,
+  });
+  await rename(temporary, file);
+}
+
+export async function readMcpLocalConfig(file: string): Promise<McpLocalConfig> {
+  try {
+    return mcpLocalConfigSchema.parse(JSON.parse(await readFile(file, "utf8")));
+  } catch (error) {
+    if (isFileNotFound(error)) return { servers: {} };
+    throw new Error(`无法读取本机 MCP 配置 ${file}: ${formatError(error)}`, { cause: error });
+  }
+}
+
+export async function writeMcpLocalConfig(
+  file: string,
+  config: McpLocalConfig,
+): Promise<void> {
+  const parsed = mcpLocalConfigSchema.parse(config);
+  const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
+  await mkdir(resolve(file, ".."), { recursive: true });
+  await writeFile(temporary, `${JSON.stringify(parsed, null, 2)}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
   });
   await rename(temporary, file);
 }

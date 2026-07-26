@@ -1,12 +1,14 @@
-import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   isWorkspaceTrusted,
   loadMcpConfig,
+  readMcpLocalConfig,
   resolveWorkspace,
   trustWorkspace,
+  writeMcpLocalConfig,
   workspaceId,
 } from "./index";
 
@@ -72,5 +74,18 @@ describe("config", () => {
     }));
 
     await expect(loadMcpConfig(workspace)).rejects.toThrow("无法读取");
+  });
+
+  it("stores MCP environment only in the restricted local file", async () => {
+    const root = await mkdtemp(join(tmpdir(), "deki-mcp-local-"));
+    temporaryDirectories.push(root);
+    const file = join(root, "project", "mcp-local.json");
+    await writeMcpLocalConfig(file, {
+      servers: { fixture: { environment: { API_TOKEN: "secret" } } },
+    });
+    await expect(readMcpLocalConfig(file)).resolves.toEqual({
+      servers: { fixture: { environment: { API_TOKEN: "secret" } } },
+    });
+    expect((await stat(file)).mode & 0o777).toBe(0o600);
   });
 });

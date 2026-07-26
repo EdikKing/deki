@@ -87,4 +87,23 @@ describe("MemoryEngine", () => {
     expect(moved.scope).toBe("project");
     expect(engine.deleteMemory("project", "project-a", candidate.id)).toBe(true);
   });
+
+  it("clears only the selected memory scope", async () => {
+    const engine = await createEngine();
+    engine.createMemory({
+      scope: "user",
+      scopeId: "user",
+      content: "user memory",
+      source: { kind: "user_command" },
+    });
+    engine.createMemory({
+      scope: "project",
+      scopeId: "project-a",
+      content: "project memory",
+      source: { kind: "user_command" },
+    });
+    expect(engine.clearScope("user", "user")).toBe(1);
+    expect(engine.listMemories("user", "user")).toHaveLength(0);
+    expect(engine.listMemories("project", "project-a")).toHaveLength(1);
+  });
 });

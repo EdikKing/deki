@@ -1,8 +1,9 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  defaultSettings,
   ModelConfigStore,
   SettingsConflictError,
   SettingsStore,
@@ -59,6 +60,24 @@ describe("SettingsStore", () => {
       original.revision,
     )).rejects.toBeInstanceOf(SettingsConflictError);
   });
+
+  it("updates and resets current-session overrides without writing a file", async () => {
+    const root = await mkdtemp(join(tmpdir(), "deki-settings-session-"));
+    directories.push(root);
+    const globalFile = join(root, "settings.json");
+    const store = new SettingsStore({ globalFile });
+    let snapshot = await store.initialize();
+    snapshot = await store.update(
+      "session",
+      { appearance: { fontSize: 19 }, models: { maxRetries: 0 } },
+      snapshot.revision,
+    );
+    expect(snapshot.effective.appearance.fontSize).toBe(19);
+    expect(snapshot.sources["appearance.fontSize"]).toBe("session");
+    snapshot = await store.reset("session", ["appearance.fontSize"], snapshot.revision);
+    expect(snapshot.effective.appearance.fontSize).toBe(defaultSettings.appearance.fontSize);
+    await expect(readFile(globalFile, "utf8")).rejects.toThrow();
+  });
 });
 
 describe("ModelConfigStore", () => {
@@ -73,6 +92,7 @@ describe("ModelConfigStore", () => {
       baseUrl: "https://example.com/v1",
       api: "openai-completions",
       apiKey: { action: "set", value: "super-secret-key" },
+      headers: { "x-private-token": "header-secret" },
       models: [{ id: "model-1", name: "Model 1" }],
     });
 
@@ -81,6 +101,44 @@ describe("ModelConfigStore", () => {
       hasApiKey: true,
     })]);
     expect(JSON.stringify(await store.list())).not.toContain("super-secret-key");
+    expect(JSON.stringify(await store.list())).not.toContain("header-secret");
+    expect((await store.list())[0]?.headers).toEqual({
+      "x-private-token": "[REDACTED]",
+    });
     expect(await readFile(file, "utf8")).toContain("super-secret-key");
+    expect((await stat(file)).mode & 0o777).toBe(0o600);
+
+    await store.upsert({
+      id: "custom",
+      name: "Updated",
+      baseUrl: "https://example.com/v1",
+      api: "openai-completions",
+      apiKey: { action: "keep" },
+      headers: { "x-private-token": "[REDACTED]" },
+      models: [{ id: "model-1", name: "Model 1" }],
+    });
+    expect(await readFile(file, "utf8")).toContain("header-secret");
+  });
+
+  it("preserves a corrupt models file and falls back to the last valid backup", async () => {
+    const root = await mkdtemp(join(tmpdir(), "deki-models-corrupt-"));
+    directories.push(root);
+    const file = join(root, "models.json");
+    const store = new ModelConfigStore(file);
+    await store.upsert({
+      id: "first",
+      apiKey: { action: "set", value: "first-key" },
+      models: [{ id: "model-1" }],
+    });
+    await store.upsert({
+      id: "second",
+      apiKey: { action: "set", value: "second-key" },
+      models: [{ id: "model-2" }],
+    });
+    await writeFile(file, "{broken", "utf8");
+    const recovered = await store.list();
+    expect(recovered.map((provider) => provider.id)).toEqual(["first"]);
+    expect((await readdir(root)).some((entry) =>
+      entry.startsWith("models.json.corrupt-"))).toBe(true);
   });
 });

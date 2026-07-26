@@ -17,7 +17,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:electron": "pnpm build && playwright test --config playwright.config.ts"
+    "test:electron": "pnpm build && playwright test --config playwright.config.ts",
+    "license:generate": "node scripts/generate-third-party-licenses.mjs"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",

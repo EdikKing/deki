@@ -1,4 +1,4 @@
-import { access, readdir } from "node:fs/promises";
+import { access, readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { InMemoryCredentialStore, type Model } from "@earendil-works/pi-ai";
 import {
@@ -8,6 +8,7 @@ import {
   defineTool,
   ModelRuntime,
   SessionManager,
+  SettingsManager,
   type AgentSessionRuntime,
   type AgentSessionEvent,
   type ToolDefinition as PiToolDefinition,
@@ -44,7 +45,11 @@ export interface DekiAgentRuntimeOptions {
   memoryEngine: MemoryEngine;
   mcpManager: McpManager;
   settings: DekiSettings;
-  persistProjectGrant?: (category: import("@deki-ai/settings").PermissionCategory) => Promise<void>;
+  mcpEnvironment?: Record<string, Record<string, string>>;
+  persistProjectGrant?: (
+    category: import("@deki-ai/settings").PermissionCategory,
+    grantKey?: string,
+  ) => Promise<void>;
   onEvent: (event: AgentEvent) => void;
 }
 
@@ -117,9 +122,11 @@ export class DekiAgentRuntime {
       await this.#gateway.register(new WorkspaceToolsProvider(
         this.#permissions,
         this.#options.settings.advanced.toolOutputLimitBytes,
+        this.#options.settings.workspace.contextIgnore,
       ));
 
       this.#recalledMemories = this.#options.settings.memory.projectMemoryEnabled
+        && this.#options.settings.workspace.loadProjectMemory
         ? this.#options.memoryEngine.recallProjectMemories(
             this.#options.scopeId,
             "",
@@ -133,7 +140,7 @@ export class DekiAgentRuntime {
       await this.#gateway.register(new ProjectInfoProvider(this.#options.workspace));
 
       if (this.#options.settings.mcp.startEnabledServers) {
-        const mcpConfig = await loadMcpConfig(this.#options.workspace);
+        const mcpConfig = await this.#loadRuntimeMcpConfig();
         const mcpProviders = await this.#options.mcpManager.start(
           mcpConfig,
           this.#options.settings.mcp.startupTimeoutMs,
@@ -155,6 +162,14 @@ export class DekiAgentRuntime {
           ? `已发现项目 Skill: ${this.#skills.join(", ")}`
           : "当前工作区未发现项目 Skill",
       );
+      if (this.#options.settings.workspace.detectGit) {
+        try {
+          await access(join(this.#options.workspace, ".git"));
+          this.#addDiagnostic("已检测到 Git 工作区");
+        } catch {
+          this.#addDiagnostic("当前项目不是 Git 工作区");
+        }
+      }
     } else {
       this.#addDiagnostic("普通会话模式：未启用项目 Tool、Skill、MCP 和记忆");
       if (this.#options.settings.memory.userMemoryEnabled) {
@@ -375,9 +390,13 @@ export class DekiAgentRuntime {
     return (await this.#findSession(id)).path;
   }
 
-  async startMcpServer(id: string): Promise<void> {
+  async startMcpServer(id: string): Promise<boolean> {
     if (!this.#projectFeaturesEnabled()) throw new Error("普通会话不支持 MCP");
-    const config = await loadMcpConfig(this.#options.workspace);
+    const previousTools = this.#gateway.listTools()
+      .filter((tool) => tool.providerId === id)
+      .map((tool) => tool.modelName)
+      .sort();
+    const config = await this.#loadRuntimeMcpConfig();
     const server = config.mcpServers[id];
     if (!server) throw new Error("未找到 MCP Server");
     await this.#gateway.unregister(id, false);
@@ -388,7 +407,13 @@ export class DekiAgentRuntime {
     );
     if (!provider) throw new Error(this.#options.mcpManager.getStatuses().find((item) => item.id === id)?.error ?? "MCP 启动失败");
     await this.#gateway.register(provider);
-    this.#syncActiveTools();
+    const nextTools = this.#gateway.listTools()
+      .filter((tool) => tool.providerId === id)
+      .map((tool) => tool.modelName)
+      .sort();
+    const definitionsChanged = JSON.stringify(previousTools) !== JSON.stringify(nextTools);
+    if (!definitionsChanged) this.#syncActiveTools();
+    return definitionsChanged;
   }
 
   async stopMcpServer(id: string): Promise<void> {
@@ -401,7 +426,7 @@ export class DekiAgentRuntime {
     for (const status of this.#options.mcpManager.getStatuses()) {
       await this.#gateway.unregister(status.id, false);
     }
-    const config = await loadMcpConfig(this.#options.workspace);
+    const config = await this.#loadRuntimeMcpConfig();
     const providers = await this.#options.mcpManager.start(
       config,
       this.#options.settings.mcp.startupTimeoutMs,
@@ -463,10 +488,39 @@ export class DekiAgentRuntime {
       sessionStartEvent?: Parameters<typeof createAgentSessionFromServices>[0]["sessionStartEvent"];
     }) => {
       const recalled = [...this.#recalledMemories];
+      const contextFiles = this.#projectFeaturesEnabled()
+        ? await loadConfiguredContextFiles(
+            cwd,
+            this.#options.settings.workspace.contextFiles,
+            this.#options.settings.workspace.contextIgnore,
+          )
+        : [];
+      const modelContext = selectedModel.contextWindow ?? 128_000;
+      const compactionThreshold = Math.min(
+        this.#options.settings.agent.compactionThreshold,
+        Math.max(1_000, modelContext - 1_000),
+      );
+      const settingsManager = SettingsManager.inMemory({
+        compaction: {
+          enabled: this.#options.settings.agent.compactionEnabled,
+          reserveTokens: Math.max(1_000, modelContext - compactionThreshold),
+          keepRecentTokens: Math.max(1_000, Math.min(20_000, Math.floor(compactionThreshold / 4))),
+        },
+        hideThinkingBlock: !this.#options.settings.agent.showThinkingSummary,
+        retry: {
+          enabled: this.#options.settings.models.maxRetries > 0,
+          maxRetries: this.#options.settings.models.maxRetries,
+          provider: {
+            timeoutMs: this.#options.settings.models.timeoutMs,
+            maxRetries: this.#options.settings.models.maxRetries,
+          },
+        },
+      });
       const services = await createAgentSessionServices({
         cwd,
         agentDir: this.#options.paths.root,
         modelRuntime,
+        settingsManager,
         resourceLoaderOptions: {
           noContextFiles: !this.#projectFeaturesEnabled(),
           noExtensions: !this.#projectFeaturesEnabled(),
@@ -488,15 +542,19 @@ export class DekiAgentRuntime {
             ),
           }),
           agentsFilesOverride: (current) => ({
-            agentsFiles: recalled.length === 0
-              ? current.agentsFiles
-              : [
-                  ...current.agentsFiles,
+            agentsFiles: dedupeContextFiles([
+              ...current.agentsFiles.filter((file) =>
+                !matchesContextIgnore(file.path, this.#options.settings.workspace.contextIgnore)),
+              ...contextFiles,
+              ...(recalled.length === 0
+                ? []
+                : [
                   {
                     path: "deki://memory/project.md",
                     content: renderMemoryContext(recalled),
                   },
-                ],
+                ]),
+            ]),
           }),
         },
       });
@@ -583,17 +641,24 @@ export class DekiAgentRuntime {
         };
         const permissionControlled = tool.providerId !== "workspace" && tool.providerId !== "deki";
         if (permissionControlled) {
-          const readOnly = /^(?:get|list|read|search|find|query|status|health)/i.test(
-            tool.providerToolName,
-          );
+          const readOnly = tool.readOnlyHint === true;
+          const policy = this.#options.settings.mcp.toolPolicies[tool.internalName]
+            ?? tool.permission;
           await this.#permissions?.authorize({
             callId: toolCallId,
             category: readOnly ? "mcp.read" : "mcp.write",
             title: `MCP ${tool.internalName}`,
             description: readOnly
-              ? "MCP Tool 被识别为只读调用"
-              : "MCP Tool 可能产生外部副作用",
-            details: { provider: tool.providerId, tool: tool.providerToolName, input: params },
+              ? "MCP Server 明确标注此 Tool 为只读"
+              : "MCP Server 未提供只读保证，此 Tool 按可能有副作用处理",
+            details: {
+              provider: tool.providerId,
+              tool: tool.providerToolName,
+              input: params,
+              networkTargets: collectNetworkTargets(params),
+            },
+            ...(policy ? { policy } : {}),
+            grantKey: tool.internalName,
           });
         }
         try {
@@ -601,7 +666,7 @@ export class DekiAgentRuntime {
             tool.modelName,
             params,
             context,
-            this.#options.settings.mcp.callTimeoutMs,
+            tool.timeoutMs ?? this.#options.settings.mcp.callTimeoutMs,
           );
           if (permissionControlled) {
             await this.#permissions?.recordExecution(toolCallId, "succeeded", {
@@ -720,6 +785,21 @@ export class DekiAgentRuntime {
 
   #projectFeaturesEnabled(): boolean {
     return this.#options.projectFeatures !== false;
+  }
+
+  async #loadRuntimeMcpConfig() {
+    const config = await loadMcpConfig(this.#options.workspace);
+    return {
+      mcpServers: Object.fromEntries(Object.entries(config.mcpServers).map(([id, server]) => [
+        id,
+        {
+          ...server,
+          ...(this.#options.mcpEnvironment?.[id]
+            ? { environment: this.#options.mcpEnvironment[id] }
+            : {}),
+        },
+      ])),
+    };
   }
 
   #syncActiveTools(): void {
@@ -924,4 +1004,62 @@ function parseMemoryCandidates(value: string): Array<{
       type: record.type as "preference" | "fact" | "decision" | "experience",
     }];
   });
+}
+
+async function loadConfiguredContextFiles(
+  workspace: string,
+  configuredFiles: string[],
+  ignore: string[],
+): Promise<Array<{ path: string; content: string }>> {
+  const files: Array<{ path: string; content: string }> = [];
+  for (const configured of configuredFiles) {
+    const normalized = configured.replaceAll("\\", "/").replaceAll(/^\.\//g, "");
+    if (!normalized || normalized.startsWith("../") || normalized.startsWith("/")) continue;
+    if (matchesContextIgnore(normalized, ignore)) continue;
+    try {
+      files.push({
+        path: join(workspace, normalized),
+        content: await readFile(join(workspace, normalized), "utf8"),
+      });
+    } catch {
+      // Optional project context files are skipped when absent or unreadable.
+    }
+  }
+  return files;
+}
+
+function matchesContextIgnore(path: string, ignore: string[]): boolean {
+  const normalized = path.replaceAll("\\", "/");
+  return ignore.some((pattern) => {
+    const candidate = pattern.replaceAll("\\", "/").replaceAll(/^\.\//g, "").replaceAll(/\*+/g, "");
+    return Boolean(candidate)
+      && (normalized === candidate
+        || normalized.startsWith(`${candidate}/`)
+        || normalized.split("/").includes(candidate));
+  });
+}
+
+function dedupeContextFiles<T extends { path: string }>(files: T[]): T[] {
+  const seen = new Set<string>();
+  return files.filter((file) => {
+    const key = file.path.replaceAll("\\", "/");
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function collectNetworkTargets(value: unknown): string[] {
+  const targets = new Set<string>();
+  const visit = (current: unknown) => {
+    if (typeof current === "string") {
+      for (const match of current.match(/https?:\/\/[^\s"'<>]+/giu) ?? []) targets.add(match);
+    } else if (Array.isArray(current)) {
+      for (const item of current) visit(item);
+    } else if (typeof current === "object" && current !== null) {
+      for (const child of Object.values(current)) visit(child);
+    }
+  };
+  visit(value);
+  return [...targets].slice(0, 20);
 }

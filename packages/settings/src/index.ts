@@ -79,6 +79,7 @@ const mcpSchema = z.object({
   startEnabledServers: z.boolean(),
   startupTimeoutMs: z.number().int().min(1_000).max(120_000),
   callTimeoutMs: z.number().int().min(1_000).max(600_000),
+  toolPolicies: z.record(z.string(), permissionPolicySchema),
 }).strict();
 
 const skillsSchema = z.object({
@@ -202,6 +203,7 @@ export const defaultSettings: DekiSettings = settingsSchema.parse({
     startEnabledServers: true,
     startupTimeoutMs: 20_000,
     callTimeoutMs: 30_000,
+    toolPolicies: {},
   },
   skills: {
     enabled: true,
@@ -254,7 +256,7 @@ export const settingsPatchSchema = z.object({
 }).strict();
 
 export type SettingsPatch = z.infer<typeof settingsPatchSchema>;
-export const settingsScopeSchema = z.enum(["global", "projectShared", "projectLocal"]);
+export const settingsScopeSchema = z.enum(["global", "projectShared", "projectLocal", "session"]);
 export type SettingsScope = z.infer<typeof settingsScopeSchema>;
 
 const storedSettingsSchema = z.object({
@@ -366,6 +368,11 @@ export class SettingsStore {
   ): Promise<SettingsSnapshot> {
     if (expectedRevision !== this.#revision()) throw new SettingsConflictError();
     const parsedPatch = settingsPatchSchema.parse(patch);
+    if (scope === "session") {
+      this.#session = settingsPatchSchema.parse(deepMerge(this.#session, parsedPatch));
+      settingsSchema.parse(deepMerge(this.snapshot().effective, parsedPatch));
+      return this.#emit();
+    }
     const target = this.#layer(scope);
     const nextSettings = settingsPatchSchema.parse(deepMerge(target.settings, parsedPatch));
     settingsSchema.parse(deepMerge(this.snapshot().effective, parsedPatch));
@@ -385,6 +392,15 @@ export class SettingsStore {
     expectedRevision: string,
   ): Promise<SettingsSnapshot> {
     if (expectedRevision !== this.#revision()) throw new SettingsConflictError();
+    if (scope === "session") {
+      const mutable = structuredClone(this.#session) as Record<string, unknown>;
+      if (!keys || keys.length === 0) this.#session = {};
+      else {
+        for (const key of keys) deletePath(mutable, key);
+        this.#session = settingsPatchSchema.parse(mutable);
+      }
+      return this.#emit();
+    }
     const target = this.#layer(scope);
     const settings = structuredClone(target.settings) as Record<string, unknown>;
     if (!keys || keys.length === 0) {
@@ -470,6 +486,7 @@ export const modelDefinitionSchema = z.object({
   input: z.array(z.enum(["text", "image"])).optional(),
   contextWindow: z.number().int().positive().optional(),
   maxTokens: z.number().int().positive().optional(),
+  compat: z.record(z.string(), z.unknown()).optional(),
 }).strict();
 
 export const modelProviderInputSchema = z.object({
@@ -523,7 +540,9 @@ export class ModelConfigStore {
       ...(provider.api ? { api: provider.api } : {}),
       hasApiKey: Boolean(provider.apiKey),
       ...(provider.authHeader === undefined ? {} : { authHeader: provider.authHeader }),
-      ...(provider.headers ? { headers: provider.headers } : {}),
+      ...(provider.headers
+        ? { headers: Object.fromEntries(Object.keys(provider.headers).map((key) => [key, "[REDACTED]"])) }
+        : {}),
       models: provider.models,
     }));
   }
@@ -537,13 +556,19 @@ export class ModelConfigStore {
       : input.apiKey.action === "keep"
         ? previous?.apiKey
         : undefined;
+    const headers = input.headers
+      ? Object.fromEntries(Object.entries(input.headers).map(([key, value]) => [
+          key,
+          value === "[REDACTED]" ? previous?.headers?.[key] ?? "" : value,
+        ]).filter(([, value]) => value !== ""))
+      : undefined;
     file.providers[input.id] = providerStoredSchema.parse({
       ...(input.name ? { name: input.name } : {}),
       ...(input.baseUrl ? { baseUrl: input.baseUrl } : {}),
       ...(input.api ? { api: input.api } : {}),
       ...(apiKey ? { apiKey } : {}),
       ...(input.authHeader === undefined ? {} : { authHeader: input.authHeader }),
-      ...(input.headers ? { headers: input.headers } : {}),
+      ...(headers && Object.keys(headers).length > 0 ? { headers } : {}),
       models: input.models,
     });
     await writeAtomicJson(this.#file, file);
@@ -565,6 +590,7 @@ export class ModelConfigStore {
         ? previous?.apiKey
         : undefined;
     const baseUrl = input.baseUrl ?? previous?.baseUrl;
+    const api = input.api ?? previous?.api ?? "openai-completions";
     if (!baseUrl) {
       throw new Error("测试连接需要 Base URL");
     }
@@ -574,12 +600,22 @@ export class ModelConfigStore {
       const headers = new Headers({
         accept: "application/json",
         ...(previous?.headers ?? {}),
-        ...(input.headers ?? {}),
+        ...Object.fromEntries(Object.entries(input.headers ?? {})
+          .filter(([, value]) => value !== "[REDACTED]")),
       });
-      if (apiKey && input.authHeader !== false) {
+      if (apiKey && api === "anthropic-messages") {
+        headers.set("x-api-key", apiKey);
+        headers.set("anthropic-version", "2023-06-01");
+      } else if (apiKey && input.authHeader !== false && api !== "google-generative-ai") {
         headers.set("authorization", `Bearer ${apiKey}`);
       }
-      const response = await fetch(`${baseUrl.replace(/\/+$/, "")}/models`, {
+      const normalizedBase = baseUrl.replace(/\/+$/, "");
+      const endpoint = api === "google-generative-ai"
+        ? `${normalizedBase}/models${apiKey ? `?key=${encodeURIComponent(apiKey)}` : ""}`
+        : api === "anthropic-messages"
+          ? `${normalizedBase}/v1/models`
+          : `${normalizedBase}/models`;
+      const response = await fetch(endpoint, {
         headers,
         signal: controller.signal,
       });
@@ -589,7 +625,9 @@ export class ModelConfigStore {
       const body: unknown = await response.json();
       const modelCount = isRecord(body) && Array.isArray(body.data)
         ? body.data.length
-        : input.models.length;
+        : isRecord(body) && Array.isArray(body.models)
+          ? body.models.length
+          : input.models.length;
       return { ok: true, modelCount };
     } finally {
       clearTimeout(timeout);
@@ -601,7 +639,15 @@ export class ModelConfigStore {
       return modelsFileSchema.parse(JSON.parse(await readFile(this.#file, "utf8")));
     } catch (error) {
       if (isNotFound(error)) return { providers: {} };
-      throw new Error(`模型配置无效: ${formatError(error)}`, { cause: error });
+      await preserveCorruptFile(this.#file);
+      try {
+        const backup = await readFile(`${this.#file}.bak`, "utf8");
+        const recovered = modelsFileSchema.parse(JSON.parse(backup));
+        await writeFile(this.#file, backup, { encoding: "utf8", mode: 0o600 });
+        return recovered;
+      } catch {
+        throw new Error(`模型配置无效且没有可用备份: ${formatError(error)}`, { cause: error });
+      }
     }
   }
 }

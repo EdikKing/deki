@@ -821,7 +821,7 @@ html[data-density="compact"] .setting-row { min-height: 58px; padding-block: 9px
 }
 .settings-toolbar h1 { margin: 0; font-size: 22px; }
 .settings-toolbar p { margin: 5px 0 0; color: #7486a4; font-size: 11px; }
-.scope-picker { display: flex; align-items: center; gap: 8px; }
+.scope-picker { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
 .scope-picker label { color: #7d8daa; font-size: 10px; }
 .scope-picker select { min-width: 150px; }
 .small-action { padding: 7px 10px; font-size: 11px; }
@@ -1082,6 +1082,13 @@ html[data-density="compact"] .setting-row { min-height: 58px; padding-block: 9px
 }
 .mcp-tool-list > div { display: grid; grid-template-columns: 180px 1fr; gap: 12px; font-size: 9px; }
 .mcp-tool-list span { color: #7587a6; }
+.mcp-tool-list > .mcp-tool-rule {
+  grid-template-columns: minmax(180px, 1fr) auto 110px 76px;
+  align-items: center;
+}
+.mcp-tool-rule > div { display: grid; gap: 3px; }
+.mcp-tool-rule input[type="number"] { width: 76px; }
+.model-editor-card { align-items: end; margin-top: 8px; }
 .skill-card {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -1108,6 +1115,16 @@ html[data-density="compact"] .setting-row { min-height: 58px; padding-block: 9px
 .license-summary { color: #8797b2; font-size: 10px; }
 .license-summary summary { cursor: pointer; color: #b8c6e1; }
 .license-summary p { line-height: 1.7; }
+.audit-entry {
+  margin: 7px 0;
+  padding: 9px 11px;
+  border: 1px solid #263552;
+  border-radius: 8px;
+  background: #0d1524;
+  font-size: 10px;
+}
+.audit-entry summary { cursor: pointer; color: #b8c6e1; }
+.audit-entry pre { max-height: 260px; overflow: auto; white-space: pre-wrap; color: #8294b4; }
 .provider-editor {
   margin-top: 12px;
   padding: 16px;

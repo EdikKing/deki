@@ -1,4 +1,4 @@
-import { mkdtemp, readFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -6,6 +6,7 @@ import { defaultSettings } from "@deki-ai/settings";
 import {
   classifyShell,
   createUnifiedDiff,
+  inspectShellBoundary,
   isSensitivePath,
   PermissionEngine,
   WorkspaceToolsProvider,
@@ -17,6 +18,11 @@ describe("PermissionEngine", () => {
     expect(classifyShell("git push origin main")).toBe("git.push");
     expect(classifyShell("pnpm install")).toBe("dependencies.install");
     expect(classifyShell("git status")).toBe("shell.safe");
+    expect(classifyShell("pnpm test")).toBe("shell.unknown");
+    expect(inspectShellBoundary("cat /etc/passwd")?.category).toBe("outsideWorkspace");
+    expect(inspectShellBoundary("cat ../secret")?.category).toBe("outsideWorkspace");
+    expect(inspectShellBoundary("cat .env")?.category).toBe("sensitiveFiles");
+    expect(inspectShellBoundary("python -c 'open(\"/tmp/x\")'")?.category).toBe("outsideWorkspace");
   });
 
   it("denies sensitive paths regardless of workspace write defaults", async () => {
@@ -96,5 +102,82 @@ describe("PermissionEngine", () => {
     expect(createUnifiedDiff("a.txt", "old", "new")).toContain(
       "--- a/a.txt\n+++ b/a.txt\n@@ -1,1 +1,1 @@\n-old\n+new",
     );
+  });
+
+  it("connects delete operations to workspace.delete and emits a pre-execution diff", async () => {
+    const root = await mkdtemp(join(tmpdir(), "deki-delete-"));
+    const events: Array<{ type: string; diff?: string | undefined }> = [];
+    const settings = structuredClone(defaultSettings);
+    settings.permissions.policies["workspace.delete"] = "allow";
+    const engine = new PermissionEngine({
+      workspace: root,
+      logsRoot: join(root, "logs"),
+      settings,
+      sessionId: () => "session",
+      model: () => "provider/model",
+      emit: (event) => events.push(event),
+    });
+    await writeFile(join(root, "remove.txt"), "remove me", "utf8");
+    const provider = new WorkspaceToolsProvider(engine);
+    await provider.callTool(
+      "delete",
+      { path: "remove.txt" },
+      { callId: "delete-1", workspace: root },
+    );
+    await expect(access(join(root, "remove.txt"))).rejects.toThrow();
+    expect(events.find((event) => event.type === "diff.available")?.diff).toContain(
+      "+++ b/remove.txt",
+    );
+  });
+
+  it("records workspace changes made by an approved shell command", async () => {
+    const root = await mkdtemp(join(tmpdir(), "deki-shell-diff-"));
+    const events: Array<{ type: string; diff?: string | undefined }> = [];
+    const settings = structuredClone(defaultSettings);
+    settings.permissions.policies["shell.unknown"] = "allow";
+    const engine = new PermissionEngine({
+      workspace: root,
+      logsRoot: join(root, "logs"),
+      settings,
+      sessionId: () => "session",
+      model: () => "provider/model",
+      emit: (event) => events.push(event),
+    });
+    await writeFile(join(root, "shell.txt"), "before\n", "utf8");
+    const provider = new WorkspaceToolsProvider(engine);
+    await provider.callTool(
+      "bash",
+      { command: "printf 'after\\n' > shell.txt" },
+      { callId: "shell-diff", workspace: root },
+    );
+    expect(events.find((event) => event.type === "diff.available")?.diff).toContain(
+      "-before",
+    );
+  });
+
+  it("captures file changes even when an approved shell command fails", async () => {
+    const root = await mkdtemp(join(tmpdir(), "deki-shell-failed-diff-"));
+    const events: Array<{ type: string; diff?: string | undefined }> = [];
+    const settings = structuredClone(defaultSettings);
+    settings.permissions.policies["shell.unknown"] = "allow";
+    const engine = new PermissionEngine({
+      workspace: root,
+      logsRoot: join(root, "logs"),
+      settings,
+      sessionId: () => "session",
+      model: () => "provider/model",
+      emit: (event) => events.push(event),
+    });
+    const provider = new WorkspaceToolsProvider(engine);
+    await expect(provider.callTool(
+      "bash",
+      { command: "printf 'partial\\n' > partial.txt; exit 2" },
+      { callId: "shell-failed-diff", workspace: root },
+    )).rejects.toThrow("命令退出");
+    expect(events.find((event) => event.type === "diff.available")?.diff).toContain(
+      "+++ b/partial.txt",
+    );
+    const auditFile = join(root, "logs", `audit-${new Date().toISOString().slice(0, 10)}.jsonl`);
+    expect((await readFile(auditFile, "utf8"))).toContain("partial.txt");
   });
 });

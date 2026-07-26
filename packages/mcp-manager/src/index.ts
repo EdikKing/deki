@@ -12,6 +12,9 @@ import type {
 } from "@deki-ai/shared";
 
 type StatusListener = (status: ServerStatus) => void;
+export type McpServerRuntimeConfig = McpServerConfig & {
+  environment?: Record<string, string>;
+};
 
 export class McpManager {
   readonly #providers = new Map<string, McpProvider>();
@@ -45,7 +48,7 @@ export class McpManager {
 
   async startServer(
     id: string,
-    server: McpServerConfig,
+    server: McpServerRuntimeConfig,
     startupTimeoutMs = 20_000,
   ): Promise<CapabilityProvider | undefined> {
     await this.stopServer(id);
@@ -83,19 +86,19 @@ export class McpManager {
 
   async restartServer(
     id: string,
-    server: McpServerConfig,
+    server: McpServerRuntimeConfig,
     startupTimeoutMs = 20_000,
   ): Promise<CapabilityProvider | undefined> {
     return this.startServer(id, server, startupTimeoutMs);
   }
 
   async listServerTools(id: string): Promise<ToolDefinition[]> {
-    return this.#providers.get(id)?.listTools() ?? [];
+    return this.#providers.get(id)?.listAllTools() ?? [];
   }
 
   async testServer(
     id: string,
-    server: McpServerConfig,
+    server: McpServerRuntimeConfig,
     startupTimeoutMs = 20_000,
   ): Promise<{ state: "ready" | "error"; toolCount: number; error?: string }> {
     const probe = new McpProvider(id, server, () => {});
@@ -129,7 +132,7 @@ export class McpManager {
 
 class McpProvider implements CapabilityProvider {
   readonly id: string;
-  readonly #config: McpServerConfig;
+  readonly #config: McpServerRuntimeConfig;
   readonly #onDisconnect: (error: string) => void;
   #client: Client | undefined;
   #transport: StdioClientTransport | undefined;
@@ -138,7 +141,7 @@ class McpProvider implements CapabilityProvider {
 
   constructor(
     id: string,
-    config: McpServerConfig,
+    config: McpServerRuntimeConfig,
     onDisconnect: (error: string) => void,
   ) {
     this.id = id;
@@ -155,6 +158,15 @@ class McpProvider implements CapabilityProvider {
       command: this.#config.command,
       args: this.#config.args,
       ...(this.#config.cwd ? { cwd: this.#config.cwd } : {}),
+      ...(this.#config.environment
+        ? {
+            env: {
+              ...Object.fromEntries(Object.entries(process.env)
+                .flatMap(([key, value]) => value === undefined ? [] : [[key, value] as const])),
+              ...this.#config.environment,
+            },
+          }
+        : {}),
       stderr: "pipe",
     });
     client.onclose = () => {
@@ -172,14 +184,25 @@ class McpProvider implements CapabilityProvider {
     const response = await client.listTools();
     this.#client = client;
     this.#transport = transport;
-    this.#tools = response.tools.map((tool) => ({
-      name: tool.name,
-      description: tool.description ?? `MCP tool ${tool.name}`,
-      inputSchema: tool.inputSchema as Record<string, unknown>,
-    }));
+    this.#tools = response.tools.map((tool) => {
+      const rule = this.#config.tools[tool.name];
+      return {
+        name: tool.name,
+        description: tool.description ?? `MCP tool ${tool.name}`,
+        inputSchema: tool.inputSchema as Record<string, unknown>,
+        readOnlyHint: tool.annotations?.readOnlyHint === true,
+        enabled: rule?.enabled ?? true,
+        ...(rule?.permission ? { permission: rule.permission } : {}),
+        ...(rule?.timeoutMs ? { timeoutMs: rule.timeoutMs } : {}),
+      };
+    });
   }
 
   async listTools(): Promise<ToolDefinition[]> {
+    return this.#tools.filter((tool) => tool.enabled !== false);
+  }
+
+  listAllTools(): ToolDefinition[] {
     return [...this.#tools];
   }
 

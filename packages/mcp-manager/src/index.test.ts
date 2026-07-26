@@ -20,6 +20,7 @@ describe("McpManager", () => {
           args: [fixture],
           cwd: process.cwd(),
           enabled: true,
+          tools: {},
         },
       },
     });
@@ -63,6 +64,7 @@ describe("McpManager", () => {
           args: [fixture],
           cwd: process.cwd(),
           enabled: true,
+          tools: {},
         },
       },
     });
@@ -94,6 +96,7 @@ describe("McpManager", () => {
           args: ["--eval", "process.exit(17)"],
           cwd: process.cwd(),
           enabled: true,
+          tools: {},
         },
       },
     });
@@ -117,6 +120,7 @@ describe("McpManager", () => {
           args: [fixture],
           cwd: process.cwd(),
           enabled: true,
+          tools: {},
         },
       },
     });
@@ -144,6 +148,7 @@ describe("McpManager", () => {
       args: [fixture],
       cwd: process.cwd(),
       enabled: true,
+      tools: {},
     };
     await expect(manager.startServer("fixture", config, 5_000)).resolves.toBeDefined();
     await expect(manager.listServerTools("fixture")).resolves.toHaveLength(4);
@@ -158,5 +163,34 @@ describe("McpManager", () => {
       state: "ready",
       toolCount: 4,
     });
+  });
+
+  it("uses server annotations and per-tool enable, permission, and timeout rules", async () => {
+    const manager = new McpManager();
+    managers.push(manager);
+    const fixture = resolve(process.cwd(), "tests/fixtures/mcp-server.mjs");
+    const [provider] = await manager.start({
+      mcpServers: {
+        fixture: {
+          command: process.execPath,
+          args: [fixture],
+          cwd: process.cwd(),
+          enabled: true,
+          tools: {
+            echo: { enabled: false, permission: "deny", timeoutMs: 2_000 },
+          },
+        },
+      },
+    });
+    await expect(provider!.listTools()).resolves.toHaveLength(3);
+    await expect(manager.listServerTools("fixture")).resolves.toContainEqual(
+      expect.objectContaining({
+        name: "echo",
+        readOnlyHint: true,
+        enabled: false,
+        permission: "deny",
+        timeoutMs: 2_000,
+      }),
+    );
   });
 });

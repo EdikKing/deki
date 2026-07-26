@@ -22,6 +22,9 @@ startup behavior. Project scopes can override model policy, agent behavior,
 workspace context, permissions, MCP, Skills and memory. Machine paths and
 secrets never enter the project-shared document.
 
+The current-session scope is in-memory only and sits above every persisted
+layer. Individual fields, a section, or the entire selected scope can be reset.
+
 ## Tool security
 
 General chats expose no project, file, shell, MCP, project skill or project
@@ -45,9 +48,20 @@ period. Approval choices are one-time, session, project-local, or deny.
 Approval timeout is equivalent to deny. There is no `sandbox` policy value;
 legacy values migrate to `ask`.
 
+Shell commands with explicit outside-workspace paths, sensitive paths, nested
+shells, inline interpreters, command substitution, or dynamic evaluation are
+denied before execution. Approved Shell commands snapshot workspace text files
+and emit post-execution diffs. Destructive file and directory work uses the
+dedicated `delete` and `move` tools so the approval includes a pre-execution
+diff.
+
 MCP lifecycle controls persist the enabled state and rebuild the affected agent
-runtime so newly discovered tool schemas are available to the model. Skills are
-reported with source, trust, validation and conflict diagnostics.
+runtime so newly discovered tool schemas are available to the model. Tool
+annotations are used instead of name guessing; each Tool supports an explicit
+enable switch, permission and timeout. MCP environment variables are stored
+only in the mode-`0600` project-local file and are masked in Renderer IPC.
+Skills are reported with source, trust, validation, dependency and conflict
+diagnostics.
 
 Automatic memory is off by default. When enabled, the current conversation
 model proposes at most three structured candidates after a successful task.

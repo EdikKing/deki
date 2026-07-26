@@ -60,6 +60,7 @@ const mcpSettingsSchema = z.object({
   startEnabledServers: z.boolean(),
   startupTimeoutMs: z.number().int(),
   callTimeoutMs: z.number().int(),
+  toolPolicies: z.record(z.string(), permissionPolicySchema),
 }).strict();
 const skillsSettingsSchema = z.object({
   enabled: z.boolean(),
@@ -124,7 +125,7 @@ export const settingsPatchSchema = z.object({
   updates: updatesSettingsSchema.partial().optional(),
 }).strict();
 export type SettingsPatch = z.infer<typeof settingsPatchSchema>;
-export const settingsScopeSchema = z.enum(["global", "projectShared", "projectLocal"]);
+export const settingsScopeSchema = z.enum(["global", "projectShared", "projectLocal", "session"]);
 export type SettingsScope = z.infer<typeof settingsScopeSchema>;
 export const settingsSnapshotSchema = z.object({
   revision: z.string(),
@@ -147,6 +148,7 @@ export const modelDefinitionSchema = z.object({
   input: z.array(z.enum(["text", "image"])).optional(),
   contextWindow: z.number().int().positive().optional(),
   maxTokens: z.number().int().positive().optional(),
+  compat: z.record(z.string(), z.unknown()).optional(),
 }).strict();
 export const modelProviderInputSchema = z.object({
   id: z.string().regex(/^[A-Za-z0-9_-]+$/),
@@ -411,6 +413,12 @@ export const mcpServerEditorSchema = z.object({
   args: z.array(z.string()).default([]),
   cwd: z.string().optional(),
   enabled: z.boolean(),
+  environment: z.record(z.string(), z.string()).optional(),
+  tools: z.record(z.string(), z.object({
+    enabled: z.boolean(),
+    permission: permissionPolicySchema.optional(),
+    timeoutMs: z.number().int().min(1_000).max(600_000).optional(),
+  }).strict()).default({}),
   state: z.enum(["stopped", "starting", "ready", "error"]).optional(),
   toolCount: z.number().int().nonnegative().optional(),
   error: z.string().optional(),
@@ -419,6 +427,10 @@ export type McpServerEditor = z.infer<typeof mcpServerEditorSchema>;
 export const mcpToolSummarySchema = z.object({
   name: z.string(),
   description: z.string(),
+  readOnlyHint: z.boolean().optional(),
+  enabled: z.boolean(),
+  permission: permissionPolicySchema.optional(),
+  timeoutMs: z.number().int().optional(),
 }).strict();
 export type McpToolSummary = z.infer<typeof mcpToolSummarySchema>;
 export const skillStatusSchema = z.object({
@@ -456,6 +468,17 @@ export const dataUsageSchema = z.object({
   configBytes: z.number().nonnegative(),
 }).strict();
 export type DataUsage = z.infer<typeof dataUsageSchema>;
+export const auditRecordSummarySchema = z.object({
+  id: z.string(),
+  timestamp: z.string(),
+  category: z.string(),
+  policy: z.string(),
+  decision: z.string(),
+  status: z.string(),
+  details: z.unknown().optional(),
+  diff: z.string().optional(),
+}).strict();
+export type AuditRecordSummary = z.infer<typeof auditRecordSummarySchema>;
 export const clearDataInputSchema = z.object({
   category: z.enum(["sessions", "memories", "logs"]),
 }).strict();
@@ -494,6 +517,7 @@ export const IPC_CHANNELS = {
   revokeWorkspaceTrust: "deki:revoke-workspace-trust",
   exportDiagnostics: "deki:export-diagnostics",
   openDataDirectory: "deki:open-data-directory",
+  openThirdPartyLicenses: "deki:open-third-party-licenses",
   listMcpServers: "deki:list-mcp-servers",
   upsertMcpServer: "deki:upsert-mcp-server",
   removeMcpServer: "deki:remove-mcp-server",
@@ -507,8 +531,10 @@ export const IPC_CHANNELS = {
   reloadSkills: "deki:reload-skills",
   updateMemory: "deki:update-memory",
   deleteMemory: "deki:delete-memory",
+  clearMemoryScope: "deki:clear-memory-scope",
   moveMemory: "deki:move-memory",
   getDataUsage: "deki:get-data-usage",
+  listAuditRecords: "deki:list-audit-records",
   factoryReset: "deki:factory-reset",
   exportData: "deki:export-data",
   importData: "deki:import-data",
@@ -555,6 +581,7 @@ export interface DekiDesktopApi {
   revokeWorkspaceTrust(): Promise<CommandResult>;
   exportDiagnostics(): Promise<CommandResult>;
   openDataDirectory(): Promise<CommandResult>;
+  openThirdPartyLicenses(): Promise<CommandResult>;
   listMcpServers(): Promise<McpServerEditor[]>;
   upsertMcpServer(server: McpServerEditor): Promise<CommandResult>;
   removeMcpServer(id: string): Promise<CommandResult>;
@@ -568,12 +595,14 @@ export interface DekiDesktopApi {
   reloadSkills(): Promise<CommandResult>;
   updateMemory(input: z.infer<typeof memoryMutationSchema>): Promise<MemoryRecord>;
   deleteMemory(id: string, scope?: "user" | "project"): Promise<CommandResult>;
+  clearMemoryScope(scope: "user" | "project"): Promise<CommandResult>;
   moveMemory(
     id: string,
     from: "user" | "project",
     to: "user" | "project",
   ): Promise<MemoryRecord>;
   getDataUsage(): Promise<DataUsage>;
+  listAuditRecords(): Promise<AuditRecordSummary[]>;
   factoryReset(): Promise<CommandResult>;
   exportData(): Promise<CommandResult>;
   importData(): Promise<CommandResult>;
@@ -586,6 +615,10 @@ export interface ToolDefinition {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
+  readOnlyHint?: boolean;
+  enabled?: boolean;
+  permission?: PermissionPolicy;
+  timeoutMs?: number;
 }
 
 export interface ToolCallContext {

@@ -1,4 +1,13 @@
-import { useEffect, useMemo, useState } from "react";
+import {
+  Children,
+  cloneElement,
+  isValidElement,
+  useEffect,
+  useMemo,
+  useState,
+  type ReactElement,
+  type ReactNode,
+} from "react";
 import type {
   DekiSettings,
   DataUsage,
@@ -40,18 +49,18 @@ type SectionId =
   | "about";
 
 const sectionMeta: Array<{ id: SectionId; zh: string; en: string; keywords: string }> = [
-  { id: "general", zh: "通用", en: "General", keywords: "language startup restore close update 语言 启动 恢复" },
-  { id: "appearance", zh: "外观", en: "Appearance", keywords: "theme accent font density sidebar motion contrast 主题 字体 密度" },
-  { id: "models", zh: "模型与提供方", en: "Models & Providers", keywords: "api key base url provider retry timeout model 模型 密钥" },
-  { id: "agent", zh: "Agent 与会话", en: "Agent & Sessions", keywords: "session compaction concurrency retention 会话 压缩 并发" },
-  { id: "workspace", zh: "项目与工作区", en: "Projects & Workspaces", keywords: "project trust git context ignore 项目 信任 上下文" },
-  { id: "permissions", zh: "权限", en: "Permissions", keywords: "allow ask deny shell file network audit 权限 审批 文件" },
-  { id: "mcp", zh: "MCP", en: "MCP", keywords: "stdio server tool timeout restart server 工具 超时" },
-  { id: "skills", zh: "Skills", en: "Skills", keywords: "skill reload conflict trust validate 技能 重载 冲突" },
-  { id: "memory", zh: "记忆", en: "Memory", keywords: "memory recall candidate sensitive budget 记忆 召回 候选" },
-  { id: "privacy", zh: "数据与隐私", en: "Data & Privacy", keywords: "data privacy export import clear reset telemetry 数据 隐私 导出" },
-  { id: "advanced", zh: "高级与诊断", en: "Advanced & Diagnostics", keywords: "logs proxy certificate diagnostics experimental 日志 代理 诊断" },
-  { id: "about", zh: "关于", en: "About", keywords: "version license agpl update 版本 许可证" },
+  { id: "general", zh: "通用", en: "General", keywords: "language locale startup restore close update launch window 语言 界面 启动 开机 恢复 窗口 关闭 更新 检查" },
+  { id: "appearance", zh: "外观", en: "Appearance", keywords: "theme accent font code density sidebar width motion animation contrast dark light 主题 强调色 字体 代码 密度 侧栏 宽度 动画 高对比 浅色 深色" },
+  { id: "models", zh: "模型与提供方", en: "Models & Providers", keywords: "api key base url provider headers retry timeout model reasoning context output image 模型 密钥 提供方 请求头 重试 超时 思考 上下文 输出 图像" },
+  { id: "agent", zh: "Agent 与会话", en: "Agent & Sessions", keywords: "session naming compaction concurrency retention summary restore history 会话 命名 压缩 并发 保留 摘要 恢复 历史" },
+  { id: "workspace", zh: "项目与工作区", en: "Projects & Workspaces", keywords: "project trust git checkpoint context ignore instruction recent 项目 信任 git 检查点 上下文 忽略 说明 最近" },
+  { id: "permissions", zh: "权限", en: "Permissions", keywords: "allow ask deny shell file network audit diff timeout install commit push sensitive 权限 审批 文件 网络 审计 差异 超时 安装 提交 推送 敏感" },
+  { id: "mcp", zh: "MCP", en: "MCP", keywords: "stdio server tool timeout restart environment command args cwd server 工具 超时 重启 环境变量 命令 参数" },
+  { id: "skills", zh: "Skills", en: "Skills", keywords: "skill reload conflict trust validate dependency source enable 技能 重载 冲突 信任 校验 依赖 来源 启用" },
+  { id: "memory", zh: "记忆", en: "Memory", keywords: "memory recall candidate sensitive budget user project task pin archive search 记忆 召回 候选 敏感 预算 用户 项目 任务 置顶 归档 搜索" },
+  { id: "privacy", zh: "数据与隐私", en: "Data & Privacy", keywords: "data privacy export import clear reset telemetry usage audit trash 数据 隐私 导出 导入 清理 重置 遥测 占用 审计 废纸篓" },
+  { id: "advanced", zh: "高级与诊断", en: "Advanced & Diagnostics", keywords: "logs log level proxy certificate ca diagnostics experimental output limit 日志 级别 代理 证书 诊断 实验 输出 上限" },
+  { id: "about", zh: "关于", en: "About", keywords: "version license agpl third party update channel release 版本 许可证 第三方 更新 通道 发布源" },
 ];
 const projectScopedSections = new Set<SectionId>([
   "models",
@@ -85,13 +94,14 @@ export function SettingsView(props: {
   hasWorkspace: boolean;
   taskId?: string;
   locale: Locale;
+  initialSection?: SectionId;
   onChanged: (snapshot: SettingsSnapshot) => void;
   onClose: () => void;
   onRefreshState: () => Promise<void>;
 }) {
   const [scope, setScope] = useState<SettingsScope>("global");
   const [resetKey, setResetKey] = useState("");
-  const [section, setSection] = useState<SectionId>("general");
+  const [section, setSection] = useState<SectionId>(props.initialSection ?? "general");
   const [query, setQuery] = useState("");
   const [error, setError] = useState<string>();
   const [saving, setSaving] = useState(false);
@@ -122,6 +132,12 @@ export function SettingsView(props: {
     return sectionMeta.filter((item) =>
       `${item.zh} ${item.en} ${item.keywords}`.toLocaleLowerCase().includes(needle));
   }, [query]);
+
+  useEffect(() => {
+    if (query.trim() && visibleSections.length > 0 && !visibleSections.some((item) => item.id === section)) {
+      setSection(visibleSections[0]!.id);
+    }
+  }, [query, section, visibleSections]);
 
   async function update(patch: SettingsPatch) {
     setSaving(true);
@@ -190,7 +206,7 @@ export function SettingsView(props: {
           </div>
           <div className="scope-picker">
             <label>{zh ? "作用域" : "Scope"}</label>
-            <select value={scope} onChange={(event) => setScope(event.target.value as SettingsScope)}>
+            <select aria-label={zh ? "设置作用域" : "Settings scope"} value={scope} onChange={(event) => setScope(event.target.value as SettingsScope)}>
               <option value="global">{zh ? "全局" : "Global"}</option>
               <option value="session">{zh ? "当前会话" : "Current session"}</option>
               <option value="projectShared" disabled={!props.hasWorkspace || !projectScopedSections.has(section)}>{zh ? "当前项目（共享）" : "Current project (shared)"}</option>
@@ -254,7 +270,9 @@ export function SettingsView(props: {
 
         <footer className="settings-footer">
           <span>{saving ? (zh ? "正在保存…" : "Saving…") : (zh ? "所有更改已保存" : "All changes saved")}</span>
-          <button className="ghost" disabled={saving} onClick={() => void reset()}>
+          <button className="danger-outline" disabled={saving} onClick={() => {
+            if (window.confirm(zh ? "恢复当前作用域的全部设置？此操作无法撤销。" : "Reset every setting in this scope? This cannot be undone.")) void reset();
+          }}>
             {zh ? "恢复当前作用域全部设置" : "Reset entire scope"}
           </button>
         </footer>
@@ -586,14 +604,71 @@ function PermissionSettings({ value, source, zh, update }: SettingsComponentProp
   const setPolicy = (category: PermissionCategory, policy: PermissionPolicy) => {
     void update({ permissions: { policies: { ...value.permissions.policies, [category]: policy } } });
   };
+  const groups: Array<{ title: string; categories: PermissionCategory[] }> = [
+    {
+      title: zh ? "文件与工作区" : "Files & workspace",
+      categories: ["workspace.read", "workspace.write", "workspace.delete", "outsideWorkspace", "sensitiveFiles"],
+    },
+    {
+      title: zh ? "Shell 与网络" : "Shell & network",
+      categories: ["shell.safe", "shell.unknown", "dependencies.install", "network", "privileged"],
+    },
+    {
+      title: "Git",
+      categories: ["git.commit", "git.push"],
+    },
+    {
+      title: "MCP",
+      categories: ["mcp.read", "mcp.write"],
+    },
+  ];
+  const applyPreset = (preset: "conservative" | "balanced" | "autonomous") => {
+    const next = { ...value.permissions.policies };
+    for (const category of Object.keys(next) as PermissionCategory[]) {
+      const alwaysDeny = category === "outsideWorkspace" || category === "sensitiveFiles" || category === "privileged";
+      if (alwaysDeny) next[category] = "deny";
+      else if (preset === "conservative") next[category] = category === "workspace.read" || category === "mcp.read" ? "allow" : "ask";
+      else if (preset === "autonomous") next[category] = ["workspace.read", "workspace.write", "shell.safe", "mcp.read"].includes(category) ? "allow" : "ask";
+      else {
+        const defaults: Partial<Record<PermissionCategory, PermissionPolicy>> = {
+          "workspace.read": "allow",
+          "workspace.write": "allow",
+          "workspace.delete": "ask",
+          "shell.safe": "allow",
+          "shell.unknown": "ask",
+          "dependencies.install": "ask",
+          "git.commit": "ask",
+          "git.push": "ask",
+          network: "ask",
+          "mcp.read": "allow",
+          "mcp.write": "ask",
+        };
+        next[category] = defaults[category] ?? "deny";
+      }
+    }
+    void update({ permissions: { policies: next } });
+  };
   return <>
     <p className="settings-warning">{zh ? "没有 sandbox 选项。敏感文件、提权和工作区外访问默认拒绝；其他高风险操作需要审批。" : "There is no sandbox option. Sensitive, privileged, and outside-workspace access is denied by default; other risky operations require approval."}</p>
-    {(Object.keys(permissionLabels) as PermissionCategory[]).map((category) => (
-      <Setting key={category} title={permissionLabels[category][zh ? 0 : 1]} source={source(`permissions.policies.${category}`)}>
-        <select value={value.permissions.policies[category]} onChange={(e) => setPolicy(category, e.target.value as PermissionPolicy)}>
-          <option value="allow">allow</option><option value="ask">ask</option><option value="deny">deny</option>
-        </select>
-      </Setting>
+    <div className="permission-presets" aria-label={zh ? "权限预设" : "Permission presets"}>
+      <span>{zh ? "快速预设" : "Quick presets"}</span>
+      <button className="ghost small-action" onClick={() => applyPreset("conservative")}>{zh ? "保守" : "Conservative"}</button>
+      <button className="ghost small-action" onClick={() => applyPreset("balanced")}>{zh ? "平衡（推荐）" : "Balanced (recommended)"}</button>
+      <button className="ghost small-action" onClick={() => applyPreset("autonomous")}>{zh ? "高自主" : "More autonomous"}</button>
+    </div>
+    {groups.map((group) => (
+      <section className="settings-group" key={group.title}>
+        <h2>{group.title}</h2>
+        {group.categories.map((category) => (
+          <Setting key={category} title={permissionLabels[category][zh ? 0 : 1]} source={source(`permissions.policies.${category}`)}>
+            <select value={value.permissions.policies[category]} onChange={(e) => setPolicy(category, e.target.value as PermissionPolicy)}>
+              <option value="allow">{zh ? "自动允许" : "Allow"}</option>
+              <option value="ask">{zh ? "每次确认" : "Ask"}</option>
+              <option value="deny">{zh ? "拒绝" : "Deny"}</option>
+            </select>
+          </Setting>
+        ))}
+      </section>
     ))}
     <Range title={zh ? "审批超时（秒）" : "Approval timeout (seconds)"} path="permissions.approvalTimeoutMs" value={value.permissions.approvalTimeoutMs / 1000} min={5} max={600} source={source} onChange={(seconds) => update({ permissions: { approvalTimeoutMs: seconds * 1000 } })} />
     <Range title={zh ? "审计保留天数" : "Audit retention days"} path="permissions.auditRetentionDays" value={value.permissions.auditRetentionDays} min={1} max={365} source={source} onChange={(auditRetentionDays) => update({ permissions: { auditRetentionDays } })} />
@@ -748,6 +823,7 @@ function SkillSettings({ value, source, zh, update, scope }: SettingsComponentPr
 }
 
 function MemorySettings({ value, source, zh, update, hasWorkspace, taskId }: SettingsComponentProps & { hasWorkspace: boolean; taskId?: string }) {
+  const [view, setView] = useState<"center" | "recall">("center");
   const [memories, setMemories] = useState<MemoryRecord[]>([]);
   const [memoryScope, setMemoryScope] = useState<MemoryScope>(hasWorkspace ? "project" : "user");
   const [memoryQuery, setMemoryQuery] = useState("");
@@ -786,6 +862,11 @@ function MemorySettings({ value, source, zh, update, hasWorkspace, taskId }: Set
       ? (zh ? "当前项目作用域" : "Current project scope")
       : (zh ? "用户作用域" : "User scope");
   return <>
+    <div className="settings-tabs" role="tablist" aria-label={zh ? "记忆设置视图" : "Memory settings view"}>
+      <button role="tab" aria-selected={view === "center"} className={view === "center" ? "active" : ""} onClick={() => setView("center")}>{zh ? "记忆中心" : "Memory center"}</button>
+      <button role="tab" aria-selected={view === "recall"} className={view === "recall" ? "active" : ""} onClick={() => setView("recall")}>{zh ? "召回与候选" : "Recall & candidates"}</button>
+    </div>
+    {view === "recall" && <>
     <Toggle title={zh ? "普通会话用户记忆" : "User memory in general chats"} path="memory.userMemoryEnabled" checked={value.memory.userMemoryEnabled} source={source} onChange={(userMemoryEnabled) => update({ memory: { userMemoryEnabled } })} />
     <Toggle title={zh ? "项目记忆" : "Project memory"} path="memory.projectMemoryEnabled" checked={value.memory.projectMemoryEnabled} source={source} onChange={(projectMemoryEnabled) => update({ memory: { projectMemoryEnabled } })} />
     <Toggle title={zh ? "当前任务记忆" : "Current task memory"} description={zh ? "仅在当前任务内检索，适合保存临时目标、约束和进度。" : "Retrieved only in the current task for temporary goals, constraints, and progress."} path="memory.taskMemoryEnabled" checked={value.memory.taskMemoryEnabled} source={source} onChange={(taskMemoryEnabled) => update({ memory: { taskMemoryEnabled } })} />
@@ -796,7 +877,8 @@ function MemorySettings({ value, source, zh, update, hasWorkspace, taskId }: Set
     <Range title={zh ? "项目记忆字符预算" : "Project memory character budget"} path="memory.projectCharacterBudget" value={value.memory.projectCharacterBudget} min={0} max={10000} step={100} source={source} onChange={(projectCharacterBudget) => update({ memory: { projectCharacterBudget } })} />
     <Range title={zh ? "任务记忆召回数量" : "Task recall count"} path="memory.taskRecallLimit" value={value.memory.taskRecallLimit} min={0} max={10} source={source} onChange={(taskRecallLimit) => update({ memory: { taskRecallLimit } })} />
     <Range title={zh ? "任务记忆字符预算" : "Task memory character budget"} path="memory.taskCharacterBudget" value={value.memory.taskCharacterBudget} min={0} max={10000} step={100} source={source} onChange={(taskCharacterBudget) => update({ memory: { taskCharacterBudget } })} />
-    <div className="settings-subsection">
+    </>}
+    {view === "center" && <div className="settings-subsection memory-center">
       <div className="subsection-heading"><div><h2>{zh ? "记忆中心" : "Memory center"}</h2><p>{scopeDescription}</p></div><div className="button-group"><select value={memoryScope} onChange={(event) => setMemoryScope(event.target.value as MemoryScope)}>{scopeChoices.map((choice) => <option value={choice.scope} key={choice.scope}>{choice.label}</option>)}</select><button className="ghost small-action" onClick={() => void refresh()}>{zh ? "刷新" : "Refresh"}</button><button className="danger small-action" onClick={async () => {
         if (!window.confirm(zh ? "彻底清理当前作用域全部记忆？" : "Permanently clear all memories in this scope?")) return;
         await window.deki.clearMemoryScope(memoryScope);
@@ -815,7 +897,7 @@ function MemorySettings({ value, source, zh, update, hasWorkspace, taskId }: Set
         await window.deki.moveMemory(memory.id, memoryScope, choice.scope);
         await refresh();
       }}>{zh ? `移到${choice.label}` : `Move to ${choice.label}`}</button>)}<button className="danger small-action" onClick={async () => { await window.deki.deleteMemory(memory.id, memoryScope); await refresh(); }}>{zh ? "彻底删除" : "Delete"}</button></>}</div></div>)}
-    </div>
+    </div>}
   </>;
 }
 
@@ -833,8 +915,13 @@ function PrivacySettings({ source, zh, value, update }: SettingsComponentProps) 
     <Setting title={zh ? "数据目录" : "Data directory"} description="~/.deki/" source="local"><button className="ghost" onClick={() => void window.deki.openDataDirectory()}>{zh ? "在文件管理器中打开" : "Open in file manager"}</button></Setting>
     <Setting title={zh ? "脱敏诊断导出" : "Redacted diagnostics export"} description={zh ? "不包含 API Key、项目源码或完整审计 Diff。" : "Excludes API keys, project source, and full audit diffs."} source="local"><button className="ghost" onClick={() => void window.deki.exportDiagnostics()}>{zh ? "导出诊断包" : "Export diagnostics"}</button></Setting>
     <Setting title={zh ? "数据导出 / 导入" : "Data export / import"} description={zh ? "导出设置、脱敏 Provider 元数据和当前作用域记忆；不包含 API Key、源码、审计 Diff 或机器路径。导入前会预览数量。" : "Exports settings, redacted provider metadata, and current-scope memories. API keys, source, audit diffs, and machine paths are excluded. Import shows a preview."} source="local"><div className="button-group"><button className="ghost" onClick={() => void window.deki.exportData()}>{zh ? "导出" : "Export"}</button><button className="ghost" onClick={() => void window.deki.importData()}>{zh ? "导入" : "Import"}</button></div></Setting>
-    <Setting title={zh ? "分类清理" : "Category cleanup"} description={zh ? "先关闭相关资源，再移到系统废纸篓；失败时保留时间戳备份。" : "Closes related resources before moving data to trash; falls back to a timestamped backup."} source="local"><div className="button-group"><button className="ghost" onClick={() => void window.deki.clearData("sessions")}>{zh ? "清理会话" : "Sessions"}</button><button className="ghost" onClick={() => void window.deki.clearData("memories")}>{zh ? "清理记忆" : "Memories"}</button><button className="ghost" onClick={() => void window.deki.clearData("logs")}>{zh ? "清理日志" : "Logs"}</button></div></Setting>
-    <Setting title={zh ? "恢复出厂设置" : "Factory reset"} description={zh ? "关闭 Runtime、MCP 和数据库后，将 ~/.deki 移入系统废纸篓；失败时保留时间戳备份。" : "Closes runtime, MCP, and databases, then moves ~/.deki to trash; falls back to a timestamped backup."} source="local"><button className="danger" onClick={() => void window.deki.factoryReset()}>{zh ? "可恢复地重置" : "Recoverable reset"}</button></Setting>
+    <Setting title={zh ? "分类清理" : "Category cleanup"} description={zh ? "先关闭相关资源，再移到系统废纸篓；失败时保留时间戳备份。" : "Closes related resources before moving data to trash; falls back to a timestamped backup."} source="local"><div className="button-group">{(["sessions", "memories", "logs"] as const).map((category) => <button className="danger-outline" key={category} onClick={() => {
+      const label = category === "sessions" ? (zh ? "会话" : "sessions") : category === "memories" ? (zh ? "记忆" : "memories") : (zh ? "日志" : "logs");
+      if (window.confirm(zh ? `将全部${label}移到废纸篓？` : `Move all ${label} to the trash?`)) void window.deki.clearData(category);
+    }}>{category === "sessions" ? (zh ? "清理会话" : "Sessions") : category === "memories" ? (zh ? "清理记忆" : "Memories") : (zh ? "清理日志" : "Logs")}</button>)}</div></Setting>
+    <Setting title={zh ? "恢复出厂设置" : "Factory reset"} description={zh ? "关闭 Runtime、MCP 和数据库后，将 ~/.deki 移入系统废纸篓；失败时保留时间戳备份。" : "Closes runtime, MCP, and databases, then moves ~/.deki to trash; falls back to a timestamped backup."} source="local"><button className="danger" onClick={() => {
+      if (window.confirm(zh ? "将全部 Deki 本地数据移到废纸篓并恢复出厂设置？" : "Move all local Deki data to the trash and reset the app?")) void window.deki.factoryReset();
+    }}>{zh ? "可恢复地重置" : "Recoverable reset"}</button></Setting>
     <div className="settings-subsection">
       <div className="subsection-heading"><div><h2>{zh ? "历史审计" : "Audit history"}</h2><p>{zh ? "最近 7 天最多 100 条脱敏记录。" : "Up to 100 redacted records from the last 7 days."}</p></div><button className="ghost small-action" onClick={() => void window.deki.listAuditRecords().then(setAudits)}>{zh ? "刷新" : "Refresh"}</button></div>
       {audits.length === 0 && <p className="muted">{zh ? "暂无审计记录。" : "No audit records."}</p>}
@@ -866,8 +953,8 @@ function AboutSettings({ value, zh, update }: Pick<SettingsComponentProps, "valu
   </>;
 }
 
-function Setting(props: { title: string; description?: string | undefined; source: string; children: React.ReactNode }) {
-  return <div className="setting-row"><div className="setting-copy"><div><strong>{props.title}</strong><span className="source-badge">{formatSource(props.source)}</span></div>{props.description && <p>{props.description}</p>}</div><div className="setting-control">{props.children}</div></div>;
+function Setting(props: { title: string; description?: string | undefined; source: string; children: ReactNode }) {
+  return <div className="setting-row"><div className="setting-copy"><div><strong>{props.title}</strong><span className="source-badge">{formatSource(props.source)}</span></div>{props.description && <p>{props.description}</p>}</div><div className="setting-control">{labelControls(props.children, props.title)}</div></div>;
 }
 
 function Toggle(props: { title: string; description?: string; path: string; checked: boolean; disabled?: boolean; source: (path: string) => string; onChange: (value: boolean) => Promise<void> }) {
@@ -884,7 +971,25 @@ function Range(props: { title: string; path: string; value: number; min: number;
 }
 
 function formatSource(source: string) {
-  return ({ default: "默认", global: "全局", projectShared: "项目共享", projectLocal: "项目本机", session: "会话", local: "本机", product: "产品" } as Record<string, string>)[source] ?? source;
+  const zh = document.documentElement.lang.startsWith("zh");
+  const labels = zh
+    ? { default: "默认", global: "全局", projectShared: "项目共享", projectLocal: "项目本机", session: "会话", local: "本机", product: "产品" }
+    : { default: "Default", global: "Global", projectShared: "Project shared", projectLocal: "Project local", session: "Session", local: "Local", product: "Product" };
+  return (labels as Record<string, string>)[source] ?? source;
+}
+
+function labelControls(node: ReactNode, label: string): ReactNode {
+  return Children.map(node, (child) => {
+    if (!isValidElement(child)) return child;
+    const element = child as ReactElement<{ children?: ReactNode; "aria-label"?: string }>;
+    if (typeof element.type === "string" && ["input", "select", "textarea"].includes(element.type)) {
+      return cloneElement(element, element.props["aria-label"] ? {} : { "aria-label": label });
+    }
+    if (element.props.children !== undefined) {
+      return cloneElement(element, { children: labelControls(element.props.children, label) });
+    }
+    return child;
+  });
 }
 
 function emptyProvider(): ModelProviderInput {

@@ -517,6 +517,7 @@ export const IPC_CHANNELS = {
   getBootstrapState: "deki:get-bootstrap-state",
   chooseWorkspace: "deki:choose-workspace",
   openWorkspace: "deki:open-workspace",
+  openGeneralChat: "deki:open-general-chat",
   trustWorkspace: "deki:trust-workspace",
   sendPrompt: "deki:send-prompt",
   abortRun: "deki:abort-run",
@@ -574,6 +575,7 @@ export interface DekiDesktopApi {
   getBootstrapState(): Promise<BootstrapState>;
   chooseWorkspace(): Promise<CommandResult>;
   openWorkspace(workspace: string): Promise<CommandResult>;
+  openGeneralChat(): Promise<CommandResult>;
   trustWorkspace(): Promise<CommandResult>;
   sendPrompt(prompt: string): Promise<CommandResult>;
   abortRun(): Promise<CommandResult>;

@@ -137,11 +137,14 @@ Generated from the locked pnpm dependency graph. Refer to each linked package fo
 | @types/deep-eql | 4.0.2 | MIT | [link](https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/deep-eql) |
 | @types/esrecurse | 4.3.1 | MIT | [link](https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/esrecurse) |
 | @types/estree | 1.0.9 | MIT | [link](https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/estree) |
+| @types/estree-jsx | 1.0.5 | MIT | [link](https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/estree-jsx) |
 | @types/fs-extra | 9.0.13 | MIT | [link](https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/fs-extra) |
 | @types/glob | 7.2.0 | MIT | [link](https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/glob) |
+| @types/hast | 3.0.5 | MIT | [link](https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/hast) |
 | @types/http-cache-semantics | 4.2.0 | MIT | [link](https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/http-cache-semantics) |
 | @types/json-schema | 7.0.15 | MIT | [link](https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/json-schema) |
 | @types/keyv | 3.1.4 | MIT | [link](https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/keyv) |
+| @types/mdast | 4.0.4 | MIT | [link](https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/mdast) |
 | @types/minimatch | 6.0.0 | MIT |  |
 | @types/ms | 2.1.0 | MIT | [link](https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/ms) |
 | @types/node | 22.19.15, 24.13.3 | MIT | [link](https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/node) |
@@ -150,6 +153,7 @@ Generated from the locked pnpm dependency graph. Refer to each linked package fo
 | @types/react-dom | 19.2.3 | MIT | [link](https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/react-dom) |
 | @types/responselike | 1.0.3 | MIT | [link](https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/responselike) |
 | @types/retry | 0.12.0 | MIT | [link](https://github.com/DefinitelyTyped/DefinitelyTyped#readme) |
+| @types/unist | 2.0.11, 3.0.3 | MIT | [link](https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/unist) |
 | @types/verror | 1.10.11 | MIT | [link](https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/verror) |
 | @typescript-eslint/eslint-plugin | 8.65.0 | MIT | [link](https://typescript-eslint.io/packages/eslint-plugin) |
 | @typescript-eslint/parser | 8.65.0 | MIT | [link](https://typescript-eslint.io/packages/parser) |
@@ -161,6 +165,7 @@ Generated from the locked pnpm dependency graph. Refer to each linked package fo
 | @typescript-eslint/typescript-estree | 8.65.0 | MIT | [link](https://typescript-eslint.io/packages/typescript-estree) |
 | @typescript-eslint/utils | 8.65.0 | MIT | [link](https://typescript-eslint.io/packages/utils) |
 | @typescript-eslint/visitor-keys | 8.65.0 | MIT | [link](https://typescript-eslint.io) |
+| @ungap/structured-clone | 1.3.3 | ISC | [link](https://github.com/ungap/structured-clone#readme) |
 | @vitejs/plugin-react | 5.2.0 | MIT | [link](https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#readme) |
 | @vitest/expect | 4.1.10 | MIT | [link](https://vitest.dev/api/expect) |
 | @vitest/mocker | 4.1.10 | MIT | [link](https://github.com/vitest-dev/vitest/tree/main/packages/mocker) |
@@ -193,6 +198,7 @@ Generated from the locked pnpm dependency graph. Refer to each linked package fo
 | async-exit-hook | 2.0.1 | MIT | [link](https://github.com/tapppi/async-exit-hook#readme) |
 | asynckit | 0.4.0 | MIT | [link](https://github.com/alexindigo/asynckit#readme) |
 | at-least-node | 1.0.0 | ISC | [link](https://github.com/RyanZim/at-least-node#readme) |
+| bail | 2.0.2 | MIT | [link](https://github.com/wooorm/bail#readme) |
 | balanced-match | 1.0.0, 4.0.4 | MIT | [link](https://github.com/juliangruber/balanced-match#readme) |
 | base64-js | 1.5.1 | MIT | [link](https://github.com/beatgammit/base64-js) |
 | baseline-browser-mapping | 2.11.1 | Apache-2.0 | [link](https://github.com/web-platform-dx/baseline-browser-mapping#readme) |
@@ -214,8 +220,13 @@ Generated from the locked pnpm dependency graph. Refer to each linked package fo
 | call-bind-apply-helpers | 1.0.2 | MIT | [link](https://github.com/ljharb/call-bind-apply-helpers#readme) |
 | call-bound | 1.0.4 | MIT | [link](https://github.com/ljharb/call-bound#readme) |
 | caniuse-lite | 1.0.30001806 | CC-BY-4.0 | [link](https://github.com/browserslist/caniuse-lite#readme) |
+| ccount | 2.0.1 | MIT | [link](https://github.com/wooorm/ccount#readme) |
 | chai | 6.2.2 | MIT | [link](http://chaijs.com) |
 | chalk | 4.1.2, 5.6.2 | MIT | [link](https://github.com/chalk/chalk#readme) |
+| character-entities | 2.0.2 | MIT | [link](https://github.com/wooorm/character-entities#readme) |
+| character-entities-html4 | 2.1.0 | MIT | [link](https://github.com/wooorm/character-entities-html4#readme) |
+| character-entities-legacy | 3.0.0 | MIT | [link](https://github.com/wooorm/character-entities-legacy#readme) |
+| character-reference-invalid | 2.0.1 | MIT | [link](https://github.com/wooorm/character-reference-invalid#readme) |
 | chownr | 2.0.0 | ISC | [link](https://github.com/isaacs/chownr#readme) |
 | chromium-pickle-js | 0.2.0 | MIT | [link](https://github.com/electron/node-chromium-pickle-js#readme) |
 | ci-info | 3.2.0 | MIT | [link](https://github.com/watson/ci-info) |
@@ -229,6 +240,7 @@ Generated from the locked pnpm dependency graph. Refer to each linked package fo
 | color-convert | 2.0.1 | MIT | [link](https://github.com/Qix-/color-convert#readme) |
 | color-name | 1.1.4 | MIT | [link](https://github.com/colorjs/color-name) |
 | combined-stream | 1.0.8 | MIT | [link](https://github.com/felixge/node-combined-stream) |
+| comma-separated-tokens | 2.0.3 | MIT | [link](https://github.com/wooorm/comma-separated-tokens#readme) |
 | commander | 5.0.0, 9.4.0 | MIT | [link](https://github.com/tj/commander.js#readme) |
 | compare-version | 0.1.2 | MIT | [link](https://github.com/kevva/compare-version#readme) |
 | concat-map | 0.0.1 | MIT | [link](https://github.com/substack/node-concat-map#readme) |
@@ -246,13 +258,16 @@ Generated from the locked pnpm dependency graph. Refer to each linked package fo
 | csstype | 3.2.3 | MIT | [link](https://github.com/frenic/csstype#readme) |
 | data-uri-to-buffer | 4.0.0 | MIT | [link](https://github.com/TooTallNate/node-data-uri-to-buffer) |
 | debug | 4.4.3 | MIT | [link](https://github.com/debug-js/debug#readme) |
+| decode-named-character-reference | 1.3.0 | MIT | [link](https://github.com/wooorm/decode-named-character-reference#readme) |
 | decompress-response | 6.0.0 | MIT | [link](https://github.com/sindresorhus/decompress-response#readme) |
 | deep-is | 0.1.4 | MIT | [link](https://github.com/thlorenz/deep-is#readme) |
 | defaults | 1.0.4 | MIT | [link](https://github.com/sindresorhus/node-defaults#readme) |
 | defer-to-connect | 2.0.1 | MIT | [link](https://github.com/szmarczak/defer-to-connect#readme) |
 | delayed-stream | 1.0.0 | MIT | [link](https://github.com/felixge/node-delayed-stream) |
 | depd | 2.0.0 | MIT | [link](https://github.com/dougwilson/nodejs-depd#readme) |
+| dequal | 2.0.3 | MIT | [link](https://github.com/lukeed/dequal#readme) |
 | detect-libc | 2.1.2 | Apache-2.0 | [link](https://github.com/lovell/detect-libc#readme) |
+| devlop | 1.1.0 | MIT | [link](https://github.com/wooorm/devlop#readme) |
 | diff | 8.0.4 | BSD-3-Clause | [link](https://github.com/kpdecker/jsdiff#readme) |
 | dir-compare | 4.2.0 | MIT | [link](https://github.com/gliviu/dir-compare#readme) |
 | dmg-builder | 26.0.12 | MIT | [link](https://github.com/electron-userland/electron-builder) |
@@ -285,7 +300,7 @@ Generated from the locked pnpm dependency graph. Refer to each linked package fo
 | esbuild | 0.25.11, 0.28.1 | MIT | [link](https://github.com/evanw/esbuild#readme) |
 | escalade | 3.2.0 | MIT | [link](https://github.com/lukeed/escalade#readme) |
 | escape-html | 1.0.3 | MIT | [link](https://github.com/component/escape-html#readme) |
-| escape-string-regexp | 4.0.0 | MIT | [link](https://github.com/sindresorhus/escape-string-regexp#readme) |
+| escape-string-regexp | 4.0.0, 5.0.0 | MIT | [link](https://github.com/sindresorhus/escape-string-regexp#readme) |
 | eslint | 10.0.1 | MIT | [link](https://eslint.org) |
 | eslint-scope | 9.1.2 | BSD-2-Clause | [link](https://github.com/eslint/js/blob/main/packages/eslint-scope/README.md) |
 | eslint-visitor-keys | 3.4.3, 5.0.1 | Apache-2.0 | [link](https://github.com/eslint/js/blob/main/packages/eslint-visitor-keys/README.md) |
@@ -293,6 +308,7 @@ Generated from the locked pnpm dependency graph. Refer to each linked package fo
 | esquery | 1.7.0 | BSD-3-Clause | [link](https://github.com/estools/esquery/) |
 | esrecurse | 4.3.0 | BSD-2-Clause | [link](https://github.com/estools/esrecurse) |
 | estraverse | 5.3.0 | BSD-2-Clause | [link](https://github.com/estools/estraverse) |
+| estree-util-is-identifier-name | 3.0.0 | MIT | [link](https://github.com/syntax-tree/estree-util-is-identifier-name#readme) |
 | estree-walker | 3.0.3 | MIT | [link](https://github.com/Rich-Harris/estree-walker#readme) |
 | esutils | 2.0.3 | BSD-2-Clause | [link](https://github.com/estools/esutils) |
 | etag | 1.8.1 | MIT | [link](https://github.com/jshttp/etag#readme) |
@@ -347,9 +363,12 @@ Generated from the locked pnpm dependency graph. Refer to each linked package fo
 | has-symbols | 1.1.0 | MIT | [link](https://github.com/ljharb/has-symbols#readme) |
 | has-tostringtag | 1.0.2 | MIT | [link](https://github.com/inspect-js/has-tostringtag#readme) |
 | hasown | 2.0.4 | MIT | [link](https://github.com/inspect-js/hasOwn#readme) |
+| hast-util-to-jsx-runtime | 2.3.6 | MIT | [link](https://github.com/syntax-tree/hast-util-to-jsx-runtime#readme) |
+| hast-util-whitespace | 3.0.0 | MIT | [link](https://github.com/syntax-tree/hast-util-whitespace#readme) |
 | highlight.js | 10.7.3 | BSD-3-Clause | [link](https://highlightjs.org/) |
 | hono | 4.12.32 | MIT | [link](https://hono.dev) |
 | hosted-git-info | 4.1.0, 9.0.3 | ISC | [link](https://github.com/npm/hosted-git-info) |
+| html-url-attributes | 3.0.1 | MIT | [link](https://github.com/rehypejs/rehype-minify/tree/main#readme) |
 | http-cache-semantics | 4.2.0 | BSD-2-Clause | [link](https://github.com/kornelski/http-cache-semantics#readme) |
 | http-errors | 2.0.0, 2.0.1 | MIT | [link](https://github.com/jshttp/http-errors#readme) |
 | http-proxy-agent | 5.0.0, 7.0.0, 7.0.2 | MIT | [link](https://github.com/TooTallNate/proxy-agents#readme) |
@@ -365,14 +384,20 @@ Generated from the locked pnpm dependency graph. Refer to each linked package fo
 | infer-owner | 1.0.4 | ISC | [link](https://github.com/npm/infer-owner#readme) |
 | inflight | 1.0.6 | ISC | [link](https://github.com/isaacs/inflight) |
 | inherits | 2.0.4 | ISC | [link](https://github.com/isaacs/inherits#readme) |
+| inline-style-parser | 0.1.1 | MIT | [link](https://github.com/remarkablemark/inline-style-parser#readme) |
 | ip-address | 10.3.1 | MIT | [link](https://github.com/beaugunderson/ip-address#readme) |
 | ipaddr.js | 1.9.1 | MIT | [link](https://github.com/whitequark/ipaddr.js#readme) |
+| is-alphabetical | 2.0.1 | MIT | [link](https://github.com/wooorm/is-alphabetical#readme) |
+| is-alphanumerical | 2.0.1 | MIT | [link](https://github.com/wooorm/is-alphanumerical#readme) |
 | is-ci | 3.0.1 | MIT | [link](https://github.com/watson/is-ci) |
+| is-decimal | 2.0.1 | MIT | [link](https://github.com/wooorm/is-decimal#readme) |
 | is-extglob | 2.1.1 | MIT | [link](https://github.com/jonschlinkert/is-extglob) |
 | is-fullwidth-code-point | 3.0.0 | MIT | [link](https://github.com/sindresorhus/is-fullwidth-code-point#readme) |
 | is-glob | 4.0.3 | MIT | [link](https://github.com/micromatch/is-glob) |
+| is-hexadecimal | 2.0.1 | MIT | [link](https://github.com/wooorm/is-hexadecimal#readme) |
 | is-interactive | 1.0.0 | MIT | [link](https://github.com/sindresorhus/is-interactive#readme) |
 | is-lambda | 1.0.1 | MIT | [link](https://github.com/watson/is-lambda) |
+| is-plain-obj | 4.1.0 | MIT | [link](https://github.com/sindresorhus/is-plain-obj#readme) |
 | is-promise | 4.0.0 | MIT | [link](https://github.com/then/is-promise#readme) |
 | is-unicode-supported | 0.1.0 | MIT | [link](https://github.com/sindresorhus/is-unicode-supported#readme) |
 | isbinaryfile | 4.0.10, 5.0.7 | MIT | [link](https://github.com/gjtorikian/isBinaryFile#readme) |
@@ -401,15 +426,60 @@ Generated from the locked pnpm dependency graph. Refer to each linked package fo
 | lodash | 4.18.1 | MIT | [link](https://lodash.com/) |
 | log-symbols | 4.1.0 | MIT | [link](https://github.com/sindresorhus/log-symbols#readme) |
 | long | 5.3.2 | Apache-2.0 | [link](https://github.com/dcodeIO/long.js#readme) |
+| longest-streak | 3.1.0 | MIT | [link](https://github.com/wooorm/longest-streak#readme) |
 | lowercase-keys | 2.0.0 | MIT | [link](https://github.com/sindresorhus/lowercase-keys#readme) |
 | lru-cache | 5.1.1, 6.0.0, 7.7.1, 10.2.0 | ISC | [link](https://github.com/isaacs/node-lru-cache#readme) |
 | lru-cache | 11.5.2 | BlueOak-1.0.0 | [link](https://github.com/isaacs/node-lru-cache#readme) |
 | magic-string | 0.30.19, 0.30.21 | MIT | [link](https://github.com/Rich-Harris/magic-string#readme) |
 | make-fetch-happen | 10.2.1 | ISC | [link](https://github.com/npm/make-fetch-happen#readme) |
+| markdown-table | 3.0.4 | MIT | [link](https://github.com/wooorm/markdown-table#readme) |
 | marked | 18.0.5 | MIT | [link](https://marked.js.org) |
 | math-intrinsics | 1.1.0 | MIT | [link](https://github.com/es-shims/math-intrinsics#readme) |
+| mdast-util-find-and-replace | 3.0.2 | MIT | [link](https://github.com/syntax-tree/mdast-util-find-and-replace#readme) |
+| mdast-util-from-markdown | 2.0.3 | MIT | [link](https://github.com/syntax-tree/mdast-util-from-markdown#readme) |
+| mdast-util-gfm | 3.1.0 | MIT | [link](https://github.com/syntax-tree/mdast-util-gfm#readme) |
+| mdast-util-gfm-autolink-literal | 2.0.1 | MIT | [link](https://github.com/syntax-tree/mdast-util-gfm-autolink-literal#readme) |
+| mdast-util-gfm-footnote | 2.1.0 | MIT | [link](https://github.com/syntax-tree/mdast-util-gfm-footnote#readme) |
+| mdast-util-gfm-strikethrough | 2.0.0 | MIT | [link](https://github.com/syntax-tree/mdast-util-gfm-strikethrough#readme) |
+| mdast-util-gfm-table | 2.0.0 | MIT | [link](https://github.com/syntax-tree/mdast-util-gfm-table#readme) |
+| mdast-util-gfm-task-list-item | 2.0.0 | MIT | [link](https://github.com/syntax-tree/mdast-util-gfm-task-list-item#readme) |
+| mdast-util-mdx-expression | 2.0.1 | MIT | [link](https://github.com/syntax-tree/mdast-util-mdx-expression#readme) |
+| mdast-util-mdx-jsx | 3.2.0 | MIT | [link](https://github.com/syntax-tree/mdast-util-mdx-jsx#readme) |
+| mdast-util-mdxjs-esm | 2.0.1 | MIT | [link](https://github.com/syntax-tree/mdast-util-mdxjs-esm#readme) |
+| mdast-util-phrasing | 4.1.0 | MIT | [link](https://github.com/syntax-tree/mdast-util-phrasing#readme) |
+| mdast-util-to-hast | 13.2.1 | MIT | [link](https://github.com/syntax-tree/mdast-util-to-hast#readme) |
+| mdast-util-to-markdown | 2.0.0 | MIT | [link](https://github.com/syntax-tree/mdast-util-to-markdown#readme) |
+| mdast-util-to-string | 4.0.0 | MIT | [link](https://github.com/syntax-tree/mdast-util-to-string#readme) |
 | media-typer | 1.1.1 | MIT | [link](https://github.com/jshttp/media-typer#readme) |
 | merge-descriptors | 2.0.0 | MIT | [link](https://github.com/sindresorhus/merge-descriptors#readme) |
+| micromark | 4.0.0 | MIT | [link](https://github.com/micromark/micromark/tree/main#readme) |
+| micromark-core-commonmark | 2.0.0 | MIT | [link](https://github.com/micromark/micromark/tree/main#readme) |
+| micromark-extension-gfm | 3.0.0 | MIT | [link](https://github.com/micromark/micromark-extension-gfm#readme) |
+| micromark-extension-gfm-autolink-literal | 2.1.0 | MIT | [link](https://github.com/micromark/micromark-extension-gfm-autolink-literal#readme) |
+| micromark-extension-gfm-footnote | 2.1.0 | MIT | [link](https://github.com/micromark/micromark-extension-gfm-footnote#readme) |
+| micromark-extension-gfm-strikethrough | 2.1.0 | MIT | [link](https://github.com/micromark/micromark-extension-gfm-strikethrough#readme) |
+| micromark-extension-gfm-table | 2.1.1 | MIT | [link](https://github.com/micromark/micromark-extension-gfm-table#readme) |
+| micromark-extension-gfm-tagfilter | 2.0.0 | MIT | [link](https://github.com/micromark/micromark-extension-gfm-tagfilter#readme) |
+| micromark-extension-gfm-task-list-item | 2.1.0 | MIT | [link](https://github.com/micromark/micromark-extension-gfm-task-list-item#readme) |
+| micromark-factory-destination | 2.0.0 | MIT | [link](https://github.com/micromark/micromark/tree/main#readme) |
+| micromark-factory-label | 2.0.0 | MIT | [link](https://github.com/micromark/micromark/tree/main#readme) |
+| micromark-factory-space | 2.0.0 | MIT | [link](https://github.com/micromark/micromark/tree/main#readme) |
+| micromark-factory-title | 2.0.0 | MIT | [link](https://github.com/micromark/micromark/tree/main#readme) |
+| micromark-factory-whitespace | 2.0.0 | MIT | [link](https://github.com/micromark/micromark/tree/main#readme) |
+| micromark-util-character | 2.0.0 | MIT | [link](https://github.com/micromark/micromark/tree/main#readme) |
+| micromark-util-chunked | 2.0.0 | MIT | [link](https://github.com/micromark/micromark/tree/main#readme) |
+| micromark-util-classify-character | 2.0.0 | MIT | [link](https://github.com/micromark/micromark/tree/main#readme) |
+| micromark-util-combine-extensions | 2.0.0 | MIT | [link](https://github.com/micromark/micromark/tree/main#readme) |
+| micromark-util-decode-numeric-character-reference | 2.0.0 | MIT | [link](https://github.com/micromark/micromark/tree/main#readme) |
+| micromark-util-decode-string | 2.0.1 | MIT | [link](https://github.com/micromark/micromark/tree/main#readme) |
+| micromark-util-encode | 2.0.0 | MIT | [link](https://github.com/micromark/micromark/tree/main#readme) |
+| micromark-util-html-tag-name | 2.0.0 | MIT | [link](https://github.com/micromark/micromark/tree/main#readme) |
+| micromark-util-normalize-identifier | 2.0.0 | MIT | [link](https://github.com/micromark/micromark/tree/main#readme) |
+| micromark-util-resolve-all | 2.0.0 | MIT | [link](https://github.com/micromark/micromark/tree/main#readme) |
+| micromark-util-sanitize-uri | 2.0.0 | MIT | [link](https://github.com/micromark/micromark/tree/main#readme) |
+| micromark-util-subtokenize | 2.0.0 | MIT | [link](https://github.com/micromark/micromark/tree/main#readme) |
+| micromark-util-symbol | 2.0.0 | MIT | [link](https://github.com/micromark/micromark/tree/main#readme) |
+| micromark-util-types | 2.0.0 | MIT | [link](https://github.com/micromark/micromark/tree/main#readme) |
 | mime | 2.6.0 | MIT | [link](https://github.com/broofa/mime#readme) |
 | mime-db | 1.52.0, 1.54.0 | MIT | [link](https://github.com/jshttp/mime-db#readme) |
 | mime-types | 2.1.35, 3.0.2 | MIT | [link](https://github.com/jshttp/mime-types#readme) |
@@ -456,6 +526,7 @@ Generated from the locked pnpm dependency graph. Refer to each linked package fo
 | p-retry | 4.6.2 | MIT | [link](https://github.com/sindresorhus/p-retry#readme) |
 | p-try | 2.2.0 | MIT | [link](https://github.com/sindresorhus/p-try#readme) |
 | package-json-from-dist | 1.0.1 | BlueOak-1.0.0 | [link](https://github.com/isaacs/package-json-from-dist#readme) |
+| parse-entities | 4.0.2 | MIT | [link](https://github.com/wooorm/parse-entities#readme) |
 | parseurl | 1.3.3 | MIT | [link](https://github.com/pillarjs/parseurl#readme) |
 | partial-json | 0.1.7 | MIT | [link](https://promplate.dev/partial-json-parser) |
 | path-exists | 4.0.0 | MIT | [link](https://github.com/sindresorhus/path-exists#readme) |
@@ -479,6 +550,7 @@ Generated from the locked pnpm dependency graph. Refer to each linked package fo
 | promise-inflight | 1.0.1 | ISC | [link](https://github.com/iarna/promise-inflight#readme) |
 | promise-retry | 2.0.1 | MIT | [link](https://github.com/IndigoUnited/node-promise-retry#readme) |
 | proper-lockfile | 4.1.2 | MIT | [link](https://github.com/moxystudio/node-proper-lockfile) |
+| property-information | 7.2.0 | MIT | [link](https://github.com/wooorm/property-information#readme) |
 | protobufjs | 7.6.5 | BSD-3-Clause | [link](https://protobufjs.github.io/protobuf.js/) |
 | proxy-addr | 2.0.7 | MIT | [link](https://github.com/jshttp/proxy-addr#readme) |
 | pump | 3.0.4 | MIT | [link](https://github.com/mafintosh/pump#readme) |
@@ -489,8 +561,13 @@ Generated from the locked pnpm dependency graph. Refer to each linked package fo
 | raw-body | 3.0.0, 3.0.2 | MIT | [link](https://github.com/stream-utils/raw-body#readme) |
 | react | 19.2.8 | MIT | [link](https://react.dev/) |
 | react-dom | 19.2.8 | MIT | [link](https://react.dev/) |
+| react-markdown | 10.1.0 | MIT | [link](https://github.com/remarkjs/react-markdown#readme) |
 | react-refresh | 0.18.0 | MIT | [link](https://react.dev/) |
 | read-binary-file-arch | 1.0.6 | MIT | [link](https://github.com/samuelmaddock/read-binary-file-arch#readme) |
+| remark-gfm | 4.0.1 | MIT | [link](https://github.com/remarkjs/remark-gfm#readme) |
+| remark-parse | 11.0.0 | MIT | [link](https://remark.js.org) |
+| remark-rehype | 11.1.2 | MIT | [link](https://github.com/remarkjs/remark-rehype#readme) |
+| remark-stringify | 11.0.0 | MIT | [link](https://remark.js.org) |
 | require-directory | 2.1.1 | MIT | [link](https://github.com/troygoode/node-require-directory/) |
 | require-from-string | 2.0.2 | MIT | [link](https://github.com/floatdrop/require-from-string#readme) |
 | resedit | 1.7.0 | MIT | [link](https://github.com/jet2jet/resedit-js) |
@@ -526,13 +603,17 @@ Generated from the locked pnpm dependency graph. Refer to each linked package fo
 | source-map | 0.6.0 | BSD-3-Clause | [link](https://github.com/mozilla/source-map) |
 | source-map-js | 1.2.1 | BSD-3-Clause | [link](https://github.com/7rulnik/source-map-js) |
 | source-map-support | 0.5.21 | MIT | [link](https://github.com/evanw/node-source-map-support#readme) |
+| space-separated-tokens | 2.0.2 | MIT | [link](https://github.com/wooorm/space-separated-tokens#readme) |
 | ssri | 9.0.0 | ISC | [link](https://github.com/npm/ssri#readme) |
 | stackback | 0.0.2 | MIT | [link](https://github.com/shtylman/node-stackback#readme) |
 | stat-mode | 1.0.0 | MIT | [link](https://github.com/TooTallNate/stat-mode) |
 | statuses | 2.0.1, 2.0.2 | MIT | [link](https://github.com/jshttp/statuses#readme) |
 | std-env | 4.2.0 | MIT | [link](https://github.com/unjs/std-env#readme) |
 | string-width | 4.2.0, 4.2.3, 5.1.2 | MIT | [link](https://github.com/sindresorhus/string-width#readme) |
+| stringify-entities | 4.0.4 | MIT | [link](https://github.com/wooorm/stringify-entities#readme) |
 | strip-ansi | 6.0.1, 7.2.0 | MIT | [link](https://github.com/chalk/strip-ansi#readme) |
+| style-to-js | 1.0.0 | MIT | [link](https://github.com/remarkablemark/style-to-js#readme) |
+| style-to-object | 0.3.0 | MIT | [link](https://github.com/remarkablemark/style-to-object#readme) |
 | sumchecker | 3.0.1 | Apache-2.0 | [link](https://github.com/malept/sumchecker#readme) |
 | supports-color | 7.2.0 | MIT | [link](https://github.com/chalk/supports-color#readme) |
 | tar | 6.1.12, 6.2.1 | ISC | [link](https://github.com/isaacs/node-tar#readme) |
@@ -546,6 +627,8 @@ Generated from the locked pnpm dependency graph. Refer to each linked package fo
 | tmp | 0.2.7 | MIT | [link](http://github.com/raszi/node-tmp) |
 | tmp-promise | 3.0.3 | MIT | [link](https://github.com/benjamingr/tmp-promise#readme) |
 | toidentifier | 1.0.1 | MIT | [link](https://github.com/component/toidentifier#readme) |
+| trim-lines | 3.0.1 | MIT | [link](https://github.com/wooorm/trim-lines#readme) |
+| trough | 2.2.0 | MIT | [link](https://github.com/wooorm/trough#readme) |
 | truncate-utf8-bytes | 1.0.2 | WTFPL | [link](https://github.com/parshap/truncate-utf8-bytes#readme) |
 | ts-algebra | 2.0.0 | MIT | [link](https://github.com/ThomasAribart/ts-algebra#readme) |
 | ts-api-utils | 2.5.0 | MIT | [link](https://github.com/JoshuaKGoldberg/ts-api-utils#readme) |
@@ -557,8 +640,14 @@ Generated from the locked pnpm dependency graph. Refer to each linked package fo
 | typescript-eslint | 8.65.0 | MIT | [link](https://typescript-eslint.io/packages/typescript-eslint) |
 | undici | 7.29.0, 8.5.0 | MIT | [link](https://undici.nodejs.org) |
 | undici-types | 6.21.0, 7.18.2 | MIT | [link](https://undici.nodejs.org) |
+| unified | 11.0.0 | MIT | [link](https://unifiedjs.com) |
 | unique-filename | 1.1.1 | ISC | [link](https://github.com/iarna/unique-filename) |
 | unique-slug | 2.0.0 | ISC | [link](https://github.com/iarna/unique-slug#readme) |
+| unist-util-is | 6.0.1 | MIT | [link](https://github.com/syntax-tree/unist-util-is#readme) |
+| unist-util-position | 5.0.0 | MIT | [link](https://github.com/syntax-tree/unist-util-position#readme) |
+| unist-util-stringify-position | 4.0.0 | MIT | [link](https://github.com/syntax-tree/unist-util-stringify-position#readme) |
+| unist-util-visit | 5.1.0 | MIT | [link](https://github.com/syntax-tree/unist-util-visit#readme) |
+| unist-util-visit-parents | 6.0.2 | MIT | [link](https://github.com/syntax-tree/unist-util-visit-parents#readme) |
 | universalify | 0.1.2, 1.0.0, 2.0.1 | MIT | [link](https://github.com/RyanZim/universalify#readme) |
 | unpipe | 1.0.0 | MIT | [link](https://github.com/stream-utils/unpipe#readme) |
 | update-browserslist-db | 1.2.3 | MIT | [link](https://github.com/browserslist/update-db#readme) |
@@ -566,6 +655,8 @@ Generated from the locked pnpm dependency graph. Refer to each linked package fo
 | utf8-byte-length | 1.0.5 | (WTFPL OR MIT) | [link](https://github.com/parshap/utf8-byte-length#readme) |
 | vary | 1.1.2 | MIT | [link](https://github.com/jshttp/vary#readme) |
 | verror | 1.10.1 | MIT | [link](https://github.com/joyent/node-verror#readme) |
+| vfile | 6.0.3 | MIT | [link](https://github.com/vfile/vfile#readme) |
+| vfile-message | 4.0.3 | MIT | [link](https://github.com/vfile/vfile-message#readme) |
 | vite | 7.3.6 | MIT | [link](https://vite.dev) |
 | vitest | 4.1.10 | MIT | [link](https://vitest.dev) |
 | wcwidth | 1.0.1 | MIT | [link](https://github.com/timoxley/wcwidth#readme) |
@@ -585,3 +676,4 @@ Generated from the locked pnpm dependency graph. Refer to each linked package fo
 | yocto-queue | 0.1.0 | MIT | [link](https://github.com/sindresorhus/yocto-queue#readme) |
 | zod | 4.4.3 | MIT | [link](https://zod.dev) |
 | zod-to-json-schema | 3.25.2 | ISC | [link](https://github.com/StefanTerdell/zod-to-json-schema#readme) |
+| zwitch | 2.0.4 | MIT | [link](https://github.com/wooorm/zwitch#readme) |

@@ -45,6 +45,11 @@ const api: DekiDesktopApi = {
       await ipcRenderer.invoke(IPC_CHANNELS.openWorkspace, { workspace }),
     );
   },
+  async openGeneralChat() {
+    return commandResultSchema.parse(
+      await ipcRenderer.invoke(IPC_CHANNELS.openGeneralChat),
+    );
+  },
   async trustWorkspace() {
     return commandResultSchema.parse(
       await ipcRenderer.invoke(IPC_CHANNELS.trustWorkspace),

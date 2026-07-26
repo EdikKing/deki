@@ -30,7 +30,7 @@ test("starts a general chat without a workspace", async ({}, testInfo) => {
     const window = await electronApp.firstWindow();
     await expect(window.getByRole("heading", { name: /开始一个普通会话|Start a general chat/ })).toBeVisible();
     const navigation = window.getByRole("navigation", { name: "项目和会话" });
-    await expect(navigation.getByText(/未关联项目|No project/)).toBeVisible();
+    await expect(navigation.getByText(/关联一个项目|Connect a project/)).toBeVisible();
     await expect(navigation.getByText(/新会话|New chat/)).toBeVisible();
     await expect(navigation.getByRole("button", { name: "添加项目" })).toBeVisible();
     await expect(window.getByText(/普通会话无需选择项目|General chat needs no project/)).toBeVisible();
@@ -44,6 +44,13 @@ test("starts a general chat without a workspace", async ({}, testInfo) => {
     await window.getByTestId("settings-section-appearance").click();
     await window.locator(".setting-row").filter({ has: window.locator("select option[value=light]") }).getByRole("combobox").selectOption("light");
     await expect(window.locator("html")).toHaveAttribute("data-theme", "light");
+    await expect(window.locator(".settings-page")).toHaveCSS("color", "rgb(22, 33, 58)");
+    await expect(window.locator(".settings-nav")).toHaveCSS("background-color", "rgb(249, 251, 254)");
+    await window.locator(".settings-search").fill("证书");
+    await expect(window.getByRole("heading", { name: "高级与诊断" })).toBeVisible();
+    await expect(window.getByText("自定义 CA 证书")).toBeVisible();
+    await expect(window.locator(".setting-control select:not([aria-label])")).toHaveCount(0);
+    await window.locator(".settings-search").fill("");
     await window.getByTestId("settings-section-models").click();
     await expect(window.locator(".builtin-provider-card")).toHaveCount(8);
     await expect(window.locator(".builtin-provider-card").first()).toHaveAttribute("data-provider-id", "openai");
@@ -94,6 +101,33 @@ test("stores and manages memory for the current task", async ({}) => {
 
 // Playwright requires an object-destructured fixtures parameter.
 // eslint-disable-next-line no-empty-pattern
+test("can leave an untrusted workspace for a general chat", async ({}) => {
+  const temporaryHome = await mkdtemp(resolve(tmpdir(), "deki-electron-untrusted-"));
+  await seedChineseSettings(temporaryHome);
+  const electronApp = await electron.launch({
+    executablePath: electronPath,
+    args: [
+      resolve("apps/desktop"),
+      "--lang=zh-CN",
+      "--workspace",
+      resolve("tests/fixtures/workspace"),
+    ],
+    env: createTestEnvironment(temporaryHome),
+  });
+
+  try {
+    const window = await electronApp.firstWindow();
+    await window.getByRole("button", { name: "返回普通会话" }).click();
+    await expect(window.getByRole("heading", { name: "开始一个普通会话" })).toBeVisible();
+    await expect(window.getByRole("button", { name: "关联一个项目" })).toBeVisible();
+  } finally {
+    await electronApp.close();
+    await rm(temporaryHome, { recursive: true, force: true });
+  }
+});
+
+// Playwright requires an object-destructured fixtures parameter.
+// eslint-disable-next-line no-empty-pattern
 test("trusts a workspace, streams fixture events, and recalls memory", async ({}, testInfo) => {
   const temporaryHome = await mkdtemp(resolve(tmpdir(), "deki-electron-home-"));
   await seedChineseSettings(temporaryHome);
@@ -128,11 +162,24 @@ test("trusts a workspace, streams fixture events, and recalls memory", async ({}
       "test-skill",
     );
     await expect(window.getByText("这是模拟的流式响应。")).toBeVisible();
-    await expect(window.locator(".timeline-item strong").first()).toHaveText(
+    await expect(window.locator(".tool-card summary strong").first()).toHaveText(
       "deki__project_info",
     );
+    const inlineTool = window.locator(".inline-tools .tool-card").first();
+    await inlineTool.getByText("完成").click();
+    await expect(inlineTool.locator(".tool-payload", { hasText: "结果" })).toContainText("fixture");
+    await expect(window.locator(".code-block code")).toContainText("const ready = true;");
+    await expect(window.getByRole("button", { name: "复制代码" })).toBeVisible();
     await expect(window.getByRole("heading", { name: "变更 Diff" })).toBeVisible();
     await expect(window.locator(".diff-entry pre")).toContainText("+++ b/example.txt");
+    await electronApp.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]?.setSize(900, 720));
+    await window.waitForTimeout(200);
+    await expect(window.getByTestId("toggle-inspector")).toBeVisible();
+    await expect(window.locator(".side-panel")).not.toHaveClass(/open/);
+    await window.getByTestId("toggle-inspector").click();
+    await expect(window.locator(".side-panel")).toHaveClass(/open/);
+    await window.getByTestId("toggle-inspector").click();
+    await expect(window.locator(".side-panel")).not.toHaveClass(/open/);
 
     await window.getByTestId("open-settings").click();
     await window.getByTestId("settings-section-mcp").click();

@@ -1279,6 +1279,10 @@ function registerIpcHandlers(): void {
       return commandResultSchema.parse({ ok: false, error: formatError(error) });
     }
   });
+  ipcMain.handle(IPC_CHANNELS.openGeneralChat, async (event) => {
+    assertTrustedSender(event);
+    return commandResultSchema.parse(await switchToWorkspace(undefined));
+  });
   ipcMain.handle(IPC_CHANNELS.trustWorkspace, async (event) => {
     assertTrustedSender(event);
     if (!controller) {
@@ -1661,7 +1665,7 @@ function createEmptyBootstrapState(): BootstrapState {
   });
 }
 
-async function switchToWorkspace(workspace: string): Promise<CommandResult> {
+async function switchToWorkspace(workspace: string | undefined): Promise<CommandResult> {
   try {
     await controller?.dispose();
     controller = await DesktopController.create(workspace);
@@ -1876,7 +1880,7 @@ function emitE2eFixtureEvents(): void {
     ...base,
     type: "message.delta",
     eventId: crypto.randomUUID(),
-    delta: "这是模拟的流式响应。",
+    delta: "这是模拟的流式响应。\n\n```ts\nconst ready = true;\n```",
   });
   broadcastEvent({
     ...base,

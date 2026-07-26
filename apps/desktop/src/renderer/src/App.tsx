@@ -1,4 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import type {
   AgentEvent,
   BootstrapState,
@@ -11,6 +13,14 @@ import type {
 import { SettingsView } from "./SettingsView";
 
 type ChatMessage = ConversationMessage;
+type ToolActivity = {
+  callId: string;
+  toolName: string;
+  status: "running" | "completed" | "failed";
+  input?: unknown;
+  update?: unknown;
+  result?: unknown;
+};
 
 export function App() {
   const [state, setState] = useState<BootstrapState>();
@@ -24,6 +34,10 @@ export function App() {
   const [approval, setApproval] = useState<Extract<AgentEvent, { type: "approval.requested" }>>();
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [sessionQuery, setSessionQuery] = useState("");
+  const [settingsSection, setSettingsSection] = useState<"models">();
+  const [compactLayout, setCompactLayout] = useState(() => window.innerWidth <= 980);
+  const [inspectorOpen, setInspectorOpen] = useState(() => window.innerWidth > 980);
+  const [inspectorWidth, setInspectorWidth] = useState(330);
 
   async function refresh() {
     setState(await window.deki.getBootstrapState());
@@ -58,6 +72,7 @@ export function App() {
     const onKeyDown = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key === ",") {
         event.preventDefault();
+        setSettingsSection(undefined);
         setShowSettings((current) => !current);
       }
     };
@@ -67,6 +82,18 @@ export function App() {
       unsubscribeSettings();
       window.removeEventListener("keydown", onKeyDown);
     };
+  }, []);
+
+  useEffect(() => {
+    const onResize = () => {
+      const nextCompact = window.innerWidth <= 980;
+      setCompactLayout((current) => {
+        if (current !== nextCompact) setInspectorOpen(!nextCompact);
+        return nextCompact;
+      });
+    };
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
   }, []);
 
   useEffect(() => {
@@ -95,6 +122,7 @@ export function App() {
     root.dataset.accent = appearance.accent;
     root.dataset.density = appearance.density;
     root.dataset.highContrast = String(appearance.highContrast);
+    root.lang = resolveLocale(settings);
     root.style.setProperty("--ui-font-size", `${appearance.fontSize}px`);
     root.style.setProperty("--code-font", appearance.codeFont);
     root.style.setProperty("--sidebar-width", `${appearance.sidebarWidth}px`);
@@ -104,9 +132,13 @@ export function App() {
   }, [settings]);
 
   const toolEvents = useMemo(
-    () => events.filter((event) => event.type.startsWith("tool.")),
+    () => events.filter(
+      (event): event is Extract<AgentEvent, { type: "tool.started" | "tool.updated" | "tool.completed" }> =>
+        event.type === "tool.started" || event.type === "tool.updated" || event.type === "tool.completed",
+    ),
     [events],
   );
+  const toolActivities = useMemo(() => buildToolActivities(toolEvents), [toolEvents]);
   const diffs = useMemo(
     () => events.filter(
       (event): event is Extract<AgentEvent, { type: "diff.available" }> =>
@@ -150,6 +182,12 @@ export function App() {
           >
             {zh ? "信任并继续" : "Trust and continue"}
           </button>
+          <button
+            className="ghost trust-secondary"
+            onClick={() => void runCommand(window.deki.openGeneralChat(), setError, refresh)}
+          >
+            {zh ? "返回普通会话" : "Return to general chat"}
+          </button>
           {error && <p className="error">{error}</p>}
         </section>
       </main>
@@ -160,12 +198,14 @@ export function App() {
     return (
       <SettingsView
         snapshot={settings}
+        {...(settingsSection ? { initialSection: settingsSection } : {})}
         hasWorkspace={Boolean(state.workspace && state.trusted)}
         {...(state.sessionId ? { taskId: state.sessionId } : {})}
         locale={locale}
         onChanged={setSettings}
         onClose={() => {
           setShowSettings(false);
+          setSettingsSection(undefined);
           void refresh();
         }}
         onRefreshState={refresh}
@@ -205,15 +245,15 @@ export function App() {
           </div>
         </div>
 
-        <nav className="sidebar-navigation" aria-label="项目和会话">
+        <nav className="sidebar-navigation" aria-label={zh ? "项目和会话" : "Projects and sessions"}>
           <section className="navigation-section">
             <header className="navigation-heading">
               <span>{zh ? "项目" : "Projects"}</span>
               <button
                 className="icon-button"
                 disabled={busy}
-                title="添加或切换项目"
-                aria-label="添加项目"
+                title={zh ? "添加或切换项目" : "Add or switch project"}
+                aria-label={zh ? "添加项目" : "Add project"}
                 onClick={() => void runCommand(
                   window.deki.chooseWorkspace(),
                   setError,
@@ -233,10 +273,14 @@ export function App() {
                 <span className={state.ready ? "project-dot ready" : "project-dot"} />
               </button>
             ) : (
-              <div className="navigation-empty">
+              <button
+                className="navigation-empty"
+                disabled={busy}
+                onClick={() => void runCommand(window.deki.chooseWorkspace(), setError, refresh)}
+              >
                 <span className="navigation-icon folder-icon" aria-hidden="true" />
-                <p>{zh ? "未关联项目" : "No project"}</p>
-              </div>
+                <span>{zh ? "关联一个项目" : "Connect a project"}</span>
+              </button>
             )}
             {state.recentWorkspaces
               .filter((workspace) => workspace !== state.workspace)
@@ -268,8 +312,8 @@ export function App() {
               <button
                 className="icon-button"
                 disabled={!state.ready || busy}
-                title="新建会话"
-                aria-label="新建会话"
+                title={zh ? "新建会话" : "New chat"}
+                aria-label={zh ? "新建会话" : "New chat"}
                 onClick={() => {
                   setMessages([]);
                   setEvents([]);
@@ -340,10 +384,13 @@ export function App() {
           </div>
           <button
             className="settings-button"
-            title="设置 (⌘,)"
-            aria-label="设置"
+            title={zh ? "设置 (⌘,)" : "Settings (⌘,)"}
+            aria-label={zh ? "设置" : "Settings"}
             data-testid="open-settings"
-            onClick={() => setShowSettings(true)}
+            onClick={() => {
+              setSettingsSection(undefined);
+              setShowSettings(true);
+            }}
           >
             <span aria-hidden="true">⚙</span>
             {zh ? "设置" : "Settings"}
@@ -359,7 +406,7 @@ export function App() {
           </div>
           <div className="top-actions">
             <select
-              aria-label="选择模型"
+              aria-label={zh ? "选择模型" : "Select model"}
               value={state.selectedModel
                 ? `${state.selectedModel.provider}/${state.selectedModel.id}`
                 : ""}
@@ -385,10 +432,24 @@ export function App() {
                 </option>
               ))}
             </select>
+            <button
+              className={`inspector-toggle${inspectorOpen ? " active" : ""}`}
+              aria-label={inspectorOpen ? (zh ? "关闭检查器" : "Close inspector") : (zh ? "打开检查器" : "Open inspector")}
+              aria-expanded={inspectorOpen}
+              data-testid="toggle-inspector"
+              onClick={() => setInspectorOpen((current) => !current)}
+            >
+              <span aria-hidden="true">◫</span>
+              <span className="inspector-toggle-label">{zh ? "检查器" : "Inspector"}</span>
+              {(toolActivities.length + diffs.length) > 0 && <b>{toolActivities.length + diffs.length}</b>}
+            </button>
           </div>
         </header>
 
-        <div className="content-grid">
+        <div
+          className={`content-grid${inspectorOpen ? " inspector-visible" : ""}`}
+          style={{ "--inspector-width": `${inspectorWidth}px` } as React.CSSProperties}
+        >
           <section className="chat-panel">
             <div className="messages">
               {messages.length === 0 && (
@@ -399,17 +460,64 @@ export function App() {
                   <h2>{state.workspace ? (zh ? "从理解项目开始" : "Start by understanding the project") : (zh ? "开始一个普通会话" : "Start a general chat")}</h2>
                   <p>
                     {state.workspace
-                      ? <>试试“概览当前项目”，或输入 <code>/remember 项目使用 Electron</code>。</>
+                      ? (zh
+                          ? <>试试“概览当前项目”，或输入 <code>/remember 项目使用 Electron</code>。</>
+                          : <>Try “summarize this project”, or enter <code>/remember This project uses Electron</code>.</>)
                       : (zh ? "普通会话无需选择项目，也不会读取本地项目内容。" : "General chat needs no project and cannot read local project content.")}
                   </p>
+                  {!state.ready && (
+                    <button
+                      className="primary empty-state-action"
+                      onClick={() => {
+                        setSettingsSection("models");
+                        setShowSettings(true);
+                      }}
+                    >
+                      {zh ? "配置模型" : "Configure a model"}
+                    </button>
+                  )}
+                  {!state.workspace && (
+                    <button
+                      className="ghost empty-state-action"
+                      onClick={() => void runCommand(window.deki.chooseWorkspace(), setError, refresh)}
+                    >
+                      {zh ? "关联项目" : "Connect a project"}
+                    </button>
+                  )}
                 </div>
               )}
               {messages.map((message) => (
                 <article key={message.id} className={`message ${message.role}`}>
-                  <span>{message.role === "user" ? "你" : "Deki"}</span>
-                  <div>{message.content || "…"}</div>
+                  <span>{message.role === "user" ? (zh ? "你" : "You") : "Deki"}</span>
+                  <div className="markdown-body">
+                    <ReactMarkdown
+                      remarkPlugins={[remarkGfm]}
+                      components={{
+                        pre: ({ children }) => (
+                          <div className="code-block">
+                            <button
+                              aria-label={zh ? "复制代码" : "Copy code"}
+                              onClick={() => void navigator.clipboard.writeText(extractText(children))}
+                            >
+                              {zh ? "复制" : "Copy"}
+                            </button>
+                            <pre>{children}</pre>
+                          </div>
+                        ),
+                      }}
+                    >
+                      {message.content || "…"}
+                    </ReactMarkdown>
+                  </div>
                 </article>
               ))}
+              {toolActivities.length > 0 && (
+                <section className="inline-tools" aria-label={zh ? "工具执行过程" : "Tool execution details"}>
+                  {toolActivities.slice(-6).map((activity) => (
+                    <ToolCard key={activity.callId} activity={activity} zh={zh} />
+                  ))}
+                </section>
+              )}
             </div>
             <div className="composer">
               <textarea
@@ -448,7 +556,32 @@ export function App() {
             {error && <p className="error inline-error">{error}</p>}
           </section>
 
-          <aside className="side-panel">
+          {compactLayout && inspectorOpen && (
+            <button
+              className="inspector-scrim"
+              aria-label={zh ? "关闭检查器" : "Close inspector"}
+              onClick={() => setInspectorOpen(false)}
+            />
+          )}
+          <aside className={`side-panel${inspectorOpen ? " open" : ""}`} aria-hidden={!inspectorOpen}>
+            {!compactLayout && (
+              <div
+                className="inspector-resizer"
+                role="separator"
+                aria-label={zh ? "调整检查器宽度" : "Resize inspector"}
+                aria-orientation="vertical"
+                tabIndex={0}
+                onPointerDown={(event) => startInspectorResize(event.clientX, inspectorWidth, setInspectorWidth)}
+                onKeyDown={(event) => {
+                  if (event.key === "ArrowLeft") setInspectorWidth((value) => Math.min(520, value + 20));
+                  if (event.key === "ArrowRight") setInspectorWidth((value) => Math.max(280, value - 20));
+                }}
+              />
+            )}
+            <header className="inspector-header">
+              <strong>{zh ? "运行检查器" : "Run inspector"}</strong>
+              <button className="icon-button" aria-label={zh ? "关闭检查器" : "Close inspector"} onClick={() => setInspectorOpen(false)}>×</button>
+            </header>
             {diffs.length > 0 && (
               <Panel title={zh ? "变更 Diff" : "Change diffs"} count={diffs.length}>
                 {diffs.slice(-3).reverse().map((event, index) => (
@@ -459,33 +592,27 @@ export function App() {
                 ))}
               </Panel>
             )}
-            <Panel title="Tool Timeline" count={toolEvents.length}>
-              {toolEvents.length === 0
-                ? <EmptyLine text="等待工具调用" />
-                : toolEvents.slice(-8).reverse().map((event) => (
-                    <div className="timeline-item" key={event.eventId}>
-                      <span className={`dot ${event.type.endsWith("completed") ? "done" : ""}`} />
-                      <div>
-                        <strong>{"toolName" in event ? event.toolName : "tool"}</strong>
-                        <small>{formatEventType(event.type)}</small>
-                      </div>
-                    </div>
+            <Panel title={zh ? "工具执行" : "Tool activity"} count={toolActivities.length}>
+              {toolActivities.length === 0
+                ? <EmptyLine text={zh ? "等待工具调用" : "Waiting for tool calls"} />
+                : toolActivities.slice(-8).reverse().map((activity) => (
+                    <ToolCard compact key={activity.callId} activity={activity} zh={zh} />
                   ))}
             </Panel>
 
             {state.workspace && (
               <>
-                <Panel title="项目记忆" count={state.memories.length}>
+                <Panel title={zh ? "项目记忆" : "Project memory"} count={state.memories.length}>
                   {state.memories.length === 0
-                    ? <EmptyLine text="使用 /remember 保存第一条记忆" />
+                    ? <EmptyLine text={zh ? "使用 /remember 保存第一条记忆" : "Use /remember to save the first memory"} />
                     : state.memories.slice(0, 5).map((memory) => (
                         <MemoryLine key={memory.id} memory={memory} />
                       ))}
                 </Panel>
 
-                <Panel title="本轮使用的记忆" count={state.recalledMemories.length}>
+                <Panel title={zh ? "本轮使用的记忆" : "Memories used this turn"} count={state.recalledMemories.length}>
                   {state.recalledMemories.length === 0
-                    ? <EmptyLine text="本轮尚未注入项目记忆" />
+                    ? <EmptyLine text={zh ? "本轮尚未注入项目记忆" : "No project memory used this turn"} />
                     : state.recalledMemories.map((memory) => (
                         <MemoryLine key={memory.id} memory={memory} />
                       ))}
@@ -493,13 +620,13 @@ export function App() {
               </>
             )}
 
-            <Panel title="运行状态" count={state.skills.length + state.mcpServers.length}>
-              <StatusLine label="Skills" value={state.skills.join(", ") || "未加载"} />
+            <Panel title={zh ? "运行状态" : "Runtime status"} count={state.skills.length + state.mcpServers.length}>
+              <StatusLine label="Skills" value={state.skills.join(", ") || (zh ? "未加载" : "Not loaded")} />
               <StatusLine
                 label="MCP"
                 value={state.mcpServers.length
                   ? state.mcpServers.map((server) => `${server.id}:${server.state}`).join(", ")
-                  : "未配置"}
+                  : (zh ? "未配置" : "Not configured")}
               />
               {state.diagnostics.slice(-3).map((message) => (
                 <p className="diagnostic" key={message}>{message}</p>
@@ -509,19 +636,19 @@ export function App() {
         </div>
       </section>
       {approval && (
-        <div className="approval-overlay" role="dialog" aria-modal="true" aria-label="操作审批">
+        <div className="approval-overlay" role="dialog" aria-modal="true" aria-label={zh ? "操作审批" : "Operation approval"}>
           <section className="approval-dialog">
             <p className="eyebrow">PERMISSION REQUEST · {approval.category}</p>
             <h2>{approval.title}</h2>
             <p className="muted">{approval.description}</p>
             <pre className="approval-details">{JSON.stringify(approval.details, null, 2)}</pre>
             {approval.diff && <pre className="approval-diff">{approval.diff}</pre>}
-            <small>请求将在 {new Date(approval.expiresAt).toLocaleTimeString()} 超时，超时视为拒绝。</small>
+            <small>{zh ? `请求将在 ${new Date(approval.expiresAt).toLocaleTimeString()} 超时，超时视为拒绝。` : `This request expires at ${new Date(approval.expiresAt).toLocaleTimeString()} and will be denied.`}</small>
             <div className="approval-actions">
-              <button className="danger" onClick={() => void answerApproval("deny")}>拒绝</button>
-              <button className="ghost" onClick={() => void answerApproval("allow_once")}>允许一次</button>
-              <button className="ghost" onClick={() => void answerApproval("allow_session")}>当前会话允许</button>
-              <button className="primary" onClick={() => void answerApproval("allow_project")}>当前项目允许</button>
+              <button className="danger" onClick={() => void answerApproval("deny")}>{zh ? "拒绝" : "Deny"}</button>
+              <button className="ghost" onClick={() => void answerApproval("allow_once")}>{zh ? "允许一次" : "Allow once"}</button>
+              <button className="ghost" onClick={() => void answerApproval("allow_session")}>{zh ? "当前会话允许" : "Allow for session"}</button>
+              <button className="primary" onClick={() => void answerApproval("allow_project")}>{zh ? "当前项目允许" : "Allow for project"}</button>
             </div>
           </section>
         </div>
@@ -583,6 +710,87 @@ function StatusLine({ label, value }: { label: string; value: string }) {
   );
 }
 
+function ToolCard(props: { activity: ToolActivity; zh: boolean; compact?: boolean }) {
+  const { activity, zh } = props;
+  const status = activity.status === "running"
+    ? (zh ? "执行中" : "Running")
+    : activity.status === "failed"
+      ? (zh ? "失败" : "Failed")
+      : (zh ? "完成" : "Completed");
+  return (
+    <details className={`tool-card ${activity.status}${props.compact ? " compact" : ""}`}>
+      <summary>
+        <span className={`dot ${activity.status === "completed" ? "done" : activity.status}`} />
+        <strong>{activity.toolName}</strong>
+        <small>{status}</small>
+      </summary>
+      <div className="tool-card-body">
+        {activity.input !== undefined && <ToolPayload label={zh ? "输入" : "Input"} value={activity.input} />}
+        {activity.update !== undefined && <ToolPayload label={zh ? "过程输出" : "Progress"} value={activity.update} />}
+        {activity.result !== undefined && <ToolPayload label={zh ? "结果" : "Result"} value={activity.result} />}
+      </div>
+    </details>
+  );
+}
+
+function ToolPayload({ label, value }: { label: string; value: unknown }) {
+  return <div className="tool-payload"><span>{label}</span><pre>{formatPayload(value)}</pre></div>;
+}
+
+function buildToolActivities(
+  events: Array<Extract<AgentEvent, { type: "tool.started" | "tool.updated" | "tool.completed" }>>,
+): ToolActivity[] {
+  const activities = new Map<string, ToolActivity>();
+  for (const event of events) {
+    const current = activities.get(event.callId) ?? {
+      callId: event.callId,
+      toolName: event.toolName,
+      status: "running" as const,
+    };
+    if (event.type === "tool.started") {
+      current.input = event.input;
+    } else if (event.type === "tool.updated") {
+      current.update = event.update;
+    } else {
+      current.result = event.result;
+      current.status = event.isError ? "failed" : "completed";
+    }
+    activities.set(event.callId, current);
+  }
+  return [...activities.values()];
+}
+
+function formatPayload(value: unknown): string {
+  const formatted = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  if (!formatted) return String(value);
+  return formatted.length > 20_000 ? `${formatted.slice(0, 20_000)}\n…` : formatted;
+}
+
+function extractText(node: React.ReactNode): string {
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(extractText).join("");
+  if (node && typeof node === "object" && "props" in node) {
+    return extractText((node as React.ReactElement<{ children?: React.ReactNode }>).props.children);
+  }
+  return "";
+}
+
+function startInspectorResize(
+  initialX: number,
+  initialWidth: number,
+  setWidth: (width: number) => void,
+) {
+  const onMove = (event: PointerEvent) => {
+    setWidth(Math.min(520, Math.max(280, initialWidth + initialX - event.clientX)));
+  };
+  const onUp = () => {
+    window.removeEventListener("pointermove", onMove);
+    window.removeEventListener("pointerup", onUp);
+  };
+  window.addEventListener("pointermove", onMove);
+  window.addEventListener("pointerup", onUp);
+}
+
 function appendAssistantDelta(
   messages: ChatMessage[],
   delta: string,
@@ -608,13 +816,6 @@ async function runCommand(
   const result = await promise;
   setError(result.ok ? undefined : result.error ?? "操作失败");
   await refresh();
-}
-
-function formatEventType(type: AgentEvent["type"]): string {
-  if (type === "tool.started") return "正在执行";
-  if (type === "tool.updated") return "输出更新";
-  if (type === "tool.completed") return "执行完成";
-  return type;
 }
 
 function getWorkspaceName(workspace: string): string {

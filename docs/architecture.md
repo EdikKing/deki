@@ -30,4 +30,9 @@ Tool Gateway 使用内部名 `provider.tool`，暴露给模型时转换为 `prov
 创建 Checkpoint。Checkpoint 只增加 `refs/deki/checkpoints/*` 引用，不改变
 HEAD、当前分支或用户暂存区。
 
-Memory Engine 使用 `node:sqlite` 和版本化迁移，以小规模内存评分召回，并提供用户/项目作用域的记忆中心。自动记忆只生成待确认候选，未经确认不会进入召回。
+Memory Engine 使用 `node:sqlite` 和版本化迁移。运行时支持 FTS5 时使用
+BM25 全文检索，不支持时自动回退到 SQLite 词项倒排索引；索引候选再结合
+词项相关性、置顶和时间衰减进行混合排序。每轮提问只在当前用户或项目作用域
+以及当前任务作用域内召回，并使用各自独立的数量和字符预算注入隐藏上下文。
+任务记忆以 Pi 会话 ID 隔离，不跨任务泄漏。自动记忆只生成待确认候选，未经
+确认不会进入召回。

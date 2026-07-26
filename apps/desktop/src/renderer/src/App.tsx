@@ -161,6 +161,7 @@ export function App() {
       <SettingsView
         snapshot={settings}
         hasWorkspace={Boolean(state.workspace && state.trusted)}
+        {...(state.sessionId ? { taskId: state.sessionId } : {})}
         locale={locale}
         onChanged={setSettings}
         onClose={() => {
@@ -175,6 +176,7 @@ export function App() {
   async function submit() {
     const value = prompt.trim();
     if (!value || busy) return;
+    const rememberCommand = value.startsWith("/remember ");
     setPrompt("");
     setError(undefined);
     setMessages((current) => [
@@ -183,8 +185,10 @@ export function App() {
     ]);
     setBusy(true);
     const result = await window.deki.sendPrompt(value);
-    if (!result.ok) {
+    if (!result.ok || rememberCommand) {
       setBusy(false);
+    }
+    if (!result.ok) {
       setError(result.error ?? "请求失败");
     }
     await refresh();

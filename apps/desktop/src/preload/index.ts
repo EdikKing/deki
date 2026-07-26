@@ -99,15 +99,21 @@ const api: DekiDesktopApi = {
       ),
     );
   },
-  async remember(content) {
+  async remember(content, scope) {
     return commandResultSchema.parse(
-      await ipcRenderer.invoke(IPC_CHANNELS.remember, { content }),
+      await ipcRenderer.invoke(IPC_CHANNELS.remember, {
+        content,
+        ...(scope ? { scope } : {}),
+      }),
     );
   },
-  async listMemories(scope) {
+  async listMemories(scope, query) {
     const result = await ipcRenderer.invoke(
       IPC_CHANNELS.listMemories,
-      memoryListInputSchema.parse({ ...(scope ? { scope } : {}) }),
+      memoryListInputSchema.parse({
+        ...(scope ? { scope } : {}),
+        ...(query ? { query } : {}),
+      }),
     );
     return memoryRecordSchema.array().parse(result);
   },

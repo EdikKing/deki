@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   agentEventSchema,
   bootstrapStateSchema,
+  memoryListInputSchema,
+  rememberInputSchema,
   sendPromptInputSchema,
 } from "./index";
 
@@ -19,6 +21,23 @@ describe("shared IPC schemas", () => {
 
   it("rejects empty prompts", () => {
     expect(() => sendPromptInputSchema.parse({ prompt: "   " })).toThrow();
+  });
+
+  it("validates task-scoped memory commands and indexed queries", () => {
+    expect(rememberInputSchema.parse({
+      content: "保留当前迁移进度",
+      scope: "task",
+    })).toEqual({
+      content: "保留当前迁移进度",
+      scope: "task",
+    });
+    expect(memoryListInputSchema.parse({
+      scope: "task",
+      query: "迁移进度",
+    })).toEqual({
+      scope: "task",
+      query: "迁移进度",
+    });
   });
 
   it("keeps bootstrap state explicit when runtime is unavailable", () => {

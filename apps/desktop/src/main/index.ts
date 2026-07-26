@@ -80,6 +80,7 @@ import {
   type BootstrapState,
   type CommandResult,
   type McpServerEditor,
+  type MemoryScope,
 } from "@deki-ai/shared";
 
 protocol.registerSchemesAsPrivileged([{
@@ -202,9 +203,16 @@ class DesktopController {
       ...(snapshot?.sessionId ? { sessionId: snapshot.sessionId } : {}),
       models: snapshot?.models ?? [],
       ...(snapshot?.selectedModel ? { selectedModel: snapshot.selectedModel } : {}),
-      memories: this.#projectFeatures
-        ? this.#memory.listProjectMemories(this.#scopeId)
-        : [],
+      memories: [
+        ...(this.#projectFeatures
+          ? this.#memory.listProjectMemories(this.#scopeId)
+          : this.#settings.snapshot().effective.memory.userMemoryEnabled
+            ? this.#memory.listMemories("user", "user", { limit: 100 })
+            : []),
+        ...(snapshot?.sessionId && this.#settings.snapshot().effective.memory.taskMemoryEnabled
+          ? this.#memory.listMemories("task", snapshot.sessionId, { limit: 100 })
+          : []),
+      ],
       recalledMemories: snapshot?.recalledMemories ?? [],
       mcpServers: this.#mcp.getStatuses(),
       skills: snapshot?.skills ?? [],
@@ -279,9 +287,9 @@ class DesktopController {
     }
   }
 
-  async remember(content: string): Promise<CommandResult> {
+  async remember(content: string, scope?: MemoryScope): Promise<CommandResult> {
     return this.#run(async (runtime) => {
-      runtime.remember(content);
+      runtime.remember(content, scope);
     });
   }
 
@@ -547,11 +555,14 @@ class DesktopController {
     }
   }
 
-  listMemories(requestedScope?: "user" | "project") {
+  listMemories(requestedScope?: MemoryScope, query?: string) {
     const { scope, scopeId } = this.#resolveMemoryScope(requestedScope);
     return [
-      ...this.#memory.listMemories(scope, scopeId),
-      ...this.#memory.listMemories(scope, scopeId, { status: "pending" }),
+      ...this.#memory.listMemories(scope, scopeId, { ...(query ? { query } : {}) }),
+      ...this.#memory.listMemories(scope, scopeId, {
+        status: "pending",
+        ...(query ? { query } : {}),
+      }),
     ];
   }
 
@@ -794,7 +805,7 @@ class DesktopController {
 
   async updateMemory(input: {
     id: string;
-    scope?: "user" | "project";
+    scope?: MemoryScope;
     content?: string;
     pinned?: boolean;
     status?: "active" | "pending" | "superseded" | "archived";
@@ -807,14 +818,14 @@ class DesktopController {
     });
   }
 
-  deleteMemory(id: string, requestedScope?: "user" | "project"): CommandResult {
+  deleteMemory(id: string, requestedScope?: MemoryScope): CommandResult {
     const { scope, scopeId } = this.#resolveMemoryScope(requestedScope);
     return this.#memory.deleteMemory(scope, scopeId, id)
       ? { ok: true }
       : { ok: false, error: "未找到记忆" };
   }
 
-  clearMemoryScope(requestedScope: "user" | "project"): CommandResult {
+  clearMemoryScope(requestedScope: MemoryScope): CommandResult {
     const { scope, scopeId } = this.#resolveMemoryScope(requestedScope);
     const count = this.#memory.clearScope(scope, scopeId);
     return { ok: true, error: `已清理 ${count} 条记忆` };
@@ -822,8 +833,8 @@ class DesktopController {
 
   moveMemory(
     id: string,
-    from: "user" | "project",
-    to: "user" | "project",
+    from: MemoryScope,
+    to: MemoryScope,
   ) {
     const source = this.#resolveMemoryScope(from);
     const target = this.#resolveMemoryScope(to);
@@ -1058,14 +1069,19 @@ class DesktopController {
     }, snapshot.revision);
   }
 
-  #resolveMemoryScope(requested?: "user" | "project"): {
-    scope: "user" | "project";
+  #resolveMemoryScope(requested?: MemoryScope): {
+    scope: MemoryScope;
     scopeId: string;
   } {
     const scope = requested ?? (this.#projectFeatures ? "project" : "user");
     if (scope === "project") {
       if (!this.#projectFeatures) throw new Error("普通会话没有项目记忆作用域");
       return { scope, scopeId: this.#scopeId };
+    }
+    if (scope === "task") {
+      const sessionId = this.#runtime?.snapshot().sessionId;
+      if (!sessionId) throw new Error("当前会话尚未就绪，没有任务记忆作用域");
+      return { scope, scopeId: sessionId };
     }
     return { scope: "user", scopeId: "user" };
   }
@@ -1315,13 +1331,13 @@ function registerIpcHandlers(): void {
   });
   ipcMain.handle(IPC_CHANNELS.remember, async (event, raw) => {
     assertTrustedSender(event);
-    const { content } = rememberInputSchema.parse(raw);
-    return commandResultSchema.parse(await controller?.remember(content));
+    const { content, scope } = rememberInputSchema.parse(raw);
+    return commandResultSchema.parse(await controller?.remember(content, scope));
   });
   ipcMain.handle(IPC_CHANNELS.listMemories, (event, raw) => {
     assertTrustedSender(event);
-    const { scope } = memoryListInputSchema.parse(raw ?? {});
-    return controller?.listMemories(scope) ?? [];
+    const { scope, query } = memoryListInputSchema.parse(raw ?? {});
+    return controller?.listMemories(scope, query) ?? [];
   });
   ipcMain.handle(IPC_CHANNELS.selectModel, async (event, raw) => {
     assertTrustedSender(event);

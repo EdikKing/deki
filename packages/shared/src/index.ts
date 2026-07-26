@@ -71,12 +71,15 @@ const skillsSettingsSchema = z.object({
 const memorySettingsSchema = z.object({
   userMemoryEnabled: z.boolean(),
   projectMemoryEnabled: z.boolean(),
+  taskMemoryEnabled: z.boolean(),
   automaticCandidates: z.boolean(),
   candidateConfirmationRequired: z.literal(true),
   userRecallLimit: z.number().int(),
   userCharacterBudget: z.number().int(),
   projectRecallLimit: z.number().int(),
   projectCharacterBudget: z.number().int(),
+  taskRecallLimit: z.number().int(),
+  taskCharacterBudget: z.number().int(),
   sensitiveFilter: z.literal(true),
 }).strict();
 const privacySettingsSchema = z.object({
@@ -207,9 +210,12 @@ export const memorySourceSchema = z.object({
 
 export type MemorySource = z.infer<typeof memorySourceSchema>;
 
+export const memoryScopeSchema = z.enum(["user", "project", "task"]);
+export type MemoryScope = z.infer<typeof memoryScopeSchema>;
+
 export const memoryRecordSchema = z.object({
   id: z.string(),
-  scope: z.enum(["user", "workspace", "project", "branch", "task"]),
+  scope: memoryScopeSchema,
   scopeId: z.string(),
   type: z.enum(["preference", "fact", "decision", "experience", "task-state"]),
   content: z.string(),
@@ -363,6 +369,7 @@ export const sendPromptInputSchema = z.object({
 
 export const rememberInputSchema = z.object({
   content: z.string().trim().min(1).max(10_000),
+  scope: memoryScopeSchema.optional(),
 });
 
 export const selectModelInputSchema = z.object({
@@ -447,18 +454,19 @@ export type SkillStatus = z.infer<typeof skillStatusSchema>;
 
 export const memoryMutationSchema = z.object({
   id: z.string(),
-  scope: z.enum(["user", "project"]).optional(),
+  scope: memoryScopeSchema.optional(),
   content: z.string().trim().min(1).max(10_000).optional(),
   pinned: z.boolean().optional(),
   status: z.enum(["active", "pending", "superseded", "archived"]).optional(),
 }).strict();
 export const memoryListInputSchema = z.object({
-  scope: z.enum(["user", "project"]).optional(),
+  scope: memoryScopeSchema.optional(),
+  query: z.string().trim().max(1_000).optional(),
 }).strict();
 export const memoryMoveInputSchema = z.object({
   id: z.string(),
-  from: z.enum(["user", "project"]),
-  to: z.enum(["user", "project"]),
+  from: memoryScopeSchema,
+  to: memoryScopeSchema,
 }).strict();
 
 export const dataUsageSchema = z.object({
@@ -575,8 +583,8 @@ export interface DekiDesktopApi {
   switchSession(id: string): Promise<CommandResult>;
   renameSession(id: string, name: string): Promise<CommandResult>;
   deleteSession(id: string): Promise<CommandResult>;
-  remember(content: string): Promise<CommandResult>;
-  listMemories(scope?: "user" | "project"): Promise<MemoryRecord[]>;
+  remember(content: string, scope?: MemoryScope): Promise<CommandResult>;
+  listMemories(scope?: MemoryScope, query?: string): Promise<MemoryRecord[]>;
   selectModel(provider: string, id: string): Promise<CommandResult>;
   getSettings(): Promise<SettingsSnapshot>;
   updateSettings(
@@ -613,12 +621,12 @@ export interface DekiDesktopApi {
   listSkills(): Promise<SkillStatus[]>;
   reloadSkills(): Promise<CommandResult>;
   updateMemory(input: z.infer<typeof memoryMutationSchema>): Promise<MemoryRecord>;
-  deleteMemory(id: string, scope?: "user" | "project"): Promise<CommandResult>;
-  clearMemoryScope(scope: "user" | "project"): Promise<CommandResult>;
+  deleteMemory(id: string, scope?: MemoryScope): Promise<CommandResult>;
+  clearMemoryScope(scope: MemoryScope): Promise<CommandResult>;
   moveMemory(
     id: string,
-    from: "user" | "project",
-    to: "user" | "project",
+    from: MemoryScope,
+    to: MemoryScope,
   ): Promise<MemoryRecord>;
   getDataUsage(): Promise<DataUsage>;
   listAuditRecords(): Promise<AuditRecordSummary[]>;

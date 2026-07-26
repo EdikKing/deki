@@ -62,6 +62,38 @@ test("starts a general chat without a workspace", async ({}, testInfo) => {
 
 // Playwright requires an object-destructured fixtures parameter.
 // eslint-disable-next-line no-empty-pattern
+test("stores and manages memory for the current task", async ({}) => {
+  const temporaryHome = await mkdtemp(resolve(tmpdir(), "deki-electron-task-memory-"));
+  await seedChineseSettings(temporaryHome);
+  const electronApp = await electron.launch({
+    executablePath: electronPath,
+    args: [resolve("apps/desktop"), "--lang=zh-CN"],
+    env: {
+      ...createTestEnvironment(temporaryHome),
+      OPENAI_API_KEY: "sk-test-only-not-persisted",
+    },
+  });
+
+  try {
+    const window = await electronApp.firstWindow();
+    const taskMemoryText = "仅用于当前 Electron 冒烟任务";
+    await expect(window.locator("textarea")).toBeEnabled();
+    await window.locator("textarea").fill(`/remember --task ${taskMemoryText}`);
+    await window.getByRole("button", { name: "发送" }).click();
+    await window.getByTestId("open-settings").click();
+    await window.getByTestId("settings-section-memory").click();
+    const memoryScope = window.locator(".settings-subsection select");
+    await expect(memoryScope.locator("option[value=task]")).toHaveText("当前任务");
+    await memoryScope.selectOption("task");
+    await expect(window.locator(".provider-card", { hasText: taskMemoryText })).toBeVisible();
+  } finally {
+    await electronApp.close();
+    await rm(temporaryHome, { recursive: true, force: true });
+  }
+});
+
+// Playwright requires an object-destructured fixtures parameter.
+// eslint-disable-next-line no-empty-pattern
 test("trusts a workspace, streams fixture events, and recalls memory", async ({}, testInfo) => {
   const temporaryHome = await mkdtemp(resolve(tmpdir(), "deki-electron-home-"));
   await seedChineseSettings(temporaryHome);

@@ -14,8 +14,8 @@
 - 受控工作区工具：`read`、`grep`、`find`、`ls`、`edit`、`write`、`delete`、`move`、`bash`
 - stdio MCP Server 的配置、启停、重启、测试、Tool 权限/开关/超时和本机环境变量
 - `.deki/skills`、`.agents/skills`、项目内 `.pi/skills` 的发现、校验和重载
-- `/remember`、模型生成的待确认记忆候选和用户/项目记忆中心
-- 本地 SQLite 记忆库和 Pi JSONL 会话
+- `/remember`、`/remember --task`、待确认记忆候选和用户/项目/任务记忆中心
+- 本地 SQLite 全文/倒排索引、逐轮混合召回和 Pi JSONL 会话
 - 内置常用云模型 Provider 与自定义 OpenAI 兼容 Provider
 - 全局、项目共享、项目本机和会话设置、字段来源及修订冲突保护
 - 受权限网关保护的文件修改、Shell、MCP、完整 Diff Viewer、历史审计与脱敏诊断

@@ -17,6 +17,14 @@ afterEach(async () => {
 });
 
 describe("SettingsStore", () => {
+  it("enables bounded current-task recall by default", () => {
+    expect(defaultSettings.memory).toMatchObject({
+      taskMemoryEnabled: true,
+      taskRecallLimit: 3,
+      taskCharacterBudget: 1_200,
+    });
+  });
+
   it("merges global, shared, local, and session settings in order", async () => {
     const root = await mkdtemp(join(tmpdir(), "deki-settings-"));
     directories.push(root);

@@ -92,12 +92,15 @@ const skillsSchema = z.object({
 const memorySchema = z.object({
   userMemoryEnabled: z.boolean(),
   projectMemoryEnabled: z.boolean(),
+  taskMemoryEnabled: z.boolean(),
   automaticCandidates: z.boolean(),
   candidateConfirmationRequired: z.literal(true),
   userRecallLimit: z.number().int().min(0).max(10),
   userCharacterBudget: z.number().int().min(0).max(10_000),
   projectRecallLimit: z.number().int().min(0).max(10),
   projectCharacterBudget: z.number().int().min(0).max(10_000),
+  taskRecallLimit: z.number().int().min(0).max(10),
+  taskCharacterBudget: z.number().int().min(0).max(10_000),
   sensitiveFilter: z.literal(true),
 }).strict();
 
@@ -215,12 +218,15 @@ export const defaultSettings: DekiSettings = settingsSchema.parse({
   memory: {
     userMemoryEnabled: false,
     projectMemoryEnabled: true,
+    taskMemoryEnabled: true,
     automaticCandidates: false,
     candidateConfirmationRequired: true,
     userRecallLimit: 2,
     userCharacterBudget: 800,
     projectRecallLimit: 3,
     projectCharacterBudget: 1_200,
+    taskRecallLimit: 3,
+    taskCharacterBudget: 1_200,
     sensitiveFilter: true,
   },
   privacy: {

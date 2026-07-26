@@ -7,6 +7,8 @@ import type {
   ModelProviderInput,
   McpServerEditor,
   McpToolSummary,
+  MemoryRecord,
+  MemoryScope,
   PermissionCategory,
   PermissionPolicy,
   RedactedModelProvider,
@@ -81,6 +83,7 @@ const permissionLabels: Record<PermissionCategory, [string, string]> = {
 export function SettingsView(props: {
   snapshot: SettingsSnapshot;
   hasWorkspace: boolean;
+  taskId?: string;
   locale: Locale;
   onChanged: (snapshot: SettingsSnapshot) => void;
   onClose: () => void;
@@ -243,7 +246,7 @@ export function SettingsView(props: {
           {section === "permissions" && <PermissionSettings value={value} source={source} zh={zh} update={update} />}
           {section === "mcp" && <McpSettings value={value} source={source} zh={zh} update={update} hasWorkspace={props.hasWorkspace} />}
           {section === "skills" && <SkillSettings value={value} source={source} zh={zh} update={update} scope={scope} />}
-          {section === "memory" && <MemorySettings value={value} source={source} zh={zh} update={update} hasWorkspace={props.hasWorkspace} />}
+          {section === "memory" && <MemorySettings value={value} source={source} zh={zh} update={update} hasWorkspace={props.hasWorkspace} {...(props.taskId ? { taskId: props.taskId } : {})} />}
           {section === "privacy" && <PrivacySettings value={value} source={source} zh={zh} update={update} />}
           {section === "advanced" && <AdvancedSettings value={value} source={source} zh={zh} update={update} />}
           {section === "about" && <AboutSettings value={value} zh={zh} update={update} />}
@@ -744,47 +747,74 @@ function SkillSettings({ value, source, zh, update, scope }: SettingsComponentPr
   </>;
 }
 
-function MemorySettings({ value, source, zh, update, hasWorkspace }: SettingsComponentProps & { hasWorkspace: boolean }) {
-  const [memories, setMemories] = useState<import("@deki-ai/shared").MemoryRecord[]>([]);
-  const [memoryScope, setMemoryScope] = useState<"user" | "project">(hasWorkspace ? "project" : "user");
+function MemorySettings({ value, source, zh, update, hasWorkspace, taskId }: SettingsComponentProps & { hasWorkspace: boolean; taskId?: string }) {
+  const [memories, setMemories] = useState<MemoryRecord[]>([]);
+  const [memoryScope, setMemoryScope] = useState<MemoryScope>(hasWorkspace ? "project" : "user");
   const [memoryQuery, setMemoryQuery] = useState("");
-  const refresh = async () => setMemories(await window.deki.listMemories(memoryScope));
+  const refresh = async (query = memoryQuery) =>
+    setMemories(await window.deki.listMemories(memoryScope, query));
   useEffect(() => {
     if (!hasWorkspace && memoryScope === "project") {
       setMemoryScope("user");
       return;
     }
-    void refresh();
-  }, [hasWorkspace, memoryScope, value.memory.userMemoryEnabled, value.memory.projectMemoryEnabled]);
-  const visibleMemories = memories.filter((memory) =>
-    memory.content.toLocaleLowerCase().includes(memoryQuery.trim().toLocaleLowerCase()));
+    if (!taskId && memoryScope === "task") {
+      setMemoryScope(hasWorkspace ? "project" : "user");
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      void refresh(memoryQuery);
+    }, memoryQuery ? 150 : 0);
+    return () => window.clearTimeout(timer);
+  }, [
+    hasWorkspace,
+    memoryQuery,
+    memoryScope,
+    taskId,
+    value.memory.projectMemoryEnabled,
+    value.memory.taskMemoryEnabled,
+    value.memory.userMemoryEnabled,
+  ]);
+  const scopeChoices: Array<{ scope: MemoryScope; label: string }> = [
+    { scope: "user", label: zh ? "用户" : "User" },
+    ...(hasWorkspace ? [{ scope: "project" as const, label: zh ? "当前项目" : "Project" }] : []),
+    ...(taskId ? [{ scope: "task" as const, label: zh ? "当前任务" : "Current task" }] : []),
+  ];
+  const scopeDescription = memoryScope === "task"
+    ? `${zh ? "当前任务作用域" : "Current task scope"} · ${taskId ?? ""}`
+    : memoryScope === "project"
+      ? (zh ? "当前项目作用域" : "Current project scope")
+      : (zh ? "用户作用域" : "User scope");
   return <>
     <Toggle title={zh ? "普通会话用户记忆" : "User memory in general chats"} path="memory.userMemoryEnabled" checked={value.memory.userMemoryEnabled} source={source} onChange={(userMemoryEnabled) => update({ memory: { userMemoryEnabled } })} />
     <Toggle title={zh ? "项目记忆" : "Project memory"} path="memory.projectMemoryEnabled" checked={value.memory.projectMemoryEnabled} source={source} onChange={(projectMemoryEnabled) => update({ memory: { projectMemoryEnabled } })} />
+    <Toggle title={zh ? "当前任务记忆" : "Current task memory"} description={zh ? "仅在当前任务内检索，适合保存临时目标、约束和进度。" : "Retrieved only in the current task for temporary goals, constraints, and progress."} path="memory.taskMemoryEnabled" checked={value.memory.taskMemoryEnabled} source={source} onChange={(taskMemoryEnabled) => update({ memory: { taskMemoryEnabled } })} />
     <Toggle title={zh ? "自动生成记忆候选" : "Automatic memory candidates"} description={zh ? "默认关闭；候选必须确认后才进入召回。" : "Off by default; candidates must be accepted before recall."} path="memory.automaticCandidates" checked={value.memory.automaticCandidates} source={source} onChange={(automaticCandidates) => update({ memory: { automaticCandidates } })} />
     <Range title={zh ? "用户记忆召回数量" : "User recall count"} path="memory.userRecallLimit" value={value.memory.userRecallLimit} min={0} max={10} source={source} onChange={(userRecallLimit) => update({ memory: { userRecallLimit } })} />
     <Range title={zh ? "用户记忆字符预算" : "User memory character budget"} path="memory.userCharacterBudget" value={value.memory.userCharacterBudget} min={0} max={10000} step={100} source={source} onChange={(userCharacterBudget) => update({ memory: { userCharacterBudget } })} />
     <Range title={zh ? "项目记忆召回数量" : "Project recall count"} path="memory.projectRecallLimit" value={value.memory.projectRecallLimit} min={0} max={10} source={source} onChange={(projectRecallLimit) => update({ memory: { projectRecallLimit } })} />
     <Range title={zh ? "项目记忆字符预算" : "Project memory character budget"} path="memory.projectCharacterBudget" value={value.memory.projectCharacterBudget} min={0} max={10000} step={100} source={source} onChange={(projectCharacterBudget) => update({ memory: { projectCharacterBudget } })} />
+    <Range title={zh ? "任务记忆召回数量" : "Task recall count"} path="memory.taskRecallLimit" value={value.memory.taskRecallLimit} min={0} max={10} source={source} onChange={(taskRecallLimit) => update({ memory: { taskRecallLimit } })} />
+    <Range title={zh ? "任务记忆字符预算" : "Task memory character budget"} path="memory.taskCharacterBudget" value={value.memory.taskCharacterBudget} min={0} max={10000} step={100} source={source} onChange={(taskCharacterBudget) => update({ memory: { taskCharacterBudget } })} />
     <div className="settings-subsection">
-      <div className="subsection-heading"><div><h2>{zh ? "记忆中心" : "Memory center"}</h2><p>{memoryScope === "project" ? (zh ? "当前项目作用域" : "Current project scope") : (zh ? "用户作用域" : "User scope")}</p></div><div className="button-group">{hasWorkspace && <select value={memoryScope} onChange={(event) => setMemoryScope(event.target.value as "user" | "project")}><option value="project">{zh ? "当前项目" : "Project"}</option><option value="user">{zh ? "用户" : "User"}</option></select>}<button className="ghost small-action" onClick={() => void refresh()}>{zh ? "刷新" : "Refresh"}</button><button className="danger small-action" onClick={async () => {
+      <div className="subsection-heading"><div><h2>{zh ? "记忆中心" : "Memory center"}</h2><p>{scopeDescription}</p></div><div className="button-group"><select value={memoryScope} onChange={(event) => setMemoryScope(event.target.value as MemoryScope)}>{scopeChoices.map((choice) => <option value={choice.scope} key={choice.scope}>{choice.label}</option>)}</select><button className="ghost small-action" onClick={() => void refresh()}>{zh ? "刷新" : "Refresh"}</button><button className="danger small-action" onClick={async () => {
         if (!window.confirm(zh ? "彻底清理当前作用域全部记忆？" : "Permanently clear all memories in this scope?")) return;
         await window.deki.clearMemoryScope(memoryScope);
         await refresh();
       }}>{zh ? "清空此作用域" : "Clear scope"}</button></div></div>
-      <input className="memory-search" value={memoryQuery} onChange={(event) => setMemoryQuery(event.target.value)} placeholder={zh ? "搜索记忆…" : "Search memories…"} />
-      {visibleMemories.length === 0 && <p className="muted">{zh ? "没有可管理的记忆。" : "No memories to manage."}</p>}
-      {visibleMemories.map((memory) => <div className="provider-card" key={memory.id}><div><strong>{memory.content}</strong><small>{memory.scope} · {memory.status} · {new Date(memory.updatedAt).toLocaleString()}</small></div><div>{memory.status === "pending" ? <><button className="primary small-action" onClick={async () => { await window.deki.updateMemory({ id: memory.id, scope: memoryScope, status: "active" }); await refresh(); }}>{zh ? "确认" : "Accept"}</button><button className="danger small-action" onClick={async () => { await window.deki.deleteMemory(memory.id, memoryScope); await refresh(); }}>{zh ? "拒绝" : "Reject"}</button></> : <><button className="ghost small-action" onClick={async () => {
+      <input className="memory-search" value={memoryQuery} onChange={(event) => setMemoryQuery(event.target.value)} placeholder={zh ? "使用全文索引搜索记忆…" : "Search memories with full-text index…"} />
+      <p className="muted">{zh ? "聊天时会按每轮问题进行混合检索；使用 /remember --task 内容 可保存当前任务记忆。" : "Each prompt uses hybrid retrieval. Use /remember --task content to save task-only memory."}</p>
+      {memories.length === 0 && <p className="muted">{zh ? "没有可管理的记忆。" : "No memories to manage."}</p>}
+      {memories.map((memory) => <div className="provider-card" key={memory.id}><div><strong>{memory.content}</strong><small>{memory.scope} · {memory.status} · {new Date(memory.updatedAt).toLocaleString()}</small></div><div>{memory.status === "pending" ? <><button className="primary small-action" onClick={async () => { await window.deki.updateMemory({ id: memory.id, scope: memoryScope, status: "active" }); await refresh(); }}>{zh ? "确认" : "Accept"}</button><button className="danger small-action" onClick={async () => { await window.deki.deleteMemory(memory.id, memoryScope); await refresh(); }}>{zh ? "拒绝" : "Reject"}</button></> : <><button className="ghost small-action" onClick={async () => {
         const content = window.prompt(zh ? "编辑记忆" : "Edit memory", memory.content);
         if (content?.trim()) {
           await window.deki.updateMemory({ id: memory.id, scope: memoryScope, content: content.trim() });
           await refresh();
         }
-      }}>{zh ? "编辑" : "Edit"}</button><button className="ghost small-action" onClick={async () => { await window.deki.updateMemory({ id: memory.id, scope: memoryScope, pinned: !memory.pinned }); await refresh(); }}>{memory.pinned ? (zh ? "取消置顶" : "Unpin") : (zh ? "置顶" : "Pin")}</button><button className="ghost small-action" onClick={async () => { await window.deki.updateMemory({ id: memory.id, scope: memoryScope, status: "archived" }); await refresh(); }}>{zh ? "归档" : "Archive"}</button>{hasWorkspace && <button className="ghost small-action" onClick={async () => {
-        const target = memoryScope === "project" ? "user" : "project";
-        await window.deki.moveMemory(memory.id, memoryScope, target);
+      }}>{zh ? "编辑" : "Edit"}</button><button className="ghost small-action" onClick={async () => { await window.deki.updateMemory({ id: memory.id, scope: memoryScope, pinned: !memory.pinned }); await refresh(); }}>{memory.pinned ? (zh ? "取消置顶" : "Unpin") : (zh ? "置顶" : "Pin")}</button><button className="ghost small-action" onClick={async () => { await window.deki.updateMemory({ id: memory.id, scope: memoryScope, status: "archived" }); await refresh(); }}>{zh ? "归档" : "Archive"}</button>{scopeChoices.filter((choice) => choice.scope !== memoryScope).map((choice) => <button className="ghost small-action" key={choice.scope} onClick={async () => {
+        await window.deki.moveMemory(memory.id, memoryScope, choice.scope);
         await refresh();
-      }}>{memoryScope === "project" ? (zh ? "移到用户" : "Move to user") : (zh ? "移到项目" : "Move to project")}</button>}<button className="danger small-action" onClick={async () => { await window.deki.deleteMemory(memory.id, memoryScope); await refresh(); }}>{zh ? "彻底删除" : "Delete"}</button></>}</div></div>)}
+      }}>{zh ? `移到${choice.label}` : `Move to ${choice.label}`}</button>)}<button className="danger small-action" onClick={async () => { await window.deki.deleteMemory(memory.id, memoryScope); await refresh(); }}>{zh ? "彻底删除" : "Delete"}</button></>}</div></div>)}
     </div>
   </>;
 }

@@ -30,6 +30,7 @@ import {
   type CapabilityProvider,
   type ConversationMessage,
   type MemoryRecord,
+  type MemoryScope,
   type ModelSummary,
   type SessionSummary,
   type ToolCallContext,
@@ -254,6 +255,10 @@ export class DekiAgentRuntime {
 
   async prompt(prompt: string): Promise<void> {
     const trimmed = prompt.trim();
+    if (trimmed.startsWith("/remember --task ")) {
+      this.remember(trimmed.slice("/remember --task ".length), "task");
+      return;
+    }
     if (trimmed.startsWith("/remember ")) {
       this.remember(trimmed.slice("/remember ".length));
       return;
@@ -272,6 +277,7 @@ export class DekiAgentRuntime {
     ) {
       runtime.session.setSessionName(createSessionTitle(trimmed));
     }
+    await this.#injectRelevantMemories(trimmed);
 
     this.#streaming = true;
     this.#lastPrompt = trimmed;
@@ -287,23 +293,38 @@ export class DekiAgentRuntime {
     }
   }
 
-  remember(content: string): MemoryRecord {
-    if (!this.#projectFeaturesEnabled() && !this.#options.settings.memory.userMemoryEnabled) {
+  remember(content: string, requestedScope?: MemoryScope): MemoryRecord {
+    const scope = requestedScope
+      ?? (this.#projectFeaturesEnabled() ? "project" : "user");
+    if (scope === "user" && !this.#options.settings.memory.userMemoryEnabled) {
       throw new Error("普通会话的用户记忆未启用，请先在设置中开启");
     }
-    if (this.#projectFeaturesEnabled() && !this.#options.settings.memory.projectMemoryEnabled) {
+    if (scope === "project" && !this.#projectFeaturesEnabled()) {
+      throw new Error("普通会话没有项目记忆作用域");
+    }
+    if (scope === "project" && !this.#options.settings.memory.projectMemoryEnabled) {
       throw new Error("项目记忆未启用，请先在设置中开启");
     }
+    if (scope === "task" && !this.#options.settings.memory.taskMemoryEnabled) {
+      throw new Error("任务记忆未启用，请先在设置中开启");
+    }
+    const sessionId = this.#runtime?.session.sessionId;
+    if (scope === "task" && !sessionId) {
+      throw new Error("当前会话尚未就绪，没有任务记忆作用域");
+    }
     const memory = this.#options.memoryEngine.createMemory({
-      scope: this.#projectFeaturesEnabled() ? "project" : "user",
-      scopeId: this.#projectFeaturesEnabled() ? this.#options.scopeId : "user",
+      scope,
+      scopeId: scope === "project"
+        ? this.#options.scopeId
+        : scope === "task"
+          ? sessionId!
+          : "user",
       content,
       source: {
         kind: "user_command",
-        ...(this.#runtime?.session.sessionId
-          ? { sessionId: this.#runtime.session.sessionId }
-          : {}),
+        ...(sessionId ? { sessionId } : {}),
       },
+      ...(scope === "task" ? { type: "task-state" as const } : {}),
     });
     this.#emit({ type: "memory.saved", memory });
     return memory;
@@ -318,27 +339,13 @@ export class DekiAgentRuntime {
       throw new Error("Agent 正在运行，无法新建会话");
     }
 
-    this.#recalledMemories = this.#projectFeaturesEnabled()
-      ? this.#options.settings.memory.projectMemoryEnabled
-        ? this.#options.memoryEngine.recallProjectMemories(
-            this.#options.scopeId,
-            "",
-            {
-              limit: this.#options.settings.memory.projectRecallLimit,
-              characterBudget: this.#options.settings.memory.projectCharacterBudget,
-            },
-          )
-        : []
-      : this.#options.settings.memory.userMemoryEnabled
-        ? this.#options.memoryEngine.listMemories("user", "user", {
-            limit: this.#options.settings.memory.userRecallLimit,
-          }).filter((memory, index, all) => {
-            const used = all.slice(0, index).reduce((sum, item) => sum + item.content.length, 0);
-            return used + memory.content.length <= this.#options.settings.memory.userCharacterBudget;
-          })
-        : [];
+    this.#recalledMemories = this.#recallMemories("");
     const result = await runtime.newSession();
     if (result.cancelled) return;
+    this.#recalledMemories = this.#recallMemories(
+      "",
+      runtime.session.sessionId,
+    );
     if (this.#recalledMemories.length > 0) {
       this.#emit({
         type: "memory.used",
@@ -514,7 +521,8 @@ export class DekiAgentRuntime {
       sessionManager: SessionManager;
       sessionStartEvent?: Parameters<typeof createAgentSessionFromServices>[0]["sessionStartEvent"];
     }) => {
-      const recalled = [...this.#recalledMemories];
+      const recalled = this.#recallMemories("", sessionManager.getSessionId());
+      this.#recalledMemories = recalled;
       const contextFiles = this.#projectFeaturesEnabled()
         ? await loadConfiguredContextFiles(
             cwd,
@@ -735,6 +743,63 @@ export class DekiAgentRuntime {
     }
   }
 
+  async #injectRelevantMemories(query: string): Promise<void> {
+    const runtime = this.#runtime;
+    if (!runtime) return;
+    const memories = this.#recallMemories(query, runtime.session.sessionId);
+    this.#recalledMemories = memories;
+    if (memories.length === 0) return;
+    await runtime.session.sendCustomMessage({
+      customType: "deki.memory.recall",
+      content: renderMemoryContext(memories),
+      display: false,
+      details: {
+        query,
+        memoryIds: memories.map((memory) => memory.id),
+      },
+    }, { triggerTurn: false });
+    this.#emit({ type: "memory.used", memories });
+  }
+
+  #recallMemories(query: string, sessionId?: string): MemoryRecord[] {
+    const persistent = this.#projectFeaturesEnabled()
+      ? this.#options.settings.memory.projectMemoryEnabled
+        && this.#options.settings.workspace.loadProjectMemory
+        ? this.#options.memoryEngine.recallMemories(
+            "project",
+            this.#options.scopeId,
+            query,
+            {
+              limit: this.#options.settings.memory.projectRecallLimit,
+              characterBudget: this.#options.settings.memory.projectCharacterBudget,
+            },
+          )
+        : []
+      : this.#options.settings.memory.userMemoryEnabled
+        ? this.#options.memoryEngine.recallMemories(
+            "user",
+            "user",
+            query,
+            {
+              limit: this.#options.settings.memory.userRecallLimit,
+              characterBudget: this.#options.settings.memory.userCharacterBudget,
+            },
+          )
+        : [];
+    const task = sessionId && this.#options.settings.memory.taskMemoryEnabled
+      ? this.#options.memoryEngine.recallMemories(
+          "task",
+          sessionId,
+          query,
+          {
+            limit: this.#options.settings.memory.taskRecallLimit,
+            characterBudget: this.#options.settings.memory.taskCharacterBudget,
+          },
+        )
+      : [];
+    return dedupeMemories([...task, ...persistent]);
+  }
+
   async #createAutomaticMemoryCandidates(): Promise<void> {
     const prompt = this.#lastPrompt;
     this.#lastPrompt = undefined;
@@ -939,15 +1004,25 @@ class ProjectInfoProvider implements CapabilityProvider {
 
 function renderMemoryContext(memories: readonly MemoryRecord[]): string {
   const lines = memories.map(
-    (memory) => `- [${memory.id}] ${memory.content}（来源：${memory.source.kind}）`,
+    (memory) =>
+      `- [${memory.scope}:${memory.id}] ${memory.content}（来源：${memory.source.kind}）`,
   );
   return [
-    "# Deki 项目记忆",
+    "# Deki 相关长期记忆",
     "",
     "以下内容由用户明确保存，仅在与当前任务相关时使用：",
     "",
     ...lines,
   ].join("\n");
+}
+
+function dedupeMemories(memories: readonly MemoryRecord[]): MemoryRecord[] {
+  const seen = new Set<string>();
+  return memories.filter((memory) => {
+    if (seen.has(memory.id)) return false;
+    seen.add(memory.id);
+    return true;
+  });
 }
 
 async function discoverWorkspaceSkills(workspace: string): Promise<string[]> {

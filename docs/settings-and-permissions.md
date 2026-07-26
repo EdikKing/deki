@@ -75,5 +75,14 @@ model proposes at most three structured candidates after a successful task.
 Candidates stay pending and are excluded from recall until the user accepts
 them in the memory center.
 
+Memory has user, project and current-task scopes. `/remember` saves to the
+natural persistent scope for the current chat, while `/remember --task <text>`
+saves temporary goals, constraints or progress under the current Pi session
+ID. Each prompt queries the relevant persistent scope and current task
+independently, applies separate count and character budgets, and exposes the
+selected records in the memory source area. Search uses SQLite FTS5 with BM25
+when available and a portable SQLite term index otherwise, followed by hybrid
+relevance, pin and recency ranking.
+
 The Electron renderer stays sandboxed with context isolation enabled. All
 renderer inputs are validated in the preload and again in the main process.

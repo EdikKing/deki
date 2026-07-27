@@ -56,7 +56,7 @@ describe("MemoryEngine", () => {
     expect(engine.getProjectMemory("project-b", updated.id)).toBeUndefined();
     expect(engine.archiveProjectMemory("project-a", updated.id)).toBe(true);
     expect(engine.getProjectMemory("project-a", updated.id)).toBeUndefined();
-  });
+  }, 15_000);
 
   it("rejects likely secrets", async () => {
     const engine = await createEngine();

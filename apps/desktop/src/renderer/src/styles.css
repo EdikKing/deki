@@ -532,11 +532,19 @@ h1 {
 }
 
 .settings-button {
-  width: auto;
+  width: 44px;
+  min-height: 44px;
+  justify-content: center;
   flex: 0 0 auto;
+  padding: 0;
   border-radius: 8px;
   color: #a9b7ce;
   background: transparent;
+}
+
+.settings-button > span {
+  font-size: 21px;
+  line-height: 1;
 }
 
 .settings-button:hover {

@@ -451,7 +451,6 @@ export function App() {
             }}
           >
             <span aria-hidden="true">⚙</span>
-            {zh ? "设置" : "Settings"}
           </button>
         </div>
       </aside>

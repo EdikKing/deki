@@ -385,17 +385,42 @@ export class DekiAgentRuntime {
 
   getSessionHistory(): ConversationMessage[] {
     const messages = this.#runtime?.session.messages ?? [];
-    return messages.flatMap((message, index) => {
+    return messages.reduce<ConversationMessage[]>((history, message, index) => {
       const value = asUnknownRecord(message);
-      if (value.role !== "user" && value.role !== "assistant") return [];
+      if (value.role !== "user" && value.role !== "assistant") return history;
       const content = extractMessageText(value.content);
-      if (!content) return [];
-      return [{
+      const reasoning = value.role === "assistant"
+        ? extractMessageThinking(value.content)
+        : "";
+      if (!content && !reasoning) return history;
+      const timestamp = typeof value.timestamp === "number" && Number.isFinite(value.timestamp)
+        ? new Date(value.timestamp).toISOString()
+        : undefined;
+      const next: ConversationMessage = {
         id: `${this.#runtime?.session.sessionId ?? "session"}-${index}`,
         role: value.role,
         content,
-      }];
-    });
+        ...(reasoning ? { reasoning } : {}),
+        ...(timestamp ? { timestamp } : {}),
+        ...(typeof value.provider === "string" ? { providerId: value.provider } : {}),
+        ...(typeof value.model === "string" ? { modelId: value.model } : {}),
+      };
+      const previous = history.at(-1);
+      if (next.role === "assistant" && previous?.role === "assistant") {
+        history[history.length - 1] = {
+          ...previous,
+          content: [previous.content, next.content].filter(Boolean).join("\n\n"),
+          ...((previous.reasoning || next.reasoning)
+            ? { reasoning: [previous.reasoning, next.reasoning].filter(Boolean).join("\n\n") }
+            : {}),
+          ...(next.providerId ? { providerId: next.providerId } : {}),
+          ...(next.modelId ? { modelId: next.modelId } : {}),
+        };
+        return history;
+      }
+      history.push(next);
+      return history;
+    }, []);
   }
 
   async switchSession(id: string): Promise<void> {
@@ -921,13 +946,25 @@ export function translatePiAgentEvent(
   event: AgentSessionEvent,
 ): AgentEventInput | undefined {
   switch (event.type) {
-    case "message_update":
-      return event.assistantMessageEvent.type === "text_delta"
-        ? {
+    case "message_update": {
+      if (event.assistantMessageEvent.type === "text_delta") {
+        return {
             type: "message.delta",
             delta: event.assistantMessageEvent.delta,
-          }
-        : undefined;
+            providerId: event.assistantMessageEvent.partial.provider,
+            modelId: event.assistantMessageEvent.partial.model,
+          };
+      }
+      if (event.assistantMessageEvent.type === "thinking_delta") {
+        return {
+          type: "message.reasoning.delta",
+          delta: event.assistantMessageEvent.delta,
+          providerId: event.assistantMessageEvent.partial.provider,
+          modelId: event.assistantMessageEvent.partial.model,
+        };
+      }
+      return undefined;
+    }
     case "message_end":
       return { type: "message.completed" };
     case "tool_execution_start":
@@ -1101,6 +1138,16 @@ function extractMessageText(content: unknown): string {
     const record = asUnknownRecord(item);
     return record.type === "text" && typeof record.text === "string"
       ? [record.text]
+      : [];
+  }).join("");
+}
+
+function extractMessageThinking(content: unknown): string {
+  if (!Array.isArray(content)) return "";
+  return content.flatMap((item) => {
+    const record = asUnknownRecord(item);
+    return record.type === "thinking" && typeof record.thinking === "string"
+      ? [record.thinking]
       : [];
   }).join("");
 }

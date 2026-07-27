@@ -13,9 +13,32 @@ describe("Pi runtime event bridge", () => {
   it("translates streaming text and tool lifecycle events", () => {
     const delta = {
       type: "message_update",
+      message: {
+        provider: "deepseek",
+        model: "deepseek-reasoner",
+      },
       assistantMessageEvent: {
         type: "text_delta",
         delta: "你好",
+        partial: {
+          provider: "deepseek",
+          model: "deepseek-reasoner",
+        },
+      },
+    } as unknown as AgentSessionEvent;
+    const thinking = {
+      type: "message_update",
+      message: {
+        provider: "deepseek",
+        model: "deepseek-reasoner",
+      },
+      assistantMessageEvent: {
+        type: "thinking_delta",
+        delta: "先理解问题",
+        partial: {
+          provider: "deepseek",
+          model: "deepseek-reasoner",
+        },
       },
     } as unknown as AgentSessionEvent;
     const tool = {
@@ -28,6 +51,14 @@ describe("Pi runtime event bridge", () => {
     expect(translatePiAgentEvent(delta)).toEqual({
       type: "message.delta",
       delta: "你好",
+      providerId: "deepseek",
+      modelId: "deepseek-reasoner",
+    });
+    expect(translatePiAgentEvent(thinking)).toEqual({
+      type: "message.reasoning.delta",
+      delta: "先理解问题",
+      providerId: "deepseek",
+      modelId: "deepseek-reasoner",
     });
     expect(translatePiAgentEvent(tool)).toEqual({
       type: "tool.started",

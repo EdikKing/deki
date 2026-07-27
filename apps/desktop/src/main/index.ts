@@ -1897,9 +1897,19 @@ function emitE2eFixtureEvents(): void {
   };
   broadcastEvent({
     ...base,
+    type: "message.reasoning.delta",
+    eventId: crypto.randomUUID(),
+    delta: "先检查用户目标，再确认当前运行状态。",
+    providerId: "deepseek",
+    modelId: "deepseek-v4-flash",
+  });
+  broadcastEvent({
+    ...base,
     type: "message.delta",
     eventId: crypto.randomUUID(),
     delta: "这是模拟的流式响应。\n\n```ts\nconst ready = true;\n```",
+    providerId: "deepseek",
+    modelId: "deepseek-v4-flash",
   });
   broadcastEvent({
     ...base,

@@ -206,6 +206,10 @@ export const conversationMessageSchema = z.object({
   id: z.string(),
   role: z.enum(["user", "assistant"]),
   content: z.string(),
+  reasoning: z.string().optional(),
+  timestamp: z.string().datetime().optional(),
+  providerId: z.string().optional(),
+  modelId: z.string().optional(),
 }).strict();
 export type ConversationMessage = z.infer<typeof conversationMessageSchema>;
 
@@ -282,6 +286,15 @@ export const agentEventSchema = z.discriminatedUnion("type", [
     ...eventBase,
     type: z.literal("message.delta"),
     delta: z.string(),
+    providerId: z.string().optional(),
+    modelId: z.string().optional(),
+  }),
+  z.object({
+    ...eventBase,
+    type: z.literal("message.reasoning.delta"),
+    delta: z.string(),
+    providerId: z.string().optional(),
+    modelId: z.string().optional(),
   }),
   z.object({
     ...eventBase,

@@ -17,6 +17,16 @@ describe("shared IPC schemas", () => {
       delta: "hello",
     });
     expect(event.type).toBe("message.delta");
+    const reasoning = agentEventSchema.parse({
+      type: "message.reasoning.delta",
+      eventId: "event-2",
+      timestamp: "2026-07-26T00:00:00.000Z",
+      sessionId: "session-1",
+      delta: "Inspect the project structure first.",
+      providerId: "deepseek",
+      modelId: "deepseek-reasoner",
+    });
+    expect(reasoning.type).toBe("message.reasoning.delta");
   });
 
   it("rejects empty prompts", () => {

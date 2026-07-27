@@ -66,7 +66,10 @@ export function App() {
     const unsubscribeAgent = window.deki.subscribeAgentEvents((event) => {
       setEvents((current) => [...current.slice(-199), event]);
       if (event.type === "message.delta") {
-        setMessages((current) => appendAssistantDelta(current, event.delta));
+        setMessages((current) => appendAssistantDelta(current, event.delta, "content", event));
+      }
+      if (event.type === "message.reasoning.delta") {
+        setMessages((current) => appendAssistantDelta(current, event.delta, "reasoning", event));
       }
       if (event.type === "run.completed" || event.type === "run.failed") {
         setBusy(false);
@@ -247,7 +250,12 @@ export function App() {
     setError(undefined);
     setMessages((current) => [
       ...current,
-      { id: crypto.randomUUID(), role: "user", content: value },
+      {
+        id: crypto.randomUUID(),
+        role: "user",
+        content: value,
+        timestamp: new Date().toISOString(),
+      },
     ]);
     setBusy(true);
     const result = await window.deki.sendPrompt(value);
@@ -510,29 +518,14 @@ export function App() {
                 </div>
               )}
               {messages.map((message) => (
-                <article key={message.id} className={`message ${message.role}`}>
-                  <span>{message.role === "user" ? (zh ? "你" : "You") : "Deki"}</span>
-                  <div className="markdown-body">
-                    <ReactMarkdown
-                      remarkPlugins={[remarkGfm]}
-                      components={{
-                        pre: ({ children }) => (
-                          <div className="code-block">
-                            <button
-                              aria-label={zh ? "复制代码" : "Copy code"}
-                              onClick={() => void navigator.clipboard.writeText(extractText(children))}
-                            >
-                              {zh ? "复制" : "Copy"}
-                            </button>
-                            <pre>{children}</pre>
-                          </div>
-                        ),
-                      }}
-                    >
-                      {message.content || "…"}
-                    </ReactMarkdown>
-                  </div>
-                </article>
+                <ConversationTurn
+                  key={message.id}
+                  message={message}
+                  models={state.models}
+                  selectedModel={state.selectedModel}
+                  showReasoning={settings?.effective.agent.showThinkingSummary ?? true}
+                  zh={zh}
+                />
               ))}
               {toolActivities.length > 0 && (
                 <section className="inline-tools" aria-label={zh ? "工具执行过程" : "Tool execution details"}>
@@ -745,6 +738,96 @@ export function App() {
     if (!result.ok) setError(result.error);
     setApproval(undefined);
   }
+}
+
+function ConversationTurn(props: {
+  message: ChatMessage;
+  models: ModelSummary[];
+  selectedModel: ModelSummary | undefined;
+  showReasoning: boolean;
+  zh: boolean;
+}) {
+  const assistant = props.message.role === "assistant";
+  const model = assistant
+    ? props.models.find((candidate) => (
+        candidate.id === props.message.modelId
+        && (!props.message.providerId || candidate.provider === props.message.providerId)
+      )) ?? props.selectedModel
+    : undefined;
+  const provider = providerPresentation(props.message.providerId ?? model?.provider);
+  const sender = assistant
+    ? (model?.name ?? props.message.modelId ?? "Deki")
+    : (props.zh ? "你" : "You");
+  return (
+    <article className={`message-turn ${props.message.role}`}>
+      <header className="message-turn-header">
+        <div className={`message-avatar${assistant ? " assistant" : " user"}`}>
+          {assistant
+            ? <ProviderBrandLogo presentation={provider} />
+            : <span aria-hidden="true">你</span>}
+        </div>
+        <div className="message-sender">
+          <strong>{sender}</strong>
+          {props.message.timestamp && (
+            <time dateTime={props.message.timestamp}>
+              {formatMessageTimestamp(props.message.timestamp, props.zh)}
+            </time>
+          )}
+        </div>
+      </header>
+      <div className="message-turn-content">
+        {assistant && props.showReasoning && props.message.reasoning && (
+          <details className="message-reasoning">
+            <summary>
+              <span className="reasoning-chevron" aria-hidden="true">›</span>
+              <span>{props.zh ? "思考过程" : "Reasoning"}</span>
+            </summary>
+            <div className="reasoning-content">
+              <MarkdownContent content={props.message.reasoning} zh={props.zh} />
+            </div>
+          </details>
+        )}
+        <div className={`message-body${assistant ? "" : " user-bubble"}`}>
+          <MarkdownContent content={props.message.content || "…"} zh={props.zh} />
+        </div>
+        <div className="message-turn-actions">
+          <button
+            aria-label={props.zh ? "复制消息" : "Copy message"}
+            title={props.zh ? "复制消息" : "Copy message"}
+            onClick={() => void navigator.clipboard.writeText(props.message.content)}
+          >
+            <span aria-hidden="true">▣</span>
+            <span>{props.zh ? "复制" : "Copy"}</span>
+          </button>
+        </div>
+      </div>
+    </article>
+  );
+}
+
+function MarkdownContent(props: { content: string; zh: boolean }) {
+  return (
+    <div className="markdown-body">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          pre: ({ children }) => (
+            <div className="code-block">
+              <button
+                aria-label={props.zh ? "复制代码" : "Copy code"}
+                onClick={() => void navigator.clipboard.writeText(extractText(children))}
+              >
+                {props.zh ? "复制" : "Copy"}
+              </button>
+              <pre>{children}</pre>
+            </div>
+          ),
+        }}
+      >
+        {props.content}
+      </ReactMarkdown>
+    </div>
+  );
 }
 
 function ModelPicker(props: {
@@ -1064,17 +1147,39 @@ function startInspectorResize(
 function appendAssistantDelta(
   messages: ChatMessage[],
   delta: string,
+  target: "content" | "reasoning",
+  metadata: {
+    timestamp: string;
+    providerId?: string | undefined;
+    modelId?: string | undefined;
+  },
 ): ChatMessage[] {
   const last = messages.at(-1);
   if (last?.role === "assistant") {
     return [
       ...messages.slice(0, -1),
-      { ...last, content: last.content + delta },
+      {
+        ...last,
+        ...(target === "content"
+          ? { content: last.content + delta }
+          : { reasoning: (last.reasoning ?? "") + delta }),
+        ...(last.timestamp ? {} : { timestamp: metadata.timestamp }),
+        ...(metadata.providerId ? { providerId: metadata.providerId } : {}),
+        ...(metadata.modelId ? { modelId: metadata.modelId } : {}),
+      },
     ];
   }
   return [
     ...messages,
-    { id: crypto.randomUUID(), role: "assistant", content: delta },
+    {
+      id: crypto.randomUUID(),
+      role: "assistant",
+      content: target === "content" ? delta : "",
+      ...(target === "reasoning" ? { reasoning: delta } : {}),
+      timestamp: metadata.timestamp,
+      ...(metadata.providerId ? { providerId: metadata.providerId } : {}),
+      ...(metadata.modelId ? { modelId: metadata.modelId } : {}),
+    },
   ];
 }
 
@@ -1104,4 +1209,21 @@ function formatRelativeTime(value: string, zh: boolean): string {
   const days = Math.floor(hours / 24);
   if (days < 30) return zh ? `${days} 天` : `${days}d`;
   return new Date(timestamp).toLocaleDateString(zh ? "zh-CN" : "en-US");
+}
+
+function formatMessageTimestamp(value: string, zh: boolean): string {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "";
+  const today = new Date();
+  const sameDay = date.getFullYear() === today.getFullYear()
+    && date.getMonth() === today.getMonth()
+    && date.getDate() === today.getDate();
+  return new Intl.DateTimeFormat(zh ? "zh-CN" : "en-US", {
+    ...(sameDay
+      ? {}
+      : { month: "2-digit", day: "2-digit" }),
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(date);
 }

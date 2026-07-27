@@ -310,6 +310,14 @@ test("trusts a workspace, streams fixture events, and recalls memory", async ({}
       "test-skill",
     );
     await expect(window.getByText("这是模拟的流式响应。")).toBeVisible();
+    const reasoning = window.locator(".message-reasoning");
+    await expect(reasoning).not.toHaveAttribute("open", "");
+    await expect(reasoning.locator(".reasoning-content")).not.toBeVisible();
+    await reasoning.locator("summary").click();
+    await expect(reasoning.locator(".reasoning-content")).toContainText(
+      "先检查用户目标，再确认当前运行状态。",
+    );
+    await expect(window.locator(".message-sender strong", { hasText: "deepseek-v4-flash" })).toBeVisible();
     await expect(window.locator(".tool-card summary strong").first()).toHaveText(
       "deki__project_info",
     );

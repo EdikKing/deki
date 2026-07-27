@@ -26,7 +26,7 @@
 
 ## 环境要求
 
-- Node.js 22.23.1
+- Node.js 24.18.0
 - pnpm 11.4.0
 - macOS、Linux 或 Windows
 - 至少一个由 Pi 支持的云模型 API Key

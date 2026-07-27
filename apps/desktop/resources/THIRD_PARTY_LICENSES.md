@@ -148,7 +148,7 @@ Generated from the locked pnpm dependency graph. Refer to each linked package fo
 | @types/mdast | 4.0.4 | MIT | [link](https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/mdast) |
 | @types/minimatch | 6.0.0 | MIT |  |
 | @types/ms | 2.1.0 | MIT | [link](https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/ms) |
-| @types/node | 22.19.15, 24.13.3 | MIT | [link](https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/node) |
+| @types/node | 24.13.3 | MIT | [link](https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/node) |
 | @types/plist | 3.0.5 | MIT | [link](https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/plist) |
 | @types/react | 19.2.17 | MIT | [link](https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/react) |
 | @types/react-dom | 19.2.3 | MIT | [link](https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/react-dom) |
@@ -640,7 +640,7 @@ Generated from the locked pnpm dependency graph. Refer to each linked package fo
 | typescript | 5.4.3, 6.0.3 | Apache-2.0 | [link](https://www.typescriptlang.org/) |
 | typescript-eslint | 8.65.0 | MIT | [link](https://typescript-eslint.io/packages/typescript-eslint) |
 | undici | 7.29.0, 8.5.0 | MIT | [link](https://undici.nodejs.org) |
-| undici-types | 6.21.0, 7.18.2 | MIT | [link](https://undici.nodejs.org) |
+| undici-types | 7.18.2 | MIT | [link](https://undici.nodejs.org) |
 | unified | 11.0.0 | MIT | [link](https://unifiedjs.com) |
 | unique-filename | 1.1.1 | ISC | [link](https://github.com/iarna/unique-filename) |
 | unique-slug | 2.0.0 | ISC | [link](https://github.com/iarna/unique-slug#readme) |

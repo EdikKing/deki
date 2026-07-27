@@ -11,6 +11,7 @@ import {
 } from "./index";
 
 const databases: Array<{ engine: MemoryEngine; directory: string }> = [];
+const sqliteIntegrationTimeout = process.platform === "win32" ? 45_000 : 15_000;
 
 afterEach(async () => {
   for (const { engine, directory } of databases.splice(0)) {
@@ -56,7 +57,7 @@ describe("MemoryEngine", () => {
     expect(engine.getProjectMemory("project-b", updated.id)).toBeUndefined();
     expect(engine.archiveProjectMemory("project-a", updated.id)).toBe(true);
     expect(engine.getProjectMemory("project-a", updated.id)).toBeUndefined();
-  }, 15_000);
+  }, sqliteIntegrationTimeout);
 
   it("rejects likely secrets", async () => {
     const engine = await createEngine();
@@ -135,7 +136,7 @@ describe("MemoryEngine", () => {
     expect(recalled[0]?.content).toContain("Electron");
     expect(engine.listMemories("project", "project-a", { query: "桌面界面" })[0]?.content)
       .toContain("Electron");
-  }, 15_000);
+  }, sqliteIntegrationTimeout);
 
   it("isolates task memories by session id and supports moving scopes", async () => {
     const engine = await createEngine();

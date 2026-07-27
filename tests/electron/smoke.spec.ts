@@ -70,6 +70,56 @@ test("starts a general chat without a workspace", async ({}, testInfo) => {
 
 // Playwright requires an object-destructured fixtures parameter.
 // eslint-disable-next-line no-empty-pattern
+test("keeps the composer visible when a conversation exceeds the viewport", async ({}) => {
+  const temporaryHome = await mkdtemp(resolve(tmpdir(), "deki-electron-overflow-"));
+  await seedChineseSettings(temporaryHome);
+  const electronApp = await electron.launch({
+    executablePath: electronPath,
+    args: [resolve("apps/desktop"), "--lang=zh-CN"],
+    env: createTestEnvironment(temporaryHome),
+  });
+
+  try {
+    const window = await electronApp.firstWindow();
+    const messages = window.locator(".messages");
+    await messages.evaluate((element) => {
+      for (let index = 0; index < 24; index += 1) {
+        const message = document.createElement("article");
+        message.className = "message assistant";
+        message.innerHTML = `<span>Deki</span><div>Long response line ${index}</div>`;
+        element.append(message);
+      }
+    });
+
+    const layout = await window.evaluate(() => {
+      const messageList = document.querySelector<HTMLElement>(".messages")!;
+      const composer = document.querySelector<HTMLElement>(".composer")!;
+      const chatPanel = document.querySelector<HTMLElement>(".chat-panel")!;
+      const composerRect = composer.getBoundingClientRect();
+      const chatRect = chatPanel.getBoundingClientRect();
+      return {
+        messageClientHeight: messageList.clientHeight,
+        messageScrollHeight: messageList.scrollHeight,
+        composerTop: composerRect.top,
+        composerBottom: composerRect.bottom,
+        chatBottom: chatRect.bottom,
+        viewportHeight: globalThis.innerHeight,
+      };
+    });
+
+    expect(layout.messageScrollHeight).toBeGreaterThan(layout.messageClientHeight);
+    expect(layout.composerTop).toBeGreaterThan(0);
+    expect(layout.composerBottom).toBeLessThanOrEqual(layout.viewportHeight);
+    expect(layout.chatBottom).toBeLessThanOrEqual(layout.viewportHeight);
+    await expect(window.locator(".composer textarea")).toBeInViewport();
+  } finally {
+    await electronApp.close();
+    await rm(temporaryHome, { recursive: true, force: true });
+  }
+});
+
+// Playwright requires an object-destructured fixtures parameter.
+// eslint-disable-next-line no-empty-pattern
 test("stores and manages memory for the current task", async ({}) => {
   const temporaryHome = await mkdtemp(resolve(tmpdir(), "deki-electron-task-memory-"));
   await seedChineseSettings(temporaryHome);

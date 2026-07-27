@@ -42,7 +42,26 @@ test("starts a general chat without a workspace", async ({}, testInfo) => {
     await expect(window.getByText(/普通会话无需选择项目|General chat needs no project/)).toBeVisible();
     const composer = window.locator(".composer-card");
     await expect(composer).toBeVisible();
-    await expect(composer.locator(".composer-input")).toBeVisible();
+    const composerInput = composer.locator(".composer-input");
+    await expect(composerInput).toBeVisible();
+    await composerInput.focus();
+    const composerFocusStyle = await composerInput.evaluate((element) => {
+      const style = element.ownerDocument.defaultView!.getComputedStyle(element);
+      return {
+        backgroundColor: style.backgroundColor,
+        borderTopWidth: style.borderTopWidth,
+        boxShadow: style.boxShadow,
+        outlineStyle: style.outlineStyle,
+        outlineWidth: style.outlineWidth,
+      };
+    });
+    expect(composerFocusStyle).toEqual({
+      backgroundColor: "rgba(0, 0, 0, 0)",
+      borderTopWidth: "0px",
+      boxShadow: "none",
+      outlineStyle: "none",
+      outlineWidth: "0px",
+    });
     await expect(composer.getByRole("button", { name: "选择模型" })).toBeVisible();
     await expect(composer.getByRole("button", { name: "保存记忆" })).toBeVisible();
     await expect(composer.getByRole("button", { name: "选择项目" })).toBeVisible();

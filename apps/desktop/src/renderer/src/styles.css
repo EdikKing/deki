@@ -211,6 +211,150 @@ h1 {
   text-transform: uppercase;
 }
 
+.project-tree {
+  display: grid;
+  gap: 3px;
+  margin-top: 2px;
+}
+
+.project-tree-node {
+  min-width: 0;
+}
+
+.project-tree-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 28px;
+  align-items: center;
+  gap: 2px;
+  border-radius: 9px;
+}
+
+.project-tree-row:hover {
+  background: var(--bg-hover);
+}
+
+.project-tree-toggle {
+  width: 100%;
+  min-width: 0;
+  min-height: 38px;
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) 14px;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 3px 6px 8px;
+  color: var(--text-secondary);
+  text-align: left;
+  background: transparent;
+}
+
+.project-tree-toggle strong {
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 620;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-tree-node.active > .project-tree-row .project-tree-toggle {
+  color: var(--text-primary);
+}
+
+.project-tree-chevron {
+  color: var(--text-muted);
+  font-size: 17px;
+  line-height: 1;
+  transition: transform 120ms ease;
+}
+
+.project-tree-chevron.expanded {
+  transform: rotate(90deg);
+}
+
+.project-new-session {
+  opacity: 0.55;
+}
+
+.project-tree-row:hover .project-new-session,
+.project-tree-node.active .project-new-session,
+.project-new-session:focus-visible {
+  opacity: 1;
+}
+
+.project-session-list {
+  display: grid;
+  gap: 2px;
+  margin: 0 3px 7px 26px;
+  padding-left: 8px;
+  border-left: 1px solid var(--border);
+}
+
+.session-tree-row {
+  position: relative;
+  min-width: 0;
+  border-radius: 8px;
+}
+
+.session-tree-item {
+  width: 100%;
+  min-height: 36px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  border-radius: 8px;
+  color: var(--text-secondary);
+  text-align: left;
+  background: transparent;
+}
+
+.session-tree-item strong {
+  overflow: hidden;
+  font-size: 11px;
+  font-weight: 520;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-tree-item time,
+.session-tree-item > span {
+  color: var(--text-muted);
+  font-size: 9px;
+  white-space: nowrap;
+}
+
+.session-tree-row:hover .session-tree-item {
+  color: var(--text-primary);
+  background: var(--bg-hover);
+}
+
+.session-tree-row.active .session-tree-item {
+  color: var(--text-primary);
+  background: var(--bg-active);
+}
+
+.session-tree-row .session-actions {
+  top: 50%;
+  right: 4px;
+  align-items: center;
+  transform: translateY(-50%);
+}
+
+.session-tree-row:hover .session-actions,
+.session-tree-row:focus-within .session-actions {
+  display: flex;
+}
+
+.session-tree-row:hover .session-tree-item time,
+.session-tree-row:focus-within .session-tree-item time {
+  opacity: 0;
+}
+
+.session-tree-item.placeholder {
+  cursor: default;
+  opacity: 0.72;
+}
+
 .icon-button {
   width: 24px;
   height: 24px;
@@ -2717,9 +2861,23 @@ html[data-theme="light"] .settings-error {
   }
 
   .navigation-empty span:last-child,
+  .project-tree-toggle strong,
+  .project-tree-chevron,
+  .project-new-session,
+  .project-session-list,
   .inspector-toggle-label,
   .project-heading code {
     display: none;
+  }
+
+  .project-tree-row {
+    display: block;
+  }
+
+  .project-tree-toggle {
+    grid-template-columns: 22px;
+    justify-content: center;
+    padding-inline: 0;
   }
 
   .navigation-empty {

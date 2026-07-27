@@ -30,9 +30,15 @@ test("starts a general chat without a workspace", async ({}, testInfo) => {
     const window = await electronApp.firstWindow();
     await expect(window.getByRole("heading", { name: /开始一个普通会话|Start a general chat/ })).toBeVisible();
     const navigation = window.getByRole("navigation", { name: "项目和会话" });
-    await expect(navigation.getByText(/关联一个项目|Connect a project/)).toBeVisible();
+    const defaultWorkspace = navigation.getByRole("button", { name: /默认工作区|Default workspace/ }).first();
+    await expect(defaultWorkspace).toHaveAttribute("aria-expanded", "true");
     await expect(navigation.getByText(/新会话|New chat/)).toBeVisible();
     await expect(navigation.getByRole("button", { name: "添加项目" })).toBeVisible();
+    await defaultWorkspace.click();
+    await expect(defaultWorkspace).toHaveAttribute("aria-expanded", "false");
+    await expect(navigation.getByText(/新会话|New chat/)).toHaveCount(0);
+    await defaultWorkspace.click();
+    await expect(defaultWorkspace).toHaveAttribute("aria-expanded", "true");
     await expect(window.getByText(/普通会话无需选择项目|General chat needs no project/)).toBeVisible();
     const composer = window.locator(".composer-card");
     await expect(composer).toBeVisible();
@@ -242,7 +248,7 @@ test("can leave an untrusted workspace for a general chat", async ({}) => {
     const window = await electronApp.firstWindow();
     await window.getByRole("button", { name: "返回普通会话" }).click();
     await expect(window.getByRole("heading", { name: "开始一个普通会话" })).toBeVisible();
-    await expect(window.getByRole("button", { name: "关联一个项目" })).toBeVisible();
+    await expect(window.getByRole("button", { name: "默认工作区" }).first()).toHaveAttribute("aria-expanded", "true");
   } finally {
     await electronApp.close();
     await rm(temporaryHome, { recursive: true, force: true });
@@ -279,8 +285,8 @@ test("trusts a workspace, streams fixture events, and recalls memory", async ({}
     await expect(window.getByText(/本地 AI 开发工作台|Local AI development workspace/)).toBeVisible();
     const navigation = window.getByRole("navigation", { name: "项目和会话" });
     await expect(navigation.getByText("项目", { exact: true })).toBeVisible();
-    await expect(navigation.getByText("会话", { exact: true })).toBeVisible();
-    await expect(navigation.getByRole("button", { name: "新建会话" })).toBeVisible();
+    await expect(navigation.getByRole("button", { name: "workspace" }).first()).toHaveAttribute("aria-expanded", "true");
+    await expect(navigation.getByRole("button", { name: "在workspace中新建会话" })).toBeVisible();
     await expect(window.locator(".status-line", { hasText: "Skills" })).toContainText(
       "test-skill",
     );

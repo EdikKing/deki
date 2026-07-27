@@ -33,6 +33,7 @@ type ToolActivity = {
   update?: unknown;
   result?: unknown;
 };
+const GENERAL_PROJECT_KEY = "__general__";
 
 export function App() {
   const [state, setState] = useState<BootstrapState>();
@@ -45,7 +46,7 @@ export function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [approval, setApproval] = useState<Extract<AgentEvent, { type: "approval.requested" }>>();
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
-  const [sessionQuery, setSessionQuery] = useState("");
+  const [expandedProjectKey, setExpandedProjectKey] = useState<string>(GENERAL_PROJECT_KEY);
   const [settingsSection, setSettingsSection] = useState<"models">();
   const [compactLayout, setCompactLayout] = useState(() => window.innerWidth <= 980);
   const [inspectorOpen, setInspectorOpen] = useState(() => window.innerWidth > 980);
@@ -121,6 +122,11 @@ export function App() {
   }, [state?.trusted, state?.workspace, state?.sessionId]);
 
   useEffect(() => {
+    if (!state) return;
+    setExpandedProjectKey(state.workspace ?? GENERAL_PROJECT_KEY);
+  }, [state?.workspace]);
+
+  useEffect(() => {
     if (!settings) return;
     const appearance = settings.effective.appearance;
     const root = document.documentElement;
@@ -173,10 +179,11 @@ export function App() {
   const projectName = state?.workspace
     ? getWorkspaceName(state.workspace)
     : (zh ? "普通会话" : "General chat");
-  const visibleSessions = sessions.filter((session) => {
-    const query = sessionQuery.trim().toLocaleLowerCase();
-    return !query || `${session.name ?? ""} ${session.firstMessage}`.toLocaleLowerCase().includes(query);
-  });
+  const activeProjectKey = state?.workspace ?? GENERAL_PROJECT_KEY;
+  const projectWorkspaces = [
+    ...(state?.workspace ? [state.workspace] : []),
+    ...(state?.recentWorkspaces ?? []),
+  ].filter((workspace, index, items) => items.indexOf(workspace) === index).slice(0, 7);
 
   if (!state) {
     return <main className="loading">正在启动 Deki…</main>;
@@ -253,6 +260,61 @@ export function App() {
     await refresh();
   }
 
+  async function switchProjectContext(workspace?: string) {
+    setMessages([]);
+    setEvents([]);
+    setSessions([]);
+    const result = await (workspace
+      ? window.deki.openWorkspace(workspace)
+      : window.deki.openGeneralChat());
+    if (!result.ok) {
+      setExpandedProjectKey(activeProjectKey);
+      setError(result.error ?? (zh ? "切换工作区失败" : "Failed to switch workspace"));
+      return undefined;
+    }
+    setError(undefined);
+    const next = await window.deki.getBootstrapState();
+    setState(next);
+    return next;
+  }
+
+  function toggleProjectNode(workspace?: string) {
+    const key = workspace ?? GENERAL_PROJECT_KEY;
+    if (key === activeProjectKey) {
+      setExpandedProjectKey((current) => current === key ? "" : key);
+      return;
+    }
+    setExpandedProjectKey(key);
+    void switchProjectContext(workspace);
+  }
+
+  async function createSessionForProject(workspace?: string) {
+    const key = workspace ?? GENERAL_PROJECT_KEY;
+    setExpandedProjectKey(key);
+    let nextState: BootstrapState | undefined = state;
+    if (key !== activeProjectKey) {
+      nextState = await switchProjectContext(workspace);
+    }
+    if (!nextState?.trusted || !nextState.ready) return;
+    setMessages([]);
+    setEvents([]);
+    await runCommand(window.deki.newSession(), setError, refresh);
+    await refreshSessions();
+  }
+
+  const projectNodes = [
+    ...projectWorkspaces.map((workspace) => ({
+      key: workspace,
+      name: getWorkspaceName(workspace),
+      workspace,
+    })),
+    {
+      key: GENERAL_PROJECT_KEY,
+      name: zh ? "默认工作区" : "Default workspace",
+      workspace: undefined,
+    },
+  ];
+
   return (
     <main className="app-shell">
       <aside className="navigation-sidebar">
@@ -265,7 +327,7 @@ export function App() {
         </div>
 
         <nav className="sidebar-navigation" aria-label={zh ? "项目和会话" : "Projects and sessions"}>
-          <section className="navigation-section">
+          <section className="navigation-section project-tree-section">
             <header className="navigation-heading">
               <span>{zh ? "项目" : "Projects"}</span>
               <button
@@ -282,116 +344,85 @@ export function App() {
                 +
               </button>
             </header>
-            {state.workspace ? (
-              <button className="project-item active" title={state.workspace}>
-                <span className="navigation-icon folder-icon" aria-hidden="true" />
-                <span className="navigation-copy">
-                  <strong>{projectName}</strong>
-                  <small>{zh ? "当前工作区" : "Current workspace"}</small>
-                </span>
-                <span className={state.ready ? "project-dot ready" : "project-dot"} />
-              </button>
-            ) : (
-              <button
-                className="navigation-empty"
-                disabled={busy}
-                onClick={() => void runCommand(window.deki.chooseWorkspace(), setError, refresh)}
-              >
-                <span className="navigation-icon folder-icon" aria-hidden="true" />
-                <span>{zh ? "关联一个项目" : "Connect a project"}</span>
-              </button>
-            )}
-            {state.recentWorkspaces
-              .filter((workspace) => workspace !== state.workspace)
-              .slice(0, 6)
-              .map((workspace) => (
-                <button
-                  className="project-item"
-                  title={workspace}
-                  key={workspace}
-                  disabled={busy}
-                  onClick={() => void runCommand(
-                    window.deki.openWorkspace(workspace),
-                    setError,
-                    refresh,
-                  )}
-                >
-                  <span className="navigation-icon folder-icon" aria-hidden="true" />
-                  <span className="navigation-copy">
-                    <strong>{getWorkspaceName(workspace)}</strong>
-                    <small>{zh ? "最近项目" : "Recent project"}</small>
-                  </span>
-                </button>
-              ))}
-          </section>
+            <div className="project-tree">
+              {projectNodes.map((node) => {
+                const active = node.key === activeProjectKey;
+                const expanded = node.key === expandedProjectKey;
+                const canCreateSession = !busy && (!active || state.ready);
+                return (
+                  <div className={`project-tree-node${active ? " active" : ""}`} key={node.key}>
+                    <div className="project-tree-row">
+                      <button
+                        className="project-tree-toggle"
+                        disabled={busy}
+                        title={node.workspace}
+                        aria-expanded={expanded}
+                        onClick={() => toggleProjectNode(node.workspace)}
+                      >
+                        <span className="navigation-icon folder-icon" aria-hidden="true" />
+                        <strong>{node.name}</strong>
+                        <span className={`project-tree-chevron${expanded ? " expanded" : ""}`} aria-hidden="true">›</span>
+                      </button>
+                      <button
+                        className="icon-button project-new-session"
+                        disabled={!canCreateSession}
+                        title={zh ? `在${node.name}中新建会话` : `New chat in ${node.name}`}
+                        aria-label={zh ? `在${node.name}中新建会话` : `New chat in ${node.name}`}
+                        onClick={() => void createSessionForProject(node.workspace)}
+                      >
+                        +
+                      </button>
+                    </div>
 
-          <section className="navigation-section sessions-section">
-            <header className="navigation-heading">
-              <span>{zh ? "会话" : "Sessions"}</span>
-              <button
-                className="icon-button"
-                disabled={!state.ready || busy}
-                title={zh ? "新建会话" : "New chat"}
-                aria-label={zh ? "新建会话" : "New chat"}
-                onClick={() => {
-                  setMessages([]);
-                  setEvents([]);
-                  void runCommand(window.deki.newSession(), setError, refresh);
-                }}
-              >
-                +
-              </button>
-            </header>
-            {sessions.length > 4 && <input className="session-search" value={sessionQuery} onChange={(event) => setSessionQuery(event.target.value)} placeholder={zh ? "搜索会话…" : "Search sessions…"} />}
-            <div className="session-list">
-              {visibleSessions.map((session) => (
-                <div className={`session-row${session.current ? " active" : ""}`} key={session.id}>
-                  <button
-                    className="session-item"
-                    disabled={busy}
-                    onClick={() => {
-                      if (session.current) return;
-                      setMessages([]);
-                      setEvents([]);
-                      void runCommand(window.deki.switchSession(session.id), setError, refresh);
-                    }}
-                  >
-                    <span className="navigation-icon chat-icon" aria-hidden="true" />
-                    <span className="navigation-copy">
-                      <strong>{session.name || session.firstMessage || (zh ? "新会话" : "New chat")}</strong>
-                      <small>{session.messageCount} {zh ? "条消息" : "messages"} · {new Date(session.updatedAt).toLocaleDateString()}</small>
-                    </span>
-                  </button>
-                  <div className="session-actions">
-                    <button
-                      className="icon-button"
-                      aria-label={zh ? "重命名会话" : "Rename session"}
-                      onClick={() => {
-                        const name = window.prompt(zh ? "输入会话名称" : "Session name", session.name ?? session.firstMessage);
-                        if (name?.trim()) void runCommand(window.deki.renameSession(session.id, name.trim()), setError, refreshSessions);
-                      }}
-                    >✎</button>
-                    {!session.current && <button
-                      className="icon-button danger-text"
-                      aria-label={zh ? "删除会话" : "Delete session"}
-                      onClick={() => {
-                        if (window.confirm(zh ? "将此会话移到废纸篓？" : "Move this session to the trash?")) {
-                          void runCommand(window.deki.deleteSession(session.id), setError, refreshSessions);
-                        }
-                      }}
-                    >×</button>}
+                    {expanded && active && (
+                      <div className="project-session-list">
+                        {sessions.map((session) => (
+                          <div className={`session-tree-row${session.current ? " active" : ""}`} key={session.id}>
+                            <button
+                              className="session-tree-item"
+                              disabled={busy}
+                              onClick={() => {
+                                if (session.current) return;
+                                setMessages([]);
+                                setEvents([]);
+                                void runCommand(window.deki.switchSession(session.id), setError, refresh);
+                              }}
+                            >
+                              <strong>{session.name || session.firstMessage || (zh ? "新会话" : "New chat")}</strong>
+                              <time dateTime={session.updatedAt}>{formatRelativeTime(session.updatedAt, zh)}</time>
+                            </button>
+                            <div className="session-actions">
+                              <button
+                                className="icon-button"
+                                aria-label={zh ? "重命名会话" : "Rename session"}
+                                onClick={() => {
+                                  const name = window.prompt(zh ? "输入会话名称" : "Session name", session.name ?? session.firstMessage);
+                                  if (name?.trim()) void runCommand(window.deki.renameSession(session.id, name.trim()), setError, refreshSessions);
+                                }}
+                              >✎</button>
+                              {!session.current && <button
+                                className="icon-button danger-text"
+                                aria-label={zh ? "删除会话" : "Delete session"}
+                                onClick={() => {
+                                  if (window.confirm(zh ? "将此会话移到废纸篓？" : "Move this session to the trash?")) {
+                                    void runCommand(window.deki.deleteSession(session.id), setError, refreshSessions);
+                                  }
+                                }}
+                              >×</button>}
+                            </div>
+                          </div>
+                        ))}
+                        {sessions.length === 0 && (
+                          <button className="session-tree-item placeholder" disabled>
+                            <strong>{zh ? "新会话" : "New chat"}</strong>
+                            <span>{state.ready ? (zh ? "尚未保存" : "Not saved") : (zh ? "等待模型" : "Waiting for model")}</span>
+                          </button>
+                        )}
+                      </div>
+                    )}
                   </div>
-                </div>
-              ))}
-              {visibleSessions.length === 0 && (
-                <button className="session-item active" disabled>
-                  <span className="navigation-icon chat-icon" aria-hidden="true" />
-                  <span className="navigation-copy">
-                    <strong>{zh ? "新会话" : "New chat"}</strong>
-                    <small>{state.ready ? (zh ? "尚未保存消息" : "No saved messages") : (zh ? "等待模型就绪" : "Waiting for a model")}</small>
-                  </span>
-                </button>
-              )}
+                );
+              })}
             </div>
           </section>
         </nav>
@@ -1060,4 +1091,17 @@ async function runCommand(
 function getWorkspaceName(workspace: string): string {
   const normalized = workspace.replace(/[\\/]+$/, "");
   return normalized.split(/[\\/]/).at(-1) || workspace;
+}
+
+function formatRelativeTime(value: string, zh: boolean): string {
+  const timestamp = new Date(value).getTime();
+  if (!Number.isFinite(timestamp)) return "";
+  const minutes = Math.max(0, Math.floor((Date.now() - timestamp) / 60_000));
+  if (minutes < 1) return zh ? "刚刚" : "Just now";
+  if (minutes < 60) return zh ? `${minutes} 分钟` : `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return zh ? `${hours} 小时` : `${hours}h`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return zh ? `${days} 天` : `${days}d`;
+  return new Date(timestamp).toLocaleDateString(zh ? "zh-CN" : "en-US");
 }

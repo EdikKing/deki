@@ -660,7 +660,8 @@ class DesktopController {
       return { ok: false, error: "MCP 只在受信任项目中可用" };
     }
     try {
-      await this.#runtime?.reloadMcpServers();
+      const definitionsChanged = await this.#runtime?.reloadMcpServers();
+      if (definitionsChanged) await this.#reloadRuntimeWhenIdle();
       return { ok: true };
     } catch (error) {
       return { ok: false, error: formatError(error) };

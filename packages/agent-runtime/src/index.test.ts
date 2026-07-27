@@ -5,6 +5,7 @@ import type {
 import { describe, expect, it, vi } from "vitest";
 import {
   AgentSessionEventSubscription,
+  toolDefinitionSignature,
   translatePiAgentEvent,
 } from "./index.js";
 
@@ -51,6 +52,44 @@ describe("Pi runtime event bridge", () => {
     expect(listener).toHaveBeenCalledOnce();
     bridge.dispose();
     expect(second.unsubscribe).toHaveBeenCalledOnce();
+  });
+});
+
+describe("MCP tool definition refresh", () => {
+  const echoTool = {
+    modelName: "fixture__echo",
+    description: "Echo text",
+    inputSchema: {
+      type: "object",
+      properties: { text: { type: "string" } },
+      required: ["text"],
+    },
+  };
+
+  it("is stable when tool order changes", () => {
+    const infoTool = {
+      modelName: "deki__project_info",
+      description: "Project info",
+      inputSchema: { type: "object", properties: {} },
+    };
+
+    expect(toolDefinitionSignature([echoTool, infoTool]))
+      .toBe(toolDefinitionSignature([infoTool, echoTool]));
+  });
+
+  it("changes when a tool is added or its schema changes", () => {
+    const empty = toolDefinitionSignature([]);
+    const withEcho = toolDefinitionSignature([echoTool]);
+    const changedSchema = toolDefinitionSignature([{
+      ...echoTool,
+      inputSchema: {
+        ...echoTool.inputSchema,
+        properties: { value: { type: "number" } },
+      },
+    }]);
+
+    expect(withEcho).not.toBe(empty);
+    expect(changedSchema).not.toBe(withEcho);
   });
 });
 

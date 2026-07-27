@@ -103,6 +103,7 @@ export class DekiAgentRuntime {
   #permissions: PermissionEngine | undefined;
   #lastPrompt: string | undefined;
   #checkpointManager: GitCheckpointManager | undefined;
+  #runtimeToolSignature = toolDefinitionSignature([]);
 
   constructor(options: DekiAgentRuntimeOptions) {
     this.#options = options;
@@ -426,10 +427,6 @@ export class DekiAgentRuntime {
 
   async startMcpServer(id: string): Promise<boolean> {
     if (!this.#projectFeaturesEnabled()) throw new Error("普通会话不支持 MCP");
-    const previousTools = this.#gateway.listTools()
-      .filter((tool) => tool.providerId === id)
-      .map((tool) => tool.modelName)
-      .sort();
     const config = await this.#loadRuntimeMcpConfig();
     const server = config.mcpServers[id];
     if (!server) throw new Error("未找到 MCP Server");
@@ -441,11 +438,8 @@ export class DekiAgentRuntime {
     );
     if (!provider) throw new Error(this.#options.mcpManager.getStatuses().find((item) => item.id === id)?.error ?? "MCP 启动失败");
     await this.#gateway.register(provider);
-    const nextTools = this.#gateway.listTools()
-      .filter((tool) => tool.providerId === id)
-      .map((tool) => tool.modelName)
-      .sort();
-    const definitionsChanged = JSON.stringify(previousTools) !== JSON.stringify(nextTools);
+    const definitionsChanged = toolDefinitionSignature(this.#gateway.listTools())
+      !== this.#runtimeToolSignature;
     if (!definitionsChanged) this.#syncActiveTools();
     return definitionsChanged;
   }
@@ -456,7 +450,7 @@ export class DekiAgentRuntime {
     this.#syncActiveTools();
   }
 
-  async reloadMcpServers(): Promise<void> {
+  async reloadMcpServers(): Promise<boolean> {
     for (const status of this.#options.mcpManager.getStatuses()) {
       await this.#gateway.unregister(status.id, false);
     }
@@ -466,7 +460,10 @@ export class DekiAgentRuntime {
       this.#options.settings.mcp.startupTimeoutMs,
     );
     for (const provider of providers) await this.#gateway.register(provider);
-    this.#syncActiveTools();
+    const definitionsChanged = toolDefinitionSignature(this.#gateway.listTools())
+      !== this.#runtimeToolSignature;
+    if (!definitionsChanged) this.#syncActiveTools();
+    return definitionsChanged;
   }
 
   async selectModel(provider: string, id: string): Promise<void> {
@@ -611,6 +608,7 @@ export class DekiAgentRuntime {
       const tools = this.#projectFeaturesEnabled()
         ? this.#gateway.listTools()
         : [];
+      this.#runtimeToolSignature = toolDefinitionSignature(tools);
       return {
         ...await createAgentSessionFromServices({
           services,
@@ -952,6 +950,20 @@ export function translatePiAgentEvent(
     default:
       return undefined;
   }
+}
+
+export function toolDefinitionSignature(
+  tools: ReadonlyArray<Pick<GatewayTool, "modelName" | "description" | "inputSchema">>,
+): string {
+  return JSON.stringify(
+    tools
+      .map((tool) => ({
+        name: tool.modelName,
+        description: tool.description,
+        inputSchema: tool.inputSchema,
+      }))
+      .sort((left, right) => left.name.localeCompare(right.name)),
+  );
 }
 
 class ProjectInfoProvider implements CapabilityProvider {

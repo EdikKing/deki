@@ -710,13 +710,20 @@ function McpSettings({ value, source, zh, update, hasWorkspace }: SettingsCompon
       : result.error);
     await refresh();
   };
+  const reload = async () => {
+    const result = await window.deki.reloadMcpServers();
+    setMessage(result.ok
+      ? (zh ? "MCP 已重新加载" : "MCP reloaded")
+      : result.error);
+    await refresh();
+  };
   return <>
     <p className="settings-warning">{zh ? "仅支持项目 .deki/mcp.json 中的 stdio Server；不内置示例，不支持 HTTP 或 OAuth。" : "Only stdio servers in project .deki/mcp.json are supported. No built-in examples, HTTP, or OAuth."}</p>
     <Toggle title={zh ? "启动已启用的 Server" : "Start enabled servers"} path="mcp.startEnabledServers" checked={value.mcp.startEnabledServers} source={source} onChange={(startEnabledServers) => update({ mcp: { startEnabledServers } })} />
     <Range title={zh ? "启动超时（秒）" : "Startup timeout (seconds)"} path="mcp.startupTimeoutMs" value={value.mcp.startupTimeoutMs / 1000} min={1} max={120} source={source} onChange={(seconds) => update({ mcp: { startupTimeoutMs: seconds * 1000 } })} />
     <Range title={zh ? "Tool 调用超时（秒）" : "Tool timeout (seconds)"} path="mcp.callTimeoutMs" value={value.mcp.callTimeoutMs / 1000} min={1} max={600} source={source} onChange={(seconds) => update({ mcp: { callTimeoutMs: seconds * 1000 } })} />
     <div className="settings-subsection">
-      <div className="subsection-heading"><div><h2>stdio Servers</h2><p>{hasWorkspace ? ".deki/mcp.json" : (zh ? "普通会话不可用" : "Unavailable in general chat")}</p></div><div><button className="ghost small-action" disabled={!hasWorkspace} onClick={() => void window.deki.reloadMcpServers()}>{zh ? "重载" : "Reload"}</button> <button className="primary small-action" disabled={!hasWorkspace} onClick={() => setEditing({ id: "server", command: "", args: [], enabled: true, tools: {}, environment: {} })}>{zh ? "添加" : "Add"}</button></div></div>
+      <div className="subsection-heading"><div><h2>stdio Servers</h2><p>{hasWorkspace ? ".deki/mcp.json" : (zh ? "普通会话不可用" : "Unavailable in general chat")}</p></div><div><button className="ghost small-action" disabled={!hasWorkspace} onClick={() => void reload()}>{zh ? "重载" : "Reload"}</button> <button className="primary small-action" disabled={!hasWorkspace} onClick={() => setEditing({ id: "server", command: "", args: [], enabled: true, tools: {}, environment: {} })}>{zh ? "添加" : "Add"}</button></div></div>
       {message && <p className="muted">{message}</p>}
       {servers.map((server) => <div className="mcp-server-card" key={server.id}>
         <div className="mcp-server-summary">

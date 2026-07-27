@@ -41,6 +41,15 @@ type ToolActivity = {
   update?: unknown;
   result?: unknown;
 };
+type ThinkingLevel = SettingsSnapshot["effective"]["models"]["thinkingLevel"];
+const thinkingLevels: readonly ThinkingLevel[] = [
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+];
 const GENERAL_PROJECT_KEY = "__general__";
 
 export function App() {
@@ -55,7 +64,6 @@ export function App() {
   const [approval, setApproval] = useState<Extract<AgentEvent, { type: "approval.requested" }>>();
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [activeSession, setActiveSession] = useState<SessionSummary>();
-  const [sessionQuery, setSessionQuery] = useState("");
   const [expandedProjectKey, setExpandedProjectKey] = useState<string>(GENERAL_PROJECT_KEY);
   const [settingsSection, setSettingsSection] = useState<"models" | "permissions">();
   const [compactLayout, setCompactLayout] = useState(() => window.innerWidth <= 980);
@@ -67,13 +75,10 @@ export function App() {
     setState(await window.deki.getBootstrapState());
   }
 
-  async function refreshSessions(query = sessionQuery) {
-    const [visibleSessions, allSessions] = await Promise.all([
-      window.deki.listSessions(query),
-      query ? window.deki.listSessions("") : Promise.resolve(undefined),
-    ]);
+  async function refreshSessions() {
+    const visibleSessions = await window.deki.listSessions("");
     setSessions(visibleSessions);
-    setActiveSession((allSessions ?? visibleSessions).find((session) => session.current));
+    setActiveSession(visibleSessions.find((session) => session.current));
   }
 
   useEffect(() => {
@@ -171,13 +176,6 @@ export function App() {
   }, [state?.trusted, state?.workspace, state?.sessionId]);
 
   useEffect(() => {
-    const timer = window.setTimeout(() => {
-      void refreshSessions(sessionQuery).catch((reason) => setError(String(reason)));
-    }, 150);
-    return () => window.clearTimeout(timer);
-  }, [sessionQuery]);
-
-  useEffect(() => {
     if (!state) return;
     setExpandedProjectKey(state.workspace ?? GENERAL_PROJECT_KEY);
   }, [state?.workspace]);
@@ -226,18 +224,17 @@ export function App() {
   const canRemember = Boolean(
     state?.workspace || settings?.effective.memory.userMemoryEnabled,
   );
-  const thinkingLabel = formatThinkingLevel(
-    settings?.effective.models.thinkingLevel ?? "medium",
-    zh,
-  );
   const sessionTitle = activeSession
     ? getSessionTitle(activeSession, zh)
     : (zh ? "新会话" : "New chat");
   const activeProjectKey = state?.workspace ?? GENERAL_PROJECT_KEY;
+  const recentWorkspaces = state?.recentWorkspaces ?? [];
   const projectWorkspaces = [
-    ...(state?.workspace ? [state.workspace] : []),
-    ...(state?.recentWorkspaces ?? []),
-  ].filter((workspace, index, items) => items.indexOf(workspace) === index).slice(0, 7);
+    ...recentWorkspaces,
+    ...(state?.workspace && !recentWorkspaces.includes(state.workspace)
+      ? [state.workspace]
+      : []),
+  ].slice(0, 7);
 
   if (!state) {
     return <main className="loading">正在启动 Deki…</main>;
@@ -497,12 +494,6 @@ export function App() {
                             </div>
                           </div>
                         ))}
-                        <input
-                          className="session-search"
-                          value={sessionQuery}
-                          onChange={(event) => setSessionQuery(event.target.value)}
-                          placeholder={zh ? "搜索会话…" : "Search chats…"}
-                        />
                         {sessions.length === 0 && (
                           <button className="session-tree-item placeholder" disabled>
                             <strong>{zh ? "新会话" : "New chat"}</strong>
@@ -685,12 +676,25 @@ export function App() {
                         }}
                       />
                     )}
-                    <span className="composer-mode" title={zh ? "思考强度" : "Thinking level"}>
-                      {thinkingLabel}
-                    </span>
-                    <span className="composer-runtime" title="Pi Coding Agent Runtime">
-                      <span aria-hidden="true">◇</span> Pi
-                    </span>
+                    {settings && (
+                      <ThinkingLevelPicker
+                        value={settings.effective.models.thinkingLevel}
+                        zh={zh}
+                        disabled={busy}
+                        onSelect={async (thinkingLevel) => {
+                          try {
+                            const next = await window.deki.updateSettings(
+                              "session",
+                              { models: { thinkingLevel } },
+                              settings.revision,
+                            );
+                            setSettings(next);
+                          } catch (reason) {
+                            setError(reason instanceof Error ? reason.message : String(reason));
+                          }
+                        }}
+                      />
+                    )}
                   </div>
                   <div className="composer-actions">
                     <button
@@ -1207,6 +1211,91 @@ function PermissionModePicker(props: {
   </div>;
 }
 
+function ThinkingLevelPicker(props: {
+  value: ThinkingLevel;
+  zh: boolean;
+  disabled: boolean;
+  onSelect: (level: ThinkingLevel) => Promise<void>;
+}) {
+  const [open, setOpen] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const selectedCopy = thinkingLevelCopy(props.value, props.zh);
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    window.addEventListener("pointerdown", onPointerDown);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [open]);
+
+  const choose = async (level: ThinkingLevel) => {
+    if (level === props.value) {
+      setOpen(false);
+      return;
+    }
+    setSaving(true);
+    try {
+      await props.onSelect(level);
+      setOpen(false);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return <div className="thinking-level-picker" ref={rootRef}>
+    <button
+      className="thinking-level-trigger"
+      aria-label={props.zh ? "选择推理强度" : "Select reasoning effort"}
+      aria-haspopup="listbox"
+      aria-expanded={open}
+      disabled={props.disabled || saving}
+      title={selectedCopy.description}
+      onClick={() => setOpen((current) => !current)}
+    >
+      <span>{saving ? (props.zh ? "正在切换…" : "Switching…") : selectedCopy.title}</span>
+      <span className="composer-model-chevron" aria-hidden="true">⌄</span>
+    </button>
+    {open && <section
+      className="thinking-level-popover"
+      role="listbox"
+      aria-label={props.zh ? "推理强度" : "Reasoning effort"}
+    >
+      <header className="thinking-level-heading">
+        <strong>{props.zh ? "推理强度" : "Reasoning effort"}</strong>
+        <small>{props.zh ? "强度越高，回答通常越深入，但耗时更长" : "Higher effort is usually deeper, but takes longer"}</small>
+      </header>
+      {thinkingLevels.map((level) => {
+        const copy = thinkingLevelCopy(level, props.zh);
+        const selected = props.value === level;
+        return <button
+          className={`thinking-level-option${selected ? " selected" : ""}`}
+          role="option"
+          aria-selected={selected}
+          disabled={saving}
+          key={level}
+          onClick={() => void choose(level)}
+        >
+          <span className="thinking-level-option-copy">
+            <strong>{copy.title}</strong>
+            <small>{copy.description}</small>
+          </span>
+          {selected && <span className="thinking-level-check" aria-hidden="true">✓</span>}
+        </button>;
+      })}
+    </section>}
+  </div>;
+}
+
 function providerPresentation(provider: string | undefined): {
   name: string;
   shortName: string;
@@ -1254,27 +1343,27 @@ function resolveLocale(settings: SettingsSnapshot | undefined): "zh-CN" | "en-US
   return navigator.language.toLocaleLowerCase().startsWith("zh") ? "zh-CN" : "en-US";
 }
 
-function formatThinkingLevel(
-  level: "off" | "minimal" | "low" | "medium" | "high" | "xhigh",
+function thinkingLevelCopy(
+  level: ThinkingLevel,
   zh: boolean,
-): string {
+): { title: string; description: string } {
   if (!zh) {
     return {
-      off: "Off",
-      minimal: "Minimal",
-      low: "Low",
-      medium: "Standard",
-      high: "High",
-      xhigh: "Extra high",
+      off: { title: "Off", description: "No additional reasoning" },
+      minimal: { title: "Minimal", description: "Fastest responses with minimal reasoning" },
+      low: { title: "Low", description: "Faster responses with light reasoning" },
+      medium: { title: "Standard", description: "Balances response speed and reasoning depth" },
+      high: { title: "High", description: "Deeper reasoning with a longer response time" },
+      xhigh: { title: "Extra high", description: "Deepest reasoning with the longest response time" },
     }[level];
   }
   return {
-    off: "关闭",
-    minimal: "最小",
-    low: "较低",
-    medium: "标准",
-    high: "较高",
-    xhigh: "最高",
+    off: { title: "关闭", description: "不使用额外推理" },
+    minimal: { title: "最低", description: "响应最快，仅进行极少推理" },
+    low: { title: "较低", description: "更快响应，进行简短推理" },
+    medium: { title: "标准", description: "平衡响应速度与推理深度" },
+    high: { title: "较高", description: "进行更深入推理，响应时间更长" },
+    xhigh: { title: "最高", description: "进行最深入推理，响应时间最长" },
   }[level];
 }
 

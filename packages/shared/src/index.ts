@@ -157,6 +157,7 @@ export const modelDefinitionSchema = z.object({
 export const modelProviderInputSchema = z.object({
   id: z.string().regex(/^[A-Za-z0-9_-]+$/),
   name: z.string().trim().min(1).optional(),
+  enabled: z.boolean().optional(),
   baseUrl: z.string().url().optional(),
   api: z.string().trim().min(1).optional(),
   apiKey: z.discriminatedUnion("action", [
@@ -173,6 +174,12 @@ export const redactedModelProviderSchema = modelProviderInputSchema
   .omit({ apiKey: true })
   .extend({ hasApiKey: z.boolean() });
 export type RedactedModelProvider = z.infer<typeof redactedModelProviderSchema>;
+export const modelProviderCatalogResultSchema = z.object({
+  ok: z.boolean(),
+  models: z.array(modelDefinitionSchema).optional(),
+  error: z.string().optional(),
+}).strict();
+export type ModelProviderCatalogResult = z.infer<typeof modelProviderCatalogResultSchema>;
 
 export const DEKI_VERSION = "0.0.0";
 
@@ -537,6 +544,7 @@ export const IPC_CHANNELS = {
   upsertModelProvider: "deki:upsert-model-provider",
   removeModelProvider: "deki:remove-model-provider",
   testModelProvider: "deki:test-model-provider",
+  fetchModelProviderModels: "deki:fetch-model-provider-models",
   respondToApproval: "deki:respond-to-approval",
   revokeWorkspaceTrust: "deki:revoke-workspace-trust",
   exportDiagnostics: "deki:export-diagnostics",
@@ -603,6 +611,7 @@ export interface DekiDesktopApi {
   upsertModelProvider(provider: ModelProviderInput): Promise<CommandResult>;
   removeModelProvider(id: string): Promise<CommandResult>;
   testModelProvider(provider: ModelProviderInput): Promise<CommandResult>;
+  fetchModelProviderModels(provider: ModelProviderInput): Promise<ModelProviderCatalogResult>;
   respondToApproval(
     requestId: string,
     decision: "allow_once" | "allow_session" | "allow_project" | "deny",

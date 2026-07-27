@@ -23,7 +23,7 @@ import {
   WorkspaceToolsProvider,
   type ApprovalDecision,
 } from "@deki-ai/permission-engine";
-import type { DekiSettings } from "@deki-ai/settings";
+import { ModelConfigStore, type DekiSettings } from "@deki-ai/settings";
 import {
   DEKI_VERSION,
   type AgentEvent,
@@ -219,7 +219,14 @@ export class DekiAgentRuntime {
       modelsPath: this.#options.paths.modelsFile,
       allowModelNetwork: false,
     });
-    this.#models = [...await this.#modelRuntime.getAvailable()];
+    const configuredProviders = await new ModelConfigStore(this.#options.paths.modelsFile).list();
+    const disabledProviders = new Set(
+      configuredProviders
+        .filter((provider) => provider.enabled === false)
+        .map((provider) => provider.id),
+    );
+    this.#models = [...await this.#modelRuntime.getAvailable()]
+      .filter((model) => !disabledProviders.has(model.provider));
     const configured = this.#projectFeaturesEnabled()
       ? this.#options.settings.models.projectModel
       : this.#options.settings.models.generalModel;

@@ -63,6 +63,7 @@ import {
   memoryMoveInputSchema,
   openWorkspaceInputSchema,
   modelProviderInputSchema,
+  modelProviderCatalogResultSchema,
   redactedModelProviderSchema,
   conversationMessageSchema,
   renameSessionInputSchema,
@@ -368,6 +369,15 @@ class DesktopController {
     try {
       const result = await this.#models.test(input);
       return { ok: true, error: `连接成功，端点返回 ${result.modelCount} 个模型` };
+    } catch (error) {
+      return { ok: false, error: formatError(error) };
+    }
+  }
+
+  async fetchModelProviderModels(input: ModelProviderInput) {
+    try {
+      const models = await this.#models.fetchModels(input);
+      return { ok: true, models };
     } catch (error) {
       return { ok: false, error: formatError(error) };
     }
@@ -1390,6 +1400,14 @@ function registerIpcHandlers(): void {
     assertTrustedSender(event);
     const input = modelProviderInputSchema.parse(raw);
     return commandResultSchema.parse(await controller?.testModelProvider(input));
+  });
+  ipcMain.handle(IPC_CHANNELS.fetchModelProviderModels, async (event, raw) => {
+    assertTrustedSender(event);
+    const input = modelProviderInputSchema.parse(raw);
+    return modelProviderCatalogResultSchema.parse(
+      await controller?.fetchModelProviderModels(input)
+        ?? { ok: false, error: "模型系统尚未就绪" },
+    );
   });
   ipcMain.handle(IPC_CHANNELS.respondToApproval, async (event, raw) => {
     assertTrustedSender(event);

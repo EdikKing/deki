@@ -37,7 +37,7 @@ test("starts a general chat without a workspace", async ({}, testInfo) => {
     const composer = window.locator(".composer-card");
     await expect(composer).toBeVisible();
     await expect(composer.locator(".composer-input")).toBeVisible();
-    await expect(composer.getByRole("combobox", { name: "选择模型" })).toBeVisible();
+    await expect(composer.getByRole("button", { name: "选择模型" })).toBeVisible();
     await expect(composer.getByRole("button", { name: "保存记忆" })).toBeVisible();
     await expect(composer.getByRole("button", { name: "选择项目" })).toBeVisible();
     await expect(composer.getByRole("button", { name: "发送" })).toBeVisible();
@@ -79,15 +79,61 @@ test("starts a general chat without a workspace", async ({}, testInfo) => {
     await expect(window.locator(".setting-control select:not([aria-label])")).toHaveCount(0);
     await window.locator(".settings-search").fill("");
     await window.getByTestId("settings-section-models").click();
-    await expect(window.locator(".builtin-provider-card")).toHaveCount(8);
-    await expect(window.locator(".builtin-provider-card").first()).toHaveAttribute("data-provider-id", "openai");
-    await expect(window.locator(".builtin-provider-card").last()).toHaveAttribute("data-provider-id", "openrouter");
-    await expect(window.getByRole("heading", { name: "自定义模型" })).toBeVisible();
-    await expect(window.locator(".builtin-provider-card input[type=password]")).toHaveCount(8);
+    await expect(window.getByRole("heading", { name: "模型供应商" })).toBeVisible();
+    await expect(window.locator(".builtin-provider-card")).toHaveCount(0);
+    await expect(window.getByText("尚未添加模型供应商")).toBeVisible();
+    await window.getByRole("button", { name: "添加模型供应商" }).click();
+    const providerFlow = window.getByTestId("provider-add-flow");
+    await expect(providerFlow).toBeVisible();
+    const providerType = providerFlow.getByRole("combobox", { name: "供应商类型" });
+    await expect(providerType.locator("option")).toHaveCount(10);
+    await providerType.selectOption("openai");
+    await expect(providerFlow.locator(".provider-manager")).toHaveCount(1);
+    await expect(providerFlow.locator(".provider-manager")).toHaveAttribute("data-provider-id", "openai");
+    await expect(providerFlow.locator("input[type=password]")).toHaveCount(1);
+    await expect(providerFlow.getByRole("heading", { name: "基本信息" })).toBeVisible();
+    await expect(providerFlow.getByRole("heading", { name: "已启用模型" })).toBeVisible();
+    await expect(providerFlow.getByRole("heading", { name: "可用模型" })).toBeVisible();
+    await expect(providerFlow.getByRole("button", { name: "从供应商获取" })).toBeVisible();
+    await expect(providerFlow.getByRole("checkbox", { name: "启用此渠道" })).toBeChecked();
+    await providerFlow.getByRole("button", { name: "返回供应商列表" }).click();
+    await expect(window.locator(".builtin-provider-card")).toHaveCount(0);
     await window.screenshot({
       path: testInfo.outputPath("deki-empty-workspace.png"),
       fullPage: true,
     });
+  } finally {
+    await electronApp.close();
+    await rm(temporaryHome, { recursive: true, force: true });
+  }
+});
+
+// Playwright requires an object-destructured fixtures parameter.
+// eslint-disable-next-line no-empty-pattern
+test("groups and searches models in the composer picker", async ({}) => {
+  const temporaryHome = await mkdtemp(resolve(tmpdir(), "deki-electron-model-picker-"));
+  await seedChineseSettings(temporaryHome);
+  await seedComposerModels(temporaryHome);
+  const electronApp = await electron.launch({
+    executablePath: electronPath,
+    args: [resolve("apps/desktop"), "--lang=zh-CN"],
+    env: createTestEnvironment(temporaryHome),
+  });
+
+  try {
+    const window = await electronApp.firstWindow();
+    const trigger = window.locator(".composer-model-trigger");
+    await expect(trigger.locator(".composer-model-name")).toHaveText("Alpha Chat");
+    await trigger.click();
+    const picker = window.getByRole("dialog", { name: "选择模型" });
+    await expect(picker).toBeVisible();
+    await expect(picker.getByText("alpha", { exact: true })).toBeVisible();
+    await expect(picker.getByText("beta", { exact: true })).toBeVisible();
+    await picker.getByRole("textbox", { name: "搜索模型" }).fill("Beta Code");
+    await expect(picker.getByRole("option")).toHaveCount(1);
+    await picker.getByRole("option", { name: "Beta Code" }).click();
+    await expect(trigger.locator(".composer-model-name")).toHaveText("Beta Code");
+    await expect(picker).not.toBeVisible();
   } finally {
     await electronApp.close();
     await rm(temporaryHome, { recursive: true, force: true });
@@ -360,6 +406,32 @@ async function seedChineseSettings(temporaryHome: string) {
     revision: 1,
     settings: {
       general: { locale: "zh-CN" },
+    },
+  }));
+}
+
+async function seedComposerModels(temporaryHome: string) {
+  await writeFile(join(temporaryHome, ".deki", "models.json"), JSON.stringify({
+    providers: {
+      alpha: {
+        name: "Alpha Provider",
+        baseUrl: "https://alpha.invalid/v1",
+        api: "openai-completions",
+        apiKey: "alpha-test-key",
+        models: [
+          { id: "alpha-chat", name: "Alpha Chat" },
+          { id: "alpha-reasoner", name: "Alpha Reasoner" },
+        ],
+      },
+      beta: {
+        name: "Beta Provider",
+        baseUrl: "https://beta.invalid/v1",
+        api: "openai-completions",
+        apiKey: "beta-test-key",
+        models: [
+          { id: "beta-code", name: "Beta Code" },
+        ],
+      },
     },
   }));
 }

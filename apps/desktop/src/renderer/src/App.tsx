@@ -1,16 +1,28 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import anthropicLogo from "@lobehub/icons-static-svg/icons/anthropic.svg?url";
+import deepseekLogo from "@lobehub/icons-static-svg/icons/deepseek-color.svg?url";
+import geminiLogo from "@lobehub/icons-static-svg/icons/gemini-color.svg?url";
+import minimaxLogo from "@lobehub/icons-static-svg/icons/minimax-color.svg?url";
+import moonshotLogo from "@lobehub/icons-static-svg/icons/moonshot.svg?url";
+import openaiLogo from "@lobehub/icons-static-svg/icons/openai.svg?url";
+import openrouterLogo from "@lobehub/icons-static-svg/icons/openrouter-color.svg?url";
+import zhipuLogo from "@lobehub/icons-static-svg/icons/zhipu-color.svg?url";
 import type {
   AgentEvent,
   BootstrapState,
   CommandResult,
   ConversationMessage,
   MemoryRecord,
+  ModelSummary,
   SessionSummary,
   SettingsSnapshot,
 } from "@deki-ai/shared";
 import { SettingsView } from "./SettingsView";
+import {
+  builtinModelProviders,
+} from "./builtinModelProviders";
 
 type ChatMessage = ConversationMessage;
 type ToolActivity = {
@@ -519,40 +531,22 @@ export function App() {
                       void submit();
                     }
                   }}
-                />
+                  />
                 <div className="composer-toolbar">
                   <div className="composer-meta">
-                    <span className="composer-model-mark" aria-hidden="true">
-                      {state.selectedModel?.provider.slice(0, 1).toUpperCase() ?? "AI"}
-                    </span>
-                    <select
-                      className="composer-model"
-                      aria-label={zh ? "选择模型" : "Select model"}
-                      value={state.selectedModel
-                        ? `${state.selectedModel.provider}/${state.selectedModel.id}`
-                        : ""}
+                    <ModelPicker
+                      models={state.models}
+                      selected={state.selectedModel}
+                      zh={zh}
                       disabled={state.models.length === 0 || busy}
-                      onChange={(event) => {
-                        const [provider, ...id] = event.target.value.split("/");
-                        if (provider) {
-                          void runCommand(
-                            window.deki.selectModel(provider, id.join("/")),
-                            setError,
-                            refresh,
-                          );
-                        }
+                      onSelect={async (model) => {
+                        await runCommand(
+                          window.deki.selectModel(model.provider, model.id),
+                          setError,
+                          refresh,
+                        );
                       }}
-                    >
-                      {state.models.length === 0 && <option value="">{zh ? "未配置模型" : "No model"}</option>}
-                      {state.models.map((model) => (
-                        <option
-                          key={`${model.provider}/${model.id}`}
-                          value={`${model.provider}/${model.id}`}
-                        >
-                          {model.name} · {model.provider}
-                        </option>
-                      ))}
-                    </select>
+                    />
                     <span className="composer-mode" title={zh ? "思考强度" : "Thinking level"}>
                       {thinkingLabel}
                     </span>
@@ -720,6 +714,171 @@ export function App() {
     if (!result.ok) setError(result.error);
     setApproval(undefined);
   }
+}
+
+function ModelPicker(props: {
+  models: ModelSummary[];
+  selected: ModelSummary | undefined;
+  disabled: boolean;
+  zh: boolean;
+  onSelect: (model: ModelSummary) => Promise<void>;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const rootRef = useRef<HTMLDivElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+  const selectedKey = props.selected
+    ? `${props.selected.provider}/${props.selected.id}`
+    : undefined;
+  const groups = useMemo(() => {
+    const normalized = query.trim().toLocaleLowerCase();
+    const filtered = props.models.filter((model) => (
+      !normalized
+      || `${model.name} ${model.id} ${model.provider}`.toLocaleLowerCase().includes(normalized)
+    ));
+    const grouped = new Map<string, ModelSummary[]>();
+    for (const model of filtered) {
+      grouped.set(model.provider, [...(grouped.get(model.provider) ?? []), model]);
+    }
+    return [...grouped.entries()];
+  }, [props.models, query]);
+  const firstResult = groups[0]?.[1][0];
+
+  useEffect(() => {
+    if (!open) return;
+    searchRef.current?.focus();
+    const onPointerDown = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    window.addEventListener("pointerdown", onPointerDown);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [open]);
+
+  const choose = (model: ModelSummary) => {
+    setOpen(false);
+    setQuery("");
+    void props.onSelect(model);
+  };
+  return <div className="composer-model-picker" ref={rootRef}>
+    <button
+      className="composer-model-trigger"
+      aria-label={props.zh ? "选择模型" : "Select model"}
+      aria-haspopup="dialog"
+      aria-expanded={open}
+      disabled={props.disabled}
+      onClick={() => setOpen((current) => !current)}
+    >
+      <span className="composer-model-name">
+        {props.selected?.name ?? (props.zh ? "未配置模型" : "No model")}
+      </span>
+      <span className="composer-model-chevron" aria-hidden="true">⌄</span>
+    </button>
+    {open && <section
+      className="model-picker-popover"
+      role="dialog"
+      aria-label={props.zh ? "选择模型" : "Select model"}
+    >
+      <div className="model-picker-search">
+        <span aria-hidden="true">⌕</span>
+        <input
+          ref={searchRef}
+          aria-label={props.zh ? "搜索模型" : "Search models"}
+          placeholder={props.zh ? "搜索模型…" : "Search models…"}
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && firstResult) {
+              event.preventDefault();
+              choose(firstResult);
+            }
+          }}
+        />
+        <button
+          aria-label={props.zh ? "关闭模型选择" : "Close model picker"}
+          onClick={() => setOpen(false)}
+        >×</button>
+      </div>
+      <div className="model-picker-results" role="listbox" aria-label={props.zh ? "模型列表" : "Model list"}>
+        {groups.map(([provider, models]) => {
+          const presentation = providerPresentation(provider);
+          return <section className="model-provider-group" key={provider}>
+            <header>
+              <ProviderBrandLogo presentation={presentation} />
+              <div>
+                <strong>{presentation.name}</strong>
+                <small>{props.zh ? `${models.length} 个可用模型` : `${models.length} available models`}</small>
+              </div>
+            </header>
+            {models.map((model) => {
+              const key = `${model.provider}/${model.id}`;
+              const selected = key === selectedKey;
+              return <button
+                className={`model-picker-option${selected ? " selected" : ""}`}
+                role="option"
+                aria-selected={selected}
+                key={key}
+                onClick={() => choose(model)}
+              >
+                <span>{model.name}</span>
+                {selected && <span className="model-picker-check" aria-hidden="true">✓</span>}
+              </button>;
+            })}
+          </section>;
+        })}
+        {groups.length === 0 && <p className="model-picker-empty">
+          {props.zh ? "没有匹配的模型" : "No matching models"}
+        </p>}
+      </div>
+    </section>}
+  </div>;
+}
+
+function providerPresentation(provider: string | undefined): {
+  name: string;
+  shortName: string;
+  logo?: string;
+  monochrome?: boolean;
+} {
+  if (!provider) return { name: "AI", shortName: "AI" };
+  const definition = builtinModelProviders.find((item) => item.id === provider);
+  const logo = {
+    openai: { logo: openaiLogo, monochrome: true },
+    anthropic: { logo: anthropicLogo, monochrome: true },
+    google: { logo: geminiLogo },
+    deepseek: { logo: deepseekLogo },
+    "moonshotai-cn": { logo: moonshotLogo, monochrome: true },
+    "minimax-cn": { logo: minimaxLogo },
+    zai: { logo: zhipuLogo },
+    openrouter: { logo: openrouterLogo },
+  }[provider];
+  return {
+    name: definition?.name ?? provider,
+    shortName: definition?.shortName ?? provider.slice(0, 2).toUpperCase(),
+    ...logo,
+  };
+}
+
+function ProviderBrandLogo(props: {
+  presentation: ReturnType<typeof providerPresentation>;
+}) {
+  return props.presentation.logo
+    ? <span className="provider-brand-logo-shell" aria-hidden="true">
+        <img
+          className={`provider-brand-logo${props.presentation.monochrome ? " monochrome" : ""}`}
+          src={props.presentation.logo}
+          alt=""
+        />
+      </span>
+    : <span className="provider-brand-logo-fallback" aria-hidden="true">
+        {props.presentation.shortName}
+      </span>;
 }
 
 function resolveLocale(settings: SettingsSnapshot | undefined): "zh-CN" | "en-US" {

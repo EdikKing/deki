@@ -328,11 +328,108 @@ function ModelSettings(props: SettingsComponentProps & {
   setError: (error: string | undefined) => void;
 }) {
   const { value, source, zh, update } = props;
+  const [addingProvider, setAddingProvider] = useState(false);
+  const [selectedProviderType, setSelectedProviderType] = useState("");
   const customProviders = props.providers.filter((provider) => !isBuiltinModelProvider(provider.id));
-  const modelOptions = props.providers.flatMap((provider) => provider.models.map((model) => ({
+  const modelOptions = props.providers.filter((provider) => provider.enabled !== false).flatMap((provider) => provider.models.map((model) => ({
     value: `${provider.id}/${model.id}`,
     label: `${model.name ?? model.id} · ${provider.name ?? provider.id}`,
   })));
+  const closeProviderFlow = () => {
+    setAddingProvider(false);
+    setSelectedProviderType("");
+    props.setEditing(undefined);
+  };
+  const openProviderFlow = (
+    providerType = "",
+    customProvider?: ModelProviderInput,
+  ) => {
+    setAddingProvider(true);
+    setSelectedProviderType(providerType);
+    props.setEditing(customProvider);
+  };
+  const selectedBuiltin = builtinModelProviders.find(
+    (provider) => provider.id === selectedProviderType,
+  );
+
+  if (addingProvider) {
+    return <div className="provider-add-flow" data-testid="provider-add-flow">
+      <div className="provider-add-header">
+        <button className="ghost provider-back" onClick={closeProviderFlow}>
+          <span aria-hidden="true">←</span> {zh ? "返回供应商列表" : "Back to providers"}
+        </button>
+        <div>
+          <h2>{selectedProviderType ? (zh ? "模型供应商详情" : "Model provider details") : (zh ? "添加模型供应商" : "Add model provider")}</h2>
+          <p>{zh ? "配置连接、渠道状态和会话中可用的模型。" : "Configure the connection, provider status, and models available to chats."}</p>
+        </div>
+      </div>
+      <section className="provider-picker-panel">
+        <label className="provider-type-picker">
+          <span>{zh ? "供应商类型" : "Provider type"}</span>
+          <select
+            aria-label={zh ? "供应商类型" : "Provider type"}
+            value={selectedProviderType}
+            onChange={(event) => {
+              const next = event.target.value;
+              setSelectedProviderType(next);
+              if (next === "custom") {
+                props.setEditing(emptyProvider(props.providers));
+              } else {
+                props.setEditing(undefined);
+              }
+            }}
+          >
+            <option value="">{zh ? "选择模型供应商…" : "Choose a model provider…"}</option>
+            {builtinModelProviders.map((definition) => {
+              const configured = props.providers.some((provider) => provider.id === definition.id);
+              return <option key={definition.id} value={definition.id}>
+                {definition.name}{configured ? (zh ? "（已添加）" : " (added)") : ""}
+              </option>;
+            })}
+            <option value="custom">
+              {customProviders.length > 0
+                ? (zh ? "自定义模型（已添加）" : "Custom model (added)")
+                : (zh ? "自定义模型" : "Custom model")}
+            </option>
+          </select>
+        </label>
+        {!selectedProviderType && <div className="provider-picker-empty">
+          <span aria-hidden="true">＋</span>
+          <p>{zh ? "从上方选择一个供应商开始配置" : "Choose a provider above to start configuring it"}</p>
+        </div>}
+        {selectedBuiltin && <ProviderManager
+          key={selectedBuiltin.id}
+          definition={selectedBuiltin}
+          provider={props.providers.find((provider) => provider.id === selectedBuiltin.id)}
+          zh={zh}
+          onCancel={closeProviderFlow}
+          onDone={async () => {
+            await props.refreshProviders();
+            closeProviderFlow();
+          }}
+          setError={props.setError}
+        />}
+        {selectedProviderType === "custom" && props.editing && <ProviderManager
+          key={props.editing.id}
+          initial={props.editing}
+          provider={props.providers.find((provider) => provider.id === props.editing?.id)}
+          zh={zh}
+          onCancel={closeProviderFlow}
+          onDone={async () => {
+            await props.refreshProviders();
+            closeProviderFlow();
+          }}
+          setError={props.setError}
+        />}
+      </section>
+      <p className="provider-security-note">
+        {zh
+          ? "API Key 明文保存在本机权限为 0600 的配置文件中；界面、日志和导出不会回显密钥。"
+          : "API keys are stored in a local 0600 file. The UI, logs, and exports never reveal them."}
+      </p>
+    </div>;
+  }
+
   return <>
     <Setting title={zh ? "普通会话默认模型" : "Default general model"} source={source("models.generalModel")}><select value={value.models.generalModel} onChange={(e) => void update({ models: { generalModel: e.target.value } })}><option value="">{zh ? "自动选择" : "Auto-select"}</option>{modelOptions.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select></Setting>
     <Setting title={zh ? "项目会话默认模型" : "Default project model"} source={source("models.projectModel")}><select value={value.models.projectModel} onChange={(e) => void update({ models: { projectModel: e.target.value } })}><option value="">{zh ? "自动选择" : "Auto-select"}</option>{modelOptions.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select></Setting>
@@ -341,202 +438,335 @@ function ModelSettings(props: SettingsComponentProps & {
     <Range title={zh ? "请求超时（秒）" : "Request timeout (seconds)"} path="models.timeoutMs" value={value.models.timeoutMs / 1000} min={1} max={600} source={source} onChange={(seconds) => update({ models: { timeoutMs: seconds * 1000 } })} />
     <Range title={zh ? "最大输出 Tokens" : "Maximum output tokens"} path="models.maxOutputTokens" value={value.models.maxOutputTokens} min={256} max={262144} step={256} source={source} onChange={(maxOutputTokens) => update({ models: { maxOutputTokens } })} />
     <div className="settings-subsection">
-      <div className="subsection-heading"><div><h2>{zh ? "内置模型服务商" : "Built-in model providers"}</h2><p>{zh ? "地址、协议和模型列表已经配置好，只需填写对应的 API Key。" : "Endpoints, protocols, and model catalogs are configured. Only an API key is required."}</p></div></div>
-      <div className="builtin-provider-list">
-        {builtinModelProviders.map((definition) => (
-          <BuiltinProviderCard
-            key={definition.id}
-            definition={definition}
-            provider={props.providers.find((provider) => provider.id === definition.id)}
-            zh={zh}
-            onChanged={props.refreshProviders}
-            setError={props.setError}
-          />
-        ))}
+      <div className="subsection-heading">
+        <div>
+          <h2>{zh ? "模型供应商" : "Model providers"}</h2>
+          <p>{zh ? "这里只显示已经添加的供应商；内置配置在添加时选择。" : "Only added providers appear here. Choose built-in configurations when adding one."}</p>
+        </div>
+        <button className="primary small-action" onClick={() => openProviderFlow()}>
+          <span aria-hidden="true">＋</span> {zh ? "添加模型供应商" : "Add model provider"}
+        </button>
+      </div>
+      {props.providers.length === 0 && <div className="custom-provider-empty">
+        <span aria-hidden="true">＋</span>
+        <p>{zh ? "尚未添加模型供应商" : "No model providers added yet"}</p>
+      </div>}
+      <div className="provider-channel-list">
+        {props.providers.map((provider) => {
+          const definition = builtinModelProviders.find((item) => item.id === provider.id);
+          return <article className="provider-card provider-channel-card" data-provider-id={provider.id} key={provider.id}>
+            <div className="provider-channel-identity">
+              <span className="provider-logo" aria-hidden="true">{definition?.shortName ?? "AI"}</span>
+              <div>
+                <strong>{provider.name ?? definition?.name ?? provider.id}</strong>
+                <small>
+                  {definition
+                    ? (zh ? definition.description.zh : definition.description.en)
+                    : provider.baseUrl ?? (zh ? "自定义 API" : "Custom API")}
+                </small>
+                <small>{provider.models.length} {zh ? "个模型" : "models"} · {provider.hasApiKey ? "Key ••••••••" : (zh ? "未配置 Key" : "No key")} · {provider.enabled === false ? (zh ? "已停用" : "Disabled") : (zh ? "已启用" : "Enabled")}</small>
+              </div>
+            </div>
+            <div>
+              <button className="ghost small-action" onClick={() => openProviderFlow(
+                definition ? definition.id : "custom",
+                definition ? undefined : toProviderInput(provider),
+              )}>{zh ? "管理" : "Manage"}</button>
+              <button className="danger small-action" onClick={async () => {
+                const confirmed = window.confirm(
+                  zh ? `移除模型供应商“${provider.name ?? provider.id}”？` : `Remove model provider "${provider.name ?? provider.id}"?`,
+                );
+                if (!confirmed) return;
+                const result = await window.deki.removeModelProvider(provider.id);
+                if (!result.ok) props.setError(result.error);
+                else await props.refreshProviders();
+              }}>{zh ? "移除" : "Remove"}</button>
+            </div>
+          </article>;
+        })}
       </div>
       <p className="provider-security-note">
         {zh
-          ? "API Key 明文保存在本机权限为 0600 的配置文件中；界面、日志和导出只显示配置状态，不会回显密钥。"
-          : "API keys are stored in a local 0600 file. The UI, logs, and exports only expose configuration status, never the key."}
+          ? "API Key 明文保存在本机权限为 0600 的配置文件中；界面、日志和导出只显示配置状态。"
+          : "API keys are stored in a local 0600 file. The UI, logs, and exports only expose configuration status."}
       </p>
-    </div>
-    <div className="settings-subsection custom-provider-section">
-      <div className="subsection-heading">
-        <div>
-          <h2>{zh ? "自定义模型" : "Custom model"}</h2>
-          <p>{zh ? "用于其他 OpenAI、Anthropic 或兼容 API；可配置一个自定义服务商。" : "For another OpenAI, Anthropic, or compatible API. One custom provider can be configured."}</p>
-        </div>
-        {customProviders.length === 0 && !props.editing && <button className="primary small-action" onClick={() => props.setEditing(emptyProvider())}>{zh ? "添加自定义模型" : "Add custom model"}</button>}
-      </div>
-      {customProviders.length === 0 && !props.editing && <div className="custom-provider-empty">{zh ? "未配置自定义模型" : "No custom model configured"}</div>}
-      {customProviders.map((provider) => (
-        <div className="provider-card" key={provider.id}>
-          <div><strong>{provider.name ?? provider.id}</strong><small>{provider.baseUrl ?? "Default API"} · {provider.models.length} models · {provider.hasApiKey ? "Key ••••••••" : "No key"}</small></div>
-          <div><button className="ghost small-action" onClick={() => props.setEditing(toProviderInput(provider))}>{zh ? "编辑" : "Edit"}</button><button className="danger small-action" onClick={async () => { const result = await window.deki.removeModelProvider(provider.id); if (!result.ok) props.setError(result.error); else await props.refreshProviders(); }}>{zh ? "删除" : "Delete"}</button></div>
-        </div>
-      ))}
-      {props.editing && <ProviderEditor provider={props.editing} zh={zh} onChange={props.setEditing} onCancel={() => props.setEditing(undefined)} onDone={async () => { await props.refreshProviders(); props.setEditing(undefined); }} setError={props.setError} />}
     </div>
   </>;
 }
 
-function BuiltinProviderCard(props: {
-  definition: BuiltinModelProvider;
+function ProviderManager(props: {
+  definition?: BuiltinModelProvider;
+  initial?: ModelProviderInput;
   provider: RedactedModelProvider | undefined;
   zh: boolean;
-  onChanged: () => Promise<void>;
+  onCancel: () => void;
+  onDone: () => Promise<void>;
   setError: (value: string | undefined) => void;
 }) {
+  const startingValue = props.provider
+    ? toProviderInput(props.provider)
+    : props.initial
+      ? { ...props.initial, enabled: props.initial.enabled !== false }
+      : builtinProviderInput(props.definition!, { action: "keep" });
+  const [draft, setDraft] = useState<ModelProviderInput>({
+    ...startingValue,
+    enabled: startingValue.enabled !== false,
+  });
   const [apiKey, setApiKey] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [saved, setSaved] = useState(false);
-  const [testMessage, setTestMessage] = useState<string>();
-  const configured = props.provider?.hasApiKey ?? false;
-  const modelNames = props.definition.config.models.map((model) => model.name ?? model.id).join(" · ");
-
-  const updateKey = async (action: ModelProviderInput["apiKey"]) => {
-    setBusy(true);
-    setSaved(false);
+  const [showApiKey, setShowApiKey] = useState(false);
+  const [busy, setBusy] = useState<"save" | "test" | "fetch">();
+  const [connectionStatus, setConnectionStatus] = useState<"success" | "error">();
+  const [connectionMessage, setConnectionMessage] = useState<string>();
+  const [fetchedModels, setFetchedModels] = useState<ModelProviderInput["models"]>([]);
+  const [fetchMessage, setFetchMessage] = useState<string>();
+  const [manualId, setManualId] = useState("");
+  const [manualName, setManualName] = useState("");
+  const isCustom = !props.definition;
+  const hasStoredKey = Boolean(props.provider?.hasApiKey) && draft.apiKey.action !== "clear";
+  const set = (patch: Partial<ModelProviderInput>) => {
+    setDraft((current) => ({ ...current, ...patch }));
+    setConnectionStatus(undefined);
+    setConnectionMessage(undefined);
+  };
+  const requestValue = (): ModelProviderInput => ({
+    ...draft,
+    apiKey: apiKey.trim()
+      ? { action: "set", value: apiKey.trim() }
+      : draft.apiKey,
+  });
+  const catalog = useMemo(() => {
+    const byId = new Map<string, ModelProviderInput["models"][number]>();
+    for (const model of props.definition?.config.models ?? []) byId.set(model.id, model);
+    for (const model of fetchedModels) {
+      const existing = byId.get(model.id);
+      byId.set(model.id, existing ? { ...model, ...existing } : model);
+    }
+    return [...byId.values()];
+  }, [fetchedModels, props.definition]);
+  const availableModels = catalog.filter(
+    (model) => !draft.models.some((enabled) => enabled.id === model.id),
+  );
+  const addModel = (model: ModelProviderInput["models"][number]) => {
+    if (draft.models.some((item) => item.id === model.id)) return;
+    set({ models: [...draft.models, model] });
+  };
+  const removeModel = (id: string) => {
+    if (draft.models.length <= 1) {
+      props.setError(props.zh ? "至少需要启用一个模型" : "At least one model must remain enabled");
+      return;
+    }
+    set({ models: draft.models.filter((model) => model.id !== id) });
+  };
+  const validateCustomId = () => {
+    if (isCustom && isBuiltinModelProvider(draft.id)) {
+      props.setError(props.zh ? "自定义模型 ID 不能与内置供应商重复" : "The custom provider ID cannot match a built-in provider");
+      return false;
+    }
+    return true;
+  };
+  const save = async () => {
+    if (!validateCustomId()) return;
+    setBusy("save");
     props.setError(undefined);
     try {
-      const result = await window.deki.upsertModelProvider(
-        builtinProviderInput(props.definition, action),
-      );
-      if (!result.ok) {
-        props.setError(result.error);
-        return;
-      }
-      setApiKey("");
-      setSaved(action.action === "set");
-      await props.onChanged();
+      const result = await window.deki.upsertModelProvider(requestValue());
+      if (!result.ok) props.setError(result.error);
+      else await props.onDone();
     } catch (reason) {
       props.setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
-      setBusy(false);
+      setBusy(undefined);
     }
   };
   const testConnection = async () => {
-    setBusy(true);
-    setTestMessage(undefined);
+    if (!validateCustomId()) return;
+    setBusy("test");
     props.setError(undefined);
+    setConnectionStatus(undefined);
     try {
-      const result = await window.deki.testModelProvider(
-        builtinProviderInput(props.definition, { action: "keep" }),
-      );
-      if (!result.ok) props.setError(result.error);
-      else setTestMessage(props.zh ? "连接正常" : "Connection OK");
+      const result = await window.deki.testModelProvider(requestValue());
+      setConnectionStatus(result.ok ? "success" : "error");
+      setConnectionMessage(result.ok
+        ? (props.zh ? "连接成功" : "Connection succeeded")
+        : result.error);
+    } catch (reason) {
+      setConnectionStatus("error");
+      setConnectionMessage(reason instanceof Error ? reason.message : String(reason));
     } finally {
-      setBusy(false);
+      setBusy(undefined);
     }
   };
-
-  return <article className={`builtin-provider-card${configured ? " configured" : ""}`} data-provider-id={props.definition.id}>
-    <div className="provider-identity">
-      <span className="provider-logo" aria-hidden="true">{props.definition.shortName}</span>
-      <div>
-        <div className="provider-title">
-          <strong>{props.definition.name}</strong>
-          <span className={`provider-status ${configured ? "configured" : ""}`}>
-            {configured ? (props.zh ? "已配置" : "Configured") : (props.zh ? "未配置" : "Not configured")}
-          </span>
-        </div>
-        <p>{props.zh ? props.definition.description.zh : props.definition.description.en}</p>
-        <small title={modelNames}>{modelNames}</small>
-      </div>
-    </div>
-    <div className="provider-key-control">
-      <input
-        type="password"
-        value={apiKey}
-        autoComplete="new-password"
-        placeholder={configured
-          ? (props.zh ? "输入新 Key 以替换" : "Enter a new key to replace")
-          : (props.zh ? "填写 API Key" : "Enter API key")}
-        aria-label={`${props.definition.name} API Key`}
-        onChange={(event) => {
-          setApiKey(event.target.value);
-          setSaved(false);
-        }}
-        onKeyDown={(event) => {
-          if (event.key === "Enter" && apiKey.trim() && !busy) {
-            void updateKey({ action: "set", value: apiKey.trim() });
-          }
-        }}
-      />
-      <button
-        className="primary small-action"
-        disabled={!apiKey.trim() || busy}
-        onClick={() => void updateKey({ action: "set", value: apiKey.trim() })}
-      >
-        {busy ? (props.zh ? "保存中…" : "Saving…") : (props.zh ? "保存" : "Save")}
-      </button>
-      {configured && <button className="ghost small-action" disabled={busy} onClick={() => void testConnection()}>{props.zh ? "测试" : "Test"}</button>}
-      {configured && <button className="ghost small-action" disabled={busy} onClick={() => void updateKey({ action: "clear" })}>{props.zh ? "清除" : "Clear"}</button>}
-      {saved && <span className="key-saved">{props.zh ? "已保存" : "Saved"}</span>}
-      {testMessage && <span className="key-saved">{testMessage}</span>}
-    </div>
-  </article>;
-}
-
-function ProviderEditor(props: { provider: ModelProviderInput; zh: boolean; onChange: (value: ModelProviderInput) => void; onCancel: () => void; onDone: () => Promise<void>; setError: (value: string | undefined) => void }) {
-  const provider = props.provider;
-  const set = (patch: Partial<ModelProviderInput>) => props.onChange({ ...provider, ...patch });
-  const updateModel = (index: number, patch: Partial<ModelProviderInput["models"][number]>) => {
-    set({ models: provider.models.map((model, modelIndex) =>
-      modelIndex === index ? { ...model, ...patch } : model) });
+  const fetchModels = async () => {
+    if (!validateCustomId()) return;
+    setBusy("fetch");
+    props.setError(undefined);
+    setFetchMessage(undefined);
+    try {
+      const result = await window.deki.fetchModelProviderModels(requestValue());
+      if (!result.ok) {
+        setFetchMessage(result.error);
+        return;
+      }
+      setFetchedModels(result.models ?? []);
+      setFetchMessage(props.zh
+        ? `成功获取 ${result.models?.length ?? 0} 个模型`
+        : `Fetched ${result.models?.length ?? 0} models`);
+    } catch (reason) {
+      setFetchMessage(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(undefined);
+    }
   };
-  const run = async (kind: "save" | "test") => {
-    if (isBuiltinModelProvider(provider.id)) {
-      props.setError(props.zh ? "自定义模型 ID 不能与内置服务商重复" : "The custom model ID cannot match a built-in provider");
+  const addManualModel = () => {
+    const id = manualId.trim();
+    if (!id) {
+      props.setError(props.zh ? "请填写模型 ID" : "Enter a model ID");
       return;
     }
-    const result = kind === "save" ? await window.deki.upsertModelProvider(provider) : await window.deki.testModelProvider(provider);
-    if (!result.ok) props.setError(result.error ?? "Operation failed");
-    else if (kind === "save") await props.onDone();
-    else props.setError(props.zh ? "连接测试成功" : "Connection test succeeded");
+    if (draft.models.some((model) => model.id === id)) {
+      props.setError(props.zh ? "该模型已经启用" : "That model is already enabled");
+      return;
+    }
+    addModel({
+      id,
+      ...(manualName.trim() ? { name: manualName.trim() } : {}),
+      input: ["text"],
+    });
+    setManualId("");
+    setManualName("");
   };
-  return <div className="provider-editor">
-    <div className="field-grid">
-      <label><span>ID</span><input value={provider.id} onChange={(e) => set({ id: e.target.value })} /></label>
-      <label><span>{props.zh ? "名称" : "Name"}</span><input value={provider.name ?? ""} onChange={(e) => set({ name: e.target.value || undefined })} /></label>
-      <label className="wide"><span>Base URL</span><input placeholder="https://api.example.com/v1" value={provider.baseUrl ?? ""} onChange={(e) => set({ baseUrl: e.target.value || undefined })} /></label>
-      <label><span>API type</span><input value={provider.api ?? "openai-completions"} onChange={(e) => set({ api: e.target.value || undefined })} /></label>
-      <label><span>API Key</span><input type="password" placeholder={provider.apiKey.action === "keep" ? "•••••••• (keep)" : ""} onChange={(e) => set({ apiKey: e.target.value ? { action: "set", value: e.target.value } : { action: "keep" } })} /></label>
-      <label><span>{props.zh ? "Authorization Header" : "Authorization header"}</span><input type="checkbox" checked={provider.authHeader !== false} onChange={(e) => set({ authHeader: e.target.checked })} /></label>
-      <label className="wide"><span>{props.zh ? "额外 Headers（每行 Name: Value，现有值显示为 [REDACTED]）" : "Extra headers (Name: Value per line; existing values are [REDACTED])"}</span><textarea value={Object.entries(provider.headers ?? {}).map(([key, value]) => `${key}: ${value}`).join("\n")} onChange={(event) => set({ headers: parseHeaders(event.target.value) })} /></label>
-    </div>
-    <div className="settings-subsection">
-      <div className="subsection-heading"><div><h2>{props.zh ? "模型列表" : "Models"}</h2><p>{props.zh ? "配置能力和上下文限制。" : "Configure capabilities and context limits."}</p></div><button className="ghost small-action" onClick={() => set({ models: [...provider.models, { id: `model-${provider.models.length + 1}`, input: ["text"] }] })}>{props.zh ? "添加模型" : "Add model"}</button></div>
-      {provider.models.map((model, index) => <div className="provider-card model-editor-card" key={`${index}:${model.id}`}>
-        <div className="field-grid">
-          <label><span>Model ID</span><input value={model.id} onChange={(e) => updateModel(index, { id: e.target.value })} /></label>
-          <label><span>{props.zh ? "模型名称" : "Model name"}</span><input value={model.name ?? ""} onChange={(e) => updateModel(index, { name: e.target.value || undefined })} /></label>
-          <label><span>{props.zh ? "上下文窗口" : "Context window"}</span><input type="number" min={1} value={model.contextWindow ?? ""} onChange={(e) => updateModel(index, { contextWindow: optionalPositiveNumber(e.target.value) })} /></label>
-          <label><span>{props.zh ? "最大输出" : "Max output"}</span><input type="number" min={1} value={model.maxTokens ?? ""} onChange={(e) => updateModel(index, { maxTokens: optionalPositiveNumber(e.target.value) })} /></label>
-          <label><span>{props.zh ? "推理模型" : "Reasoning"}</span><input type="checkbox" checked={model.reasoning ?? false} onChange={(e) => updateModel(index, { reasoning: e.target.checked })} /></label>
-          <label><span>{props.zh ? "图像输入" : "Image input"}</span><input type="checkbox" checked={model.input?.includes("image") ?? false} onChange={(e) => updateModel(index, { input: e.target.checked ? ["text", "image"] : ["text"] })} /></label>
-          <label><span>API type override</span><input value={model.api ?? ""} onChange={(e) => updateModel(index, { api: e.target.value || undefined })} /></label>
-          <label><span>Base URL override</span><input value={model.baseUrl ?? ""} onChange={(e) => updateModel(index, { baseUrl: e.target.value || undefined })} /></label>
-          <label className="wide"><span>{props.zh ? "兼容参数（JSON）" : "Compatibility parameters (JSON)"}</span><textarea defaultValue={model.compat ? JSON.stringify(model.compat, null, 2) : ""} onBlur={(event) => {
-            const text = event.target.value.trim();
-            if (!text) {
-              updateModel(index, { compat: undefined });
-              return;
-            }
-            try {
-              const parsed: unknown = JSON.parse(text);
-              if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
-                updateModel(index, { compat: parsed as Record<string, unknown> });
-              }
-            } catch {
-              props.setError(props.zh ? "兼容参数必须是 JSON 对象" : "Compatibility parameters must be a JSON object");
-            }
-          }} /></label>
+
+  return <div className="provider-manager" data-provider-id={draft.id}>
+    <section className="provider-manager-section">
+      <h3>{props.zh ? "基本信息" : "Basic information"}</h3>
+      <div className="provider-detail-card">
+        {isCustom && <label className="provider-detail-field">
+          <span>{props.zh ? "供应商 ID" : "Provider ID"}</span>
+          <input value={draft.id} onChange={(event) => set({ id: event.target.value })} />
+        </label>}
+        <label className="provider-detail-field">
+          <span>{props.zh ? "供应商名称" : "Provider name"}</span>
+          <input value={draft.name ?? ""} onChange={(event) => set({ name: event.target.value || undefined })} />
+        </label>
+        <label className="provider-detail-field">
+          <span>Base URL</span>
+          <small>{props.zh ? "预览：" : "Preview: "}{providerEndpointPreview(draft)}</small>
+          <input placeholder="https://api.example.com/v1" value={draft.baseUrl ?? ""} onChange={(event) => set({ baseUrl: event.target.value || undefined })} />
+        </label>
+        <label className="provider-detail-field">
+          <span>{props.zh ? "API 格式" : "API format"}</span>
+          <select value={draft.api ?? "openai-completions"} onChange={(event) => set({ api: event.target.value })}>
+            <option value="openai-completions">OpenAI Chat Completions</option>
+            <option value="openai-responses">OpenAI Responses</option>
+            <option value="anthropic-messages">Anthropic Messages</option>
+            <option value="google-generative-ai">Google Generative AI</option>
+          </select>
+        </label>
+        <div className="provider-detail-field provider-key-field">
+          <div className="provider-field-heading">
+            <span>API Key</span>
+            <button className="ghost small-action" disabled={Boolean(busy)} onClick={() => void testConnection()}>
+              ⚡ {busy === "test" ? (props.zh ? "测试中…" : "Testing…") : (props.zh ? "测试连接" : "Test connection")}
+            </button>
+          </div>
+          <div className="provider-secret-input">
+            <input
+              type={showApiKey ? "text" : "password"}
+              value={apiKey}
+              autoComplete="new-password"
+              placeholder={hasStoredKey ? "••••••••••••••••" : (props.zh ? "填写 API Key" : "Enter API key")}
+              aria-label={`${draft.name ?? draft.id} API Key`}
+              onChange={(event) => {
+                setApiKey(event.target.value);
+                setConnectionStatus(undefined);
+                setConnectionMessage(undefined);
+                setDraft((current) => ({
+                  ...current,
+                  apiKey: event.target.value
+                    ? { action: "set", value: event.target.value }
+                    : { action: "keep" },
+                }));
+              }}
+            />
+            <button className="secret-visibility" aria-label={showApiKey ? (props.zh ? "隐藏 API Key" : "Hide API key") : (props.zh ? "显示 API Key" : "Show API key")} onClick={() => setShowApiKey((shown) => !shown)}>◉</button>
+          </div>
+          <div className="provider-key-meta">
+            {connectionMessage && <span className={`connection-state ${connectionStatus ?? "error"}`}>
+              {connectionStatus === "success" ? "✓" : "!"} {connectionMessage}
+            </span>}
+            {hasStoredKey && <button className="link-button" onClick={() => {
+              setApiKey("");
+              set({ apiKey: { action: "clear" } });
+            }}>{props.zh ? "清除已保存 Key" : "Clear saved key"}</button>}
+          </div>
         </div>
-        {provider.models.length > 1 && <button className="danger small-action" onClick={() => set({ models: provider.models.filter((_, modelIndex) => modelIndex !== index) })}>{props.zh ? "移除" : "Remove"}</button>}
-      </div>)}
+        <details className="provider-advanced">
+          <summary>{props.zh ? "高级连接设置" : "Advanced connection settings"}</summary>
+          <label className="provider-detail-field">
+            <span>{props.zh ? "额外 Headers（每行 Name: Value）" : "Extra headers (Name: Value per line)"}</span>
+            <textarea value={Object.entries(draft.headers ?? {}).map(([key, value]) => `${key}: ${value}`).join("\n")} onChange={(event) => set({ headers: parseHeaders(event.target.value) })} />
+          </label>
+          <label className="provider-checkbox">
+            <input type="checkbox" checked={draft.authHeader !== false} onChange={(event) => set({ authHeader: event.target.checked })} />
+            <span>{props.zh ? "自动添加 Authorization Header" : "Add Authorization header automatically"}</span>
+          </label>
+        </details>
+        <div className="provider-enabled-row">
+          <div>
+            <strong>{props.zh ? "启用此渠道" : "Enable this provider"}</strong>
+            <small>{props.zh ? "关闭后该渠道不会在模型选择中出现" : "Disabled providers do not appear in the model selector"}</small>
+          </div>
+          <label className="toggle">
+            <input aria-label={props.zh ? "启用此渠道" : "Enable this provider"} type="checkbox" checked={draft.enabled !== false} onChange={(event) => set({ enabled: event.target.checked })} />
+            <span />
+          </label>
+        </div>
+      </div>
+    </section>
+
+    <section className="provider-manager-section">
+      <div className="provider-section-heading">
+        <div><h3>{props.zh ? "已启用模型" : "Enabled models"}</h3><p>{draft.models.length} {props.zh ? "个模型" : "models"}</p></div>
+      </div>
+      <div className="provider-model-list">
+        {draft.models.map((model) => <div className="provider-model-row" key={model.id}>
+          <span className="model-enabled-mark">✓</span>
+          <div><strong>{model.name ?? model.id}</strong>{model.name && <small>{model.id}</small>}</div>
+          <button className="ghost small-action" disabled={draft.models.length <= 1} onClick={() => removeModel(model.id)}>{props.zh ? "停用" : "Disable"}</button>
+        </div>)}
+      </div>
+    </section>
+
+    <section className="provider-manager-section">
+      <div className="provider-section-heading">
+        <div>
+          <h3>{props.zh ? "可用模型" : "Available models"}</h3>
+          {fetchMessage && <p className={fetchMessage.startsWith(props.zh ? "成功" : "Fetched") ? "connection-state success" : "connection-state error"}>{fetchMessage}</p>}
+        </div>
+        <button className="ghost small-action" disabled={Boolean(busy)} onClick={() => void fetchModels()}>
+          ↓ {busy === "fetch" ? (props.zh ? "获取中…" : "Fetching…") : (props.zh ? "从供应商获取" : "Fetch from provider")}
+        </button>
+      </div>
+      <div className="provider-model-list available">
+        {availableModels.length === 0
+          ? <div className="provider-model-empty">{props.zh ? "所有已知模型已启用；也可以从供应商获取最新列表。" : "All known models are enabled. You can also fetch the latest catalog."}</div>
+          : availableModels.map((model) => <div className="provider-model-row" key={model.id}>
+            <span className="model-available-mark">＋</span>
+            <div><strong>{model.name ?? model.id}</strong>{model.name && <small>{model.id}</small>}</div>
+            <button className="ghost small-action" onClick={() => addModel(model)}>{props.zh ? "启用" : "Enable"}</button>
+          </div>)}
+        <div className="provider-manual-model">
+          <input aria-label={props.zh ? "模型 ID" : "Model ID"} placeholder={props.zh ? "模型 ID（如 claude-opus-4-6）" : "Model ID (for example claude-opus-4-6)"} value={manualId} onChange={(event) => setManualId(event.target.value)} />
+          <input aria-label={props.zh ? "显示名称" : "Display name"} placeholder={props.zh ? "显示名称（可选）" : "Display name (optional)"} value={manualName} onChange={(event) => setManualName(event.target.value)} />
+          <button className="ghost" aria-label={props.zh ? "手动添加模型" : "Add model manually"} onClick={addManualModel}>＋</button>
+        </div>
+      </div>
+    </section>
+
+    <div className="editor-actions provider-manager-actions">
+      <button className="ghost" onClick={props.onCancel}>{props.zh ? "取消" : "Cancel"}</button>
+      <button className="primary" disabled={Boolean(busy)} onClick={() => void save()}>{busy === "save" ? (props.zh ? "保存中…" : "Saving…") : (props.zh ? "保存渠道" : "Save provider")}</button>
     </div>
-    <div className="editor-actions"><button className="ghost" onClick={props.onCancel}>{props.zh ? "取消" : "Cancel"}</button><button className="ghost" onClick={() => void run("test")}>{props.zh ? "测试连接" : "Test"}</button><button className="primary" onClick={() => void run("save")}>{props.zh ? "保存" : "Save"}</button></div>
   </div>;
 }
 
@@ -999,10 +1229,14 @@ function labelControls(node: ReactNode, label: string): ReactNode {
   });
 }
 
-function emptyProvider(): ModelProviderInput {
+function emptyProvider(providers: RedactedModelProvider[] = []): ModelProviderInput {
+  const ids = new Set(providers.map((provider) => provider.id));
+  let id = "custom";
+  for (let index = 2; ids.has(id); index += 1) id = `custom-${index}`;
   return {
-    id: "custom",
+    id,
     name: "Custom provider",
+    enabled: true,
     api: "openai-completions",
     apiKey: { action: "keep" },
     models: [{ id: "model-id", name: "Model" }],
@@ -1013,6 +1247,7 @@ function toProviderInput(provider: RedactedModelProvider): ModelProviderInput {
   return {
     id: provider.id,
     ...(provider.name ? { name: provider.name } : {}),
+    enabled: provider.enabled !== false,
     ...(provider.baseUrl ? { baseUrl: provider.baseUrl } : {}),
     ...(provider.api ? { api: provider.api } : {}),
     apiKey: { action: "keep" },
@@ -1020,6 +1255,21 @@ function toProviderInput(provider: RedactedModelProvider): ModelProviderInput {
     ...(provider.headers ? { headers: provider.headers } : {}),
     models: provider.models,
   };
+}
+
+function providerEndpointPreview(provider: ModelProviderInput): string {
+  if (!provider.baseUrl) return "—";
+  const base = provider.baseUrl.replace(/\/+$/u, "");
+  switch (provider.api) {
+    case "anthropic-messages":
+      return `${base}/v1/messages`;
+    case "google-generative-ai":
+      return `${base}/models/{model}:generateContent`;
+    case "openai-responses":
+      return `${base}/responses`;
+    default:
+      return `${base}/chat/completions`;
+  }
 }
 
 function formatBytes(bytes: number): string {
@@ -1050,11 +1300,6 @@ function parseEnvironment(value: string): Record<string, string> {
       ? [[key, envValue] as const]
       : [];
   }));
-}
-
-function optionalPositiveNumber(value: string): number | undefined {
-  const number = Number(value);
-  return Number.isInteger(number) && number > 0 ? number : undefined;
 }
 
 function listLeafPaths(value: unknown, prefix: string): string[] {

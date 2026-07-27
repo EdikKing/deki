@@ -1,7 +1,7 @@
 import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   defaultSettings,
   ModelConfigStore,
@@ -11,6 +11,7 @@ import {
 
 const directories: string[] = [];
 afterEach(async () => {
+  vi.unstubAllGlobals();
   await Promise.all(directories.splice(0).map((path) =>
     rm(path, { recursive: true, force: true })
   ));
@@ -99,6 +100,7 @@ describe("ModelConfigStore", () => {
       name: "Custom",
       baseUrl: "https://example.com/v1",
       api: "openai-completions",
+      enabled: false,
       apiKey: { action: "set", value: "super-secret-key" },
       headers: { "x-private-token": "header-secret" },
       models: [{ id: "model-1", name: "Model 1" }],
@@ -107,6 +109,7 @@ describe("ModelConfigStore", () => {
     expect(await store.list()).toEqual([expect.objectContaining({
       id: "custom",
       hasApiKey: true,
+      enabled: false,
     })]);
     expect(JSON.stringify(await store.list())).not.toContain("super-secret-key");
     expect(JSON.stringify(await store.list())).not.toContain("header-secret");
@@ -126,6 +129,35 @@ describe("ModelConfigStore", () => {
       models: [{ id: "model-1", name: "Model 1" }],
     });
     expect(await readFile(file, "utf8")).toContain("header-secret");
+  });
+
+  it("fetches and normalizes a provider model catalog", async () => {
+    const root = await mkdtemp(join(tmpdir(), "deki-model-catalog-"));
+    directories.push(root);
+    const store = new ModelConfigStore(join(root, "models.json"));
+    const fetchMock = vi.fn(async (_input: string | URL | Request) => new Response(JSON.stringify({
+      data: [
+        { id: "model-a", name: "Model A" },
+        { id: "model-b" },
+        { id: "model-a" },
+      ],
+    }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const models = await store.fetchModels({
+      id: "custom",
+      baseUrl: "https://example.com/v1",
+      api: "openai-completions",
+      apiKey: { action: "set", value: "catalog-key" },
+      models: [{ id: "fallback" }],
+    });
+
+    expect(models).toEqual([
+      { id: "model-a", name: "Model A", input: ["text"] },
+      { id: "model-b", input: ["text"] },
+    ]);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("https://example.com/v1/models");
   });
 
   it("preserves a corrupt models file and falls back to the last valid backup", async () => {

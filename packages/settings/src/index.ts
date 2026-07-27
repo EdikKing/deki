@@ -500,6 +500,7 @@ export const modelDefinitionSchema = z.object({
 export const modelProviderInputSchema = z.object({
   id: z.string().regex(/^[A-Za-z0-9_-]+$/),
   name: z.string().trim().min(1).optional(),
+  enabled: z.boolean().optional(),
   baseUrl: z.string().url().optional(),
   api: z.string().trim().min(1).optional(),
   apiKey: z.discriminatedUnion("action", [
@@ -516,6 +517,7 @@ export type ModelProviderInput = z.infer<typeof modelProviderInputSchema>;
 export const redactedModelProviderSchema = z.object({
   id: z.string(),
   name: z.string().optional(),
+  enabled: z.boolean().optional(),
   baseUrl: z.string().optional(),
   api: z.string().optional(),
   hasApiKey: z.boolean(),
@@ -544,6 +546,7 @@ export class ModelConfigStore {
     return Object.entries(file.providers).map(([id, provider]) => ({
       id,
       ...(provider.name ? { name: provider.name } : {}),
+      enabled: provider.enabled !== false,
       ...(provider.baseUrl ? { baseUrl: provider.baseUrl } : {}),
       ...(provider.api ? { api: provider.api } : {}),
       hasApiKey: Boolean(provider.apiKey),
@@ -572,6 +575,7 @@ export class ModelConfigStore {
       : undefined;
     file.providers[input.id] = providerStoredSchema.parse({
       ...(input.name ? { name: input.name } : {}),
+      enabled: input.enabled !== false,
       ...(input.baseUrl ? { baseUrl: input.baseUrl } : {}),
       ...(input.api ? { api: input.api } : {}),
       ...(apiKey ? { apiKey } : {}),
@@ -589,6 +593,11 @@ export class ModelConfigStore {
   }
 
   async test(raw: ModelProviderInput): Promise<{ ok: true; modelCount: number }> {
+    const models = await this.fetchModels(raw);
+    return { ok: true, modelCount: models.length || modelProviderInputSchema.parse(raw).models.length };
+  }
+
+  async fetchModels(raw: ModelProviderInput): Promise<Array<z.infer<typeof modelDefinitionSchema>>> {
     const input = modelProviderInputSchema.parse(raw);
     const file = await this.#read();
     const previous = file.providers[input.id];
@@ -631,12 +640,36 @@ export class ModelConfigStore {
         throw new Error(`连接失败：HTTP ${response.status}`);
       }
       const body: unknown = await response.json();
-      const modelCount = isRecord(body) && Array.isArray(body.data)
-        ? body.data.length
+      const entries = isRecord(body) && Array.isArray(body.data)
+        ? body.data
         : isRecord(body) && Array.isArray(body.models)
-          ? body.models.length
-          : input.models.length;
-      return { ok: true, modelCount };
+          ? body.models
+          : [];
+      const seen = new Set<string>();
+      return entries.flatMap((entry) => {
+        if (!isRecord(entry)) return [];
+        const rawId = typeof entry.id === "string"
+          ? entry.id
+          : typeof entry.name === "string"
+            ? entry.name
+            : undefined;
+        if (!rawId) return [];
+        const id = api === "google-generative-ai"
+          ? rawId.replace(/^models\//, "")
+          : rawId;
+        if (!id || seen.has(id)) return [];
+        seen.add(id);
+        const name = typeof entry.displayName === "string"
+          ? entry.displayName
+          : typeof entry.name === "string" && entry.name !== rawId
+            ? entry.name
+            : undefined;
+        return [{
+          id,
+          ...(name ? { name } : {}),
+          input: ["text"] as Array<"text" | "image">,
+        }];
+      });
     } finally {
       clearTimeout(timeout);
     }

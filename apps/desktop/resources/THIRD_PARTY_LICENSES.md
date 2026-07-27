@@ -89,6 +89,7 @@ Generated from the locked pnpm dependency graph. Refer to each linked package fo
 | @jridgewell/set-array | 1.2.1 | MIT | [link](https://github.com/jridgewell/set-array#readme) |
 | @jridgewell/sourcemap-codec | 1.4.10, 1.4.14, 1.5.0, 1.5.5 | MIT | [link](https://github.com/jridgewell/sourcemaps/tree/main/packages/sourcemap-codec) |
 | @jridgewell/trace-mapping | 0.3.31 | MIT | [link](https://github.com/jridgewell/sourcemaps/tree/main/packages/trace-mapping) |
+| @lobehub/icons-static-svg | 1.94.0 | MIT | [link](https://github.com/lobehub/lobe-icons) |
 | @malept/cross-spawn-promise | 2.0.0 | Apache-2.0 | [link](https://github.com/malept/cross-spawn-promise#readme) |
 | @malept/flatpak-bundler | 0.4.0 | MIT | [link](https://github.com/malept/flatpak-bundler#readme) |
 | @mariozechner/clipboard | 0.3.9 | MIT | [link](https://github.com/badlogic/clipboard#readme) |

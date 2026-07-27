@@ -17,6 +17,7 @@ import {
   mcpServerEditorSchema,
   mcpToolSummarySchema,
   modelProviderInputSchema,
+  modelProviderCatalogResultSchema,
   redactedModelProviderSchema,
   conversationMessageSchema,
   renameSessionInputSchema,
@@ -172,6 +173,14 @@ const api: DekiDesktopApi = {
     return commandResultSchema.parse(
       await ipcRenderer.invoke(
         IPC_CHANNELS.testModelProvider,
+        modelProviderInputSchema.parse(provider),
+      ),
+    );
+  },
+  async fetchModelProviderModels(provider) {
+    return modelProviderCatalogResultSchema.parse(
+      await ipcRenderer.invoke(
+        IPC_CHANNELS.fetchModelProviderModels,
         modelProviderInputSchema.parse(provider),
       ),
     );

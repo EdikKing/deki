@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Tool Gateway 统一限制并脱敏工作区与 MCP Tool 返回值，并对 Provider 调用实施并发控制。
+
 ### Added
 
 - 自有 Deki CLI，覆盖启动/恢复、doctor、模型、Skill、MCP、权限、审计和 Git Checkpoint 管理。

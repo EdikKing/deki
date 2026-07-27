@@ -90,7 +90,7 @@ export class AgentSessionEventSubscription {
 
 export class DekiAgentRuntime {
   readonly #options: DekiAgentRuntimeOptions;
-  readonly #gateway = new ToolGateway();
+  readonly #gateway: ToolGateway;
   #modelRuntime: ModelRuntime | undefined;
   #models: ModelType[] = [];
   #selectedModel: ModelType | undefined;
@@ -107,6 +107,10 @@ export class DekiAgentRuntime {
 
   constructor(options: DekiAgentRuntimeOptions) {
     this.#options = options;
+    this.#gateway = new ToolGateway({
+      outputLimitBytes: options.settings.advanced.toolOutputLimitBytes,
+      maxConcurrentCalls: options.settings.agent.maxConcurrentRuns,
+    });
   }
 
   async initialize(): Promise<void> {

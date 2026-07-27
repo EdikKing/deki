@@ -66,7 +66,10 @@ MCP lifecycle controls persist the enabled state and rebuild the affected agent
 runtime so newly discovered tool schemas are available to the model. Tool
 annotations are used instead of name guessing; each Tool supports an explicit
 enable switch, permission and timeout. MCP environment variables are stored
-only in the mode-`0600` project-local file and are masked in Renderer IPC.
+only in the mode-`0600` project-local file and are masked in Renderer IPC. The
+Tool Gateway applies the configured output byte limit to the complete result
+(text, image data and structured content), redacts secrets before results leave
+the gateway, and queues Provider calls at the configured concurrent-run limit.
 Skills are reported with source, trust, validation, dependency and conflict
 diagnostics.
 

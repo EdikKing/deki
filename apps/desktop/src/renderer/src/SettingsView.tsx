@@ -1176,7 +1176,7 @@ function AdvancedSettings({ value, source, zh, update }: SettingsComponentProps)
     <Setting title={zh ? "日志级别" : "Log level"} source={source("advanced.logLevel")}><select value={value.advanced.logLevel} onChange={(event) => void update({ advanced: { logLevel: event.target.value as DekiSettings["advanced"]["logLevel"] } })}><option value="error">error</option><option value="warn">warn</option><option value="info">info</option><option value="debug">debug</option></select></Setting>
     <Setting title={zh ? "网络代理" : "Network proxy"} description={zh ? "应用于 Electron 网络和子进程；模型运行时会在安全时机重建。" : "Applied to Electron networking and child processes; model runtime reloads safely."} source={source("advanced.proxyUrl")}><input placeholder="http://127.0.0.1:7890" value={value.advanced.proxyUrl} onChange={(event) => void update({ advanced: { proxyUrl: event.target.value.trim() } })} /></Setting>
     <Setting title={zh ? "自定义 CA 证书" : "Custom CA certificate"} description={zh ? "填写 PEM 文件绝对路径；某些 Node Provider 需要重启应用。" : "Absolute PEM path; some Node providers require an app restart."} source={source("advanced.customCaPath")}><input value={value.advanced.customCaPath} onChange={(event) => void update({ advanced: { customCaPath: event.target.value.trim() } })} /></Setting>
-    <Range title={zh ? "Tool 输出上限（KB）" : "Tool output limit (KB)"} path="advanced.toolOutputLimitBytes" value={Math.round(value.advanced.toolOutputLimitBytes / 1024)} min={1} max={97656} source={source} onChange={(kb) => update({ advanced: { toolOutputLimitBytes: kb * 1024 } })} />
+    <Range title={zh ? "Tool 输出上限（KB）" : "Tool output limit (KB)"} description={zh ? "统一限制工作区与 MCP Tool 的文本、图片和结构化返回值。" : "Applies to text, images, and structured results from workspace and MCP tools."} path="advanced.toolOutputLimitBytes" value={Math.round(value.advanced.toolOutputLimitBytes / 1024)} min={1} max={97656} source={source} onChange={(kb) => update({ advanced: { toolOutputLimitBytes: kb * 1024 } })} />
     <p className="muted">{zh ? "当前版本没有可启用的实验功能。" : "No experimental features are available in this version."}</p>
   </>;
 }
@@ -1198,13 +1198,13 @@ function Toggle(props: { title: string; description?: string; path: string; chec
   return <Setting title={props.title} description={props.description} source={props.source(props.path)}><label className="toggle"><input type="checkbox" disabled={props.disabled} checked={props.checked} onChange={(e) => void props.onChange(e.target.checked)} /><span /></label></Setting>;
 }
 
-function Range(props: { title: string; path: string; value: number; min: number; max: number; step?: number; source: (path: string) => string; onChange: (value: number) => Promise<void> }) {
+function Range(props: { title: string; description?: string; path: string; value: number; min: number; max: number; step?: number; source: (path: string) => string; onChange: (value: number) => Promise<void> }) {
   const [draft, setDraft] = useState(props.value);
   useEffect(() => setDraft(props.value), [props.value]);
   const commit = () => {
     if (draft !== props.value) void props.onChange(draft);
   };
-  return <Setting title={props.title} source={props.source(props.path)}><div className="range-control"><input type="range" value={draft} min={props.min} max={props.max} step={props.step ?? 1} onChange={(e) => setDraft(Number(e.target.value))} onPointerUp={commit} onKeyUp={commit} onBlur={commit} /><output>{draft}</output></div></Setting>;
+  return <Setting title={props.title} description={props.description} source={props.source(props.path)}><div className="range-control"><input type="range" value={draft} min={props.min} max={props.max} step={props.step ?? 1} onChange={(e) => setDraft(Number(e.target.value))} onPointerUp={commit} onKeyUp={commit} onBlur={commit} /><output>{draft}</output></div></Setting>;
 }
 
 function formatSource(source: string) {

@@ -46,6 +46,7 @@ export function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [approval, setApproval] = useState<Extract<AgentEvent, { type: "approval.requested" }>>();
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [activeSession, setActiveSession] = useState<SessionSummary>();
   const [sessionQuery, setSessionQuery] = useState("");
   const [expandedProjectKey, setExpandedProjectKey] = useState<string>(GENERAL_PROJECT_KEY);
   const [settingsSection, setSettingsSection] = useState<"models">();
@@ -59,7 +60,12 @@ export function App() {
   }
 
   async function refreshSessions(query = sessionQuery) {
-    setSessions(await window.deki.listSessions(query));
+    const [visibleSessions, allSessions] = await Promise.all([
+      window.deki.listSessions(query),
+      query ? window.deki.listSessions("") : Promise.resolve(undefined),
+    ]);
+    setSessions(visibleSessions);
+    setActiveSession((allSessions ?? visibleSessions).find((session) => session.current));
   }
 
   useEffect(() => {
@@ -134,6 +140,7 @@ export function App() {
     activeSessionId.current = state.sessionId;
     void refreshSessions().catch((reason) => setError(String(reason)));
     if (!state.sessionId) {
+      setActiveSession(undefined);
       setMessages([]);
       return;
     }
@@ -215,9 +222,9 @@ export function App() {
     settings?.effective.models.thinkingLevel ?? "medium",
     zh,
   );
-  const projectName = state?.workspace
-    ? getWorkspaceName(state.workspace)
-    : (zh ? "普通会话" : "General chat");
+  const sessionTitle = activeSession
+    ? getSessionTitle(activeSession, zh)
+    : (zh ? "新会话" : "New chat");
   const activeProjectKey = state?.workspace ?? GENERAL_PROJECT_KEY;
   const projectWorkspaces = [
     ...(state?.workspace ? [state.workspace] : []),
@@ -320,6 +327,7 @@ export function App() {
     setMessages([]);
     setEvents([]);
     setSessions([]);
+    setActiveSession(undefined);
     const result = await (workspace
       ? window.deki.openWorkspace(workspace)
       : window.deki.openGeneralChat());
@@ -354,6 +362,7 @@ export function App() {
     if (!nextState?.trusted || !nextState.ready) return;
     setMessages([]);
     setEvents([]);
+    setActiveSession(undefined);
     await runCommand(window.deki.newSession(), setError, refresh);
     await refreshSessions();
   }
@@ -439,12 +448,20 @@ export function App() {
                               disabled={busy}
                               onClick={() => {
                                 if (session.current) return;
+                                setActiveSession(session);
                                 setMessages([]);
                                 setEvents([]);
-                                void runCommand(window.deki.switchSession(session.id), setError, refresh);
+                                void runCommand(
+                                  window.deki.switchSession(session.id),
+                                  setError,
+                                  async () => {
+                                    await refresh();
+                                    await refreshSessions();
+                                  },
+                                );
                               }}
                             >
-                              <strong>{session.name || session.firstMessage || (zh ? "新会话" : "New chat")}</strong>
+                              <strong>{getSessionTitle(session, zh)}</strong>
                               <time dateTime={session.updatedAt}>
                                 {session.runState !== "idle" ? `${session.runState} · ` : ""}
                                 {formatRelativeTime(session.updatedAt, zh)}
@@ -515,8 +532,7 @@ export function App() {
       <section className="app-main">
         <header className="topbar">
           <div className="project-heading">
-            <strong>{projectName}</strong>
-            <code>{state.workspace ?? (zh ? "未关联项目，可直接开始普通会话" : "No project; general chat is available")}</code>
+            <strong>{sessionTitle}</strong>
           </div>
           <div className="top-actions">
             <button
@@ -1295,6 +1311,12 @@ async function runCommand(
 function getWorkspaceName(workspace: string): string {
   const normalized = workspace.replace(/[\\/]+$/, "");
   return normalized.split(/[\\/]/).at(-1) || workspace;
+}
+
+function getSessionTitle(session: SessionSummary, zh: boolean): string {
+  return session.name?.trim()
+    || session.firstMessage.trim()
+    || (zh ? "新会话" : "New chat");
 }
 
 function formatRelativeTime(value: string, zh: boolean): string {

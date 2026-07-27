@@ -171,12 +171,11 @@ h1 {
   align-items: center;
   gap: 11px;
   padding: 0 18px;
-  border-bottom: 1px solid #202b42;
   -webkit-app-region: drag;
 }
 
 html[data-platform="darwin"] .sidebar-brand {
-  height: 104px;
+  height: 88px;
   align-items: flex-end;
   padding: 0 18px 14px;
 }
@@ -534,7 +533,6 @@ html[data-platform="darwin"] .sidebar-brand {
   justify-content: space-between;
   gap: 8px;
   padding: 8px 10px;
-  border-top: 1px solid #202b42;
   color: #8392ab;
   font-size: 10px;
 }
@@ -593,9 +591,7 @@ html[data-platform="darwin"] .sidebar-brand {
 }
 
 html[data-platform="darwin"] .topbar {
-  height: 104px;
-  align-items: flex-end;
-  padding-bottom: 14px;
+  height: 46px;
 }
 
 .top-actions {
@@ -608,21 +604,10 @@ html[data-platform="darwin"] .topbar {
   min-width: 0;
 }
 
-.project-heading strong,
-.project-heading code {
-  display: block;
-}
-
 .project-heading strong {
-  font-size: 14px;
-}
-
-.project-heading code {
-  max-width: min(46vw, 620px);
-  margin-top: 4px;
+  display: block;
   overflow: hidden;
-  color: #6f819f;
-  font-size: 9px;
+  font-size: 14px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -2670,7 +2655,6 @@ input[type="range"]::-webkit-slider-thumb {
 
 .message-sender time,
 .navigation-heading,
-.project-heading code,
 .navigation-copy small,
 .setting-copy p,
 .subsection-heading p,
@@ -3113,8 +3097,7 @@ html[data-theme="light"] .settings-error {
   .project-tree-chevron,
   .project-new-session,
   .project-session-list,
-  .inspector-toggle-label,
-  .project-heading code {
+  .inspector-toggle-label {
     display: none;
   }
 

@@ -34,7 +34,33 @@ test("starts a general chat without a workspace", async ({}, testInfo) => {
     await expect(navigation.getByText(/新会话|New chat/)).toBeVisible();
     await expect(navigation.getByRole("button", { name: "添加项目" })).toBeVisible();
     await expect(window.getByText(/普通会话无需选择项目|General chat needs no project/)).toBeVisible();
-    await expect(window.locator("textarea")).toBeVisible();
+    const composer = window.locator(".composer-card");
+    await expect(composer).toBeVisible();
+    await expect(composer.locator(".composer-input")).toBeVisible();
+    await expect(composer.getByRole("combobox", { name: "选择模型" })).toBeVisible();
+    await expect(composer.getByRole("button", { name: "保存记忆" })).toBeVisible();
+    await expect(composer.getByRole("button", { name: "选择项目" })).toBeVisible();
+    await expect(composer.getByRole("button", { name: "发送" })).toBeVisible();
+    await expect(window.locator(".topbar").getByRole("combobox")).toHaveCount(0);
+    const composerLayout = await window.evaluate(() => {
+      const input = document.querySelector<HTMLElement>(".composer-input")!.getBoundingClientRect();
+      const toolbar = document.querySelector<HTMLElement>(".composer-toolbar")!.getBoundingClientRect();
+      return { inputTop: input.top, inputBottom: input.bottom, toolbarTop: toolbar.top };
+    });
+    expect(composerLayout.inputTop).toBeLessThan(composerLayout.toolbarTop);
+    expect(composerLayout.inputBottom).toBeLessThanOrEqual(composerLayout.toolbarTop);
+    const footerLayout = await window.evaluate(() => {
+      const status = document.querySelector<HTMLElement>(".sidebar-status")!.getBoundingClientRect();
+      const settingsButton = document.querySelector<HTMLElement>(".settings-button")!.getBoundingClientRect();
+      return {
+        statusLeft: status.left,
+        statusCenterY: status.top + status.height / 2,
+        settingsLeft: settingsButton.left,
+        settingsCenterY: settingsButton.top + settingsButton.height / 2,
+      };
+    });
+    expect(footerLayout.statusLeft).toBeLessThan(footerLayout.settingsLeft);
+    expect(Math.abs(footerLayout.statusCenterY - footerLayout.settingsCenterY)).toBeLessThanOrEqual(1);
     await window.getByTestId("open-settings").click();
     await expect(window.getByTestId("settings-page")).toBeVisible();
     await expect(window.getByRole("heading", { name: /通用|General/ })).toBeVisible();

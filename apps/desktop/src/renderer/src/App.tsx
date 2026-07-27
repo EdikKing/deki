@@ -151,6 +151,13 @@ export function App() {
   const isRememberCommand = Boolean(
     state?.workspace || settings?.effective.memory.userMemoryEnabled,
   ) && prompt.trimStart().startsWith("/remember ");
+  const canRemember = Boolean(
+    state?.workspace || settings?.effective.memory.userMemoryEnabled,
+  );
+  const thinkingLabel = formatThinkingLevel(
+    settings?.effective.models.thinkingLevel ?? "medium",
+    zh,
+  );
   const projectName = state?.workspace
     ? getWorkspaceName(state.workspace)
     : (zh ? "普通会话" : "General chat");
@@ -405,33 +412,6 @@ export function App() {
             <code>{state.workspace ?? (zh ? "未关联项目，可直接开始普通会话" : "No project; general chat is available")}</code>
           </div>
           <div className="top-actions">
-            <select
-              aria-label={zh ? "选择模型" : "Select model"}
-              value={state.selectedModel
-                ? `${state.selectedModel.provider}/${state.selectedModel.id}`
-                : ""}
-              disabled={state.models.length === 0 || busy}
-              onChange={(event) => {
-                const [provider, ...id] = event.target.value.split("/");
-                if (provider) {
-                  void runCommand(
-                    window.deki.selectModel(provider, id.join("/")),
-                    setError,
-                    refresh,
-                  );
-                }
-              }}
-            >
-              {state.models.length === 0 && <option value="">{zh ? "未配置云模型" : "No cloud model"}</option>}
-              {state.models.map((model) => (
-                <option
-                  key={`${model.provider}/${model.id}`}
-                  value={`${model.provider}/${model.id}`}
-                >
-                  {model.name} · {model.provider}
-                </option>
-              ))}
-            </select>
             <button
               className={`inspector-toggle${inspectorOpen ? " active" : ""}`}
               aria-label={inspectorOpen ? (zh ? "关闭检查器" : "Close inspector") : (zh ? "打开检查器" : "Open inspector")}
@@ -520,38 +500,114 @@ export function App() {
               )}
             </div>
             <div className="composer">
-              <textarea
-                value={prompt}
-                disabled={busy}
-                placeholder={state.ready
-                  ? (zh ? "输入任务，Enter 发送，Shift+Enter 换行" : "Enter a task; Enter sends, Shift+Enter adds a line")
-                  : state.workspace
-                    ? "未配置模型；仍可输入 /remember 保存项目记忆"
-                    : (zh ? "请在设置中添加模型 Provider 或配置环境变量" : "Add a model provider in Settings or configure environment credentials")}
-                onChange={(event) => setPrompt(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" && !event.shiftKey) {
-                    event.preventDefault();
-                    void submit();
-                  }
-                }}
-              />
-              {busy ? (
-                <button
-                  className="danger"
-                  onClick={() => void runCommand(window.deki.abortRun(), setError, refresh)}
-                >
-                  {zh ? "停止" : "Stop"}
-                </button>
-              ) : (
-                <button
-                  className="primary"
-                  disabled={!state.ready && !isRememberCommand}
-                  onClick={() => void submit()}
-                >
-                  {zh ? "发送" : "Send"}
-                </button>
-              )}
+              <div className="composer-card">
+                <textarea
+                  className="composer-input"
+                  value={prompt}
+                  disabled={busy}
+                  placeholder={state.ready
+                    ? (zh
+                        ? "输入消息…（Enter 发送，Shift+Enter 换行，/remember 保存记忆）"
+                        : "Type a message… (Enter to send, Shift+Enter for a new line, /remember to save memory)")
+                    : state.workspace
+                      ? "未配置模型；仍可输入 /remember 保存项目记忆"
+                      : (zh ? "请在设置中添加模型 Provider 或配置环境变量" : "Add a model provider in Settings or configure environment credentials")}
+                  onChange={(event) => setPrompt(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && !event.shiftKey) {
+                      event.preventDefault();
+                      void submit();
+                    }
+                  }}
+                />
+                <div className="composer-toolbar">
+                  <div className="composer-meta">
+                    <span className="composer-model-mark" aria-hidden="true">
+                      {state.selectedModel?.provider.slice(0, 1).toUpperCase() ?? "AI"}
+                    </span>
+                    <select
+                      className="composer-model"
+                      aria-label={zh ? "选择模型" : "Select model"}
+                      value={state.selectedModel
+                        ? `${state.selectedModel.provider}/${state.selectedModel.id}`
+                        : ""}
+                      disabled={state.models.length === 0 || busy}
+                      onChange={(event) => {
+                        const [provider, ...id] = event.target.value.split("/");
+                        if (provider) {
+                          void runCommand(
+                            window.deki.selectModel(provider, id.join("/")),
+                            setError,
+                            refresh,
+                          );
+                        }
+                      }}
+                    >
+                      {state.models.length === 0 && <option value="">{zh ? "未配置模型" : "No model"}</option>}
+                      {state.models.map((model) => (
+                        <option
+                          key={`${model.provider}/${model.id}`}
+                          value={`${model.provider}/${model.id}`}
+                        >
+                          {model.name} · {model.provider}
+                        </option>
+                      ))}
+                    </select>
+                    <span className="composer-mode" title={zh ? "思考强度" : "Thinking level"}>
+                      {thinkingLabel}
+                    </span>
+                    <span className="composer-runtime" title="Pi Coding Agent Runtime">
+                      <span aria-hidden="true">◇</span> Pi
+                    </span>
+                  </div>
+                  <div className="composer-actions">
+                    <button
+                      className="composer-tool"
+                      aria-label={zh ? "保存记忆" : "Save memory"}
+                      title={zh ? "插入 /remember" : "Insert /remember"}
+                      disabled={busy || !canRemember}
+                      onClick={() => setPrompt((current) => (
+                        current ? `${current}\n/remember ` : "/remember "
+                      ))}
+                    >
+                      <span aria-hidden="true">✦</span>
+                    </button>
+                    <button
+                      className="composer-tool"
+                      aria-label={zh ? "选择项目" : "Choose project"}
+                      title={zh ? "选择或切换项目" : "Choose or switch project"}
+                      disabled={busy}
+                      onClick={() => void runCommand(
+                        window.deki.chooseWorkspace(),
+                        setError,
+                        refresh,
+                      )}
+                    >
+                      <span className="navigation-icon folder-icon" aria-hidden="true" />
+                    </button>
+                    {busy ? (
+                      <button
+                        className="composer-submit danger"
+                        aria-label={zh ? "停止" : "Stop"}
+                        title={zh ? "停止" : "Stop"}
+                        onClick={() => void runCommand(window.deki.abortRun(), setError, refresh)}
+                      >
+                        <span aria-hidden="true">■</span>
+                      </button>
+                    ) : (
+                      <button
+                        className="composer-submit primary"
+                        aria-label={zh ? "发送" : "Send"}
+                        title={zh ? "发送" : "Send"}
+                        disabled={!state.ready && !isRememberCommand}
+                        onClick={() => void submit()}
+                      >
+                        <span aria-hidden="true">↑</span>
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
             </div>
             {error && <p className="error inline-error">{error}</p>}
           </section>
@@ -670,6 +726,30 @@ function resolveLocale(settings: SettingsSnapshot | undefined): "zh-CN" | "en-US
   const configured = settings?.effective.general.locale ?? "system";
   if (configured === "zh-CN" || configured === "en-US") return configured;
   return navigator.language.toLocaleLowerCase().startsWith("zh") ? "zh-CN" : "en-US";
+}
+
+function formatThinkingLevel(
+  level: "off" | "minimal" | "low" | "medium" | "high" | "xhigh",
+  zh: boolean,
+): string {
+  if (!zh) {
+    return {
+      off: "Off",
+      minimal: "Minimal",
+      low: "Low",
+      medium: "Standard",
+      high: "High",
+      xhigh: "Extra high",
+    }[level];
+  }
+  return {
+    off: "关闭",
+    minimal: "最小",
+    low: "较低",
+    medium: "标准",
+    high: "较高",
+    xhigh: "最高",
+  }[level];
 }
 
 function Panel(props: {

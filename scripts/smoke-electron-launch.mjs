@@ -60,7 +60,12 @@ try {
       child.kill("SIGTERM");
     }
   }
-  await rm(temporaryHome, { recursive: true, force: true });
+  await rm(temporaryHome, {
+    recursive: true,
+    force: true,
+    maxRetries: 20,
+    retryDelay: 250,
+  });
 }
 
 function captureOutput(chunk) {

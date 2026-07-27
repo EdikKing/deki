@@ -2768,29 +2768,44 @@ input[type="range"]::-webkit-slider-thumb {
 }
 
 .inspector-toggle {
-  min-height: 36px;
+  width: 34px;
+  height: 34px;
   display: inline-flex;
   align-items: center;
-  gap: 7px;
-  padding: 7px 10px;
-  border: 1px solid var(--border);
-  border-radius: 9px;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
   color: var(--text-secondary);
-  background: var(--bg-elevated);
+  background: transparent;
+}
+
+.inspector-toggle:hover {
+  color: var(--text-primary);
+  background: var(--bg-hover);
 }
 
 .inspector-toggle.active {
   color: var(--text-primary);
-  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
 }
 
-.inspector-toggle b {
-  min-width: 18px;
-  padding: 2px 5px;
+.run-details-icon {
+  position: relative;
+  width: 20px;
+  height: 16px;
+  border: 1.5px solid currentColor;
+  border-radius: 4px;
+}
+
+.run-details-icon::after {
+  position: absolute;
+  top: 2px;
+  right: 3px;
+  bottom: 2px;
+  width: 1.5px;
   border-radius: 99px;
-  color: white;
-  background: var(--accent);
-  font-size: 9px;
+  background: currentColor;
+  content: "";
 }
 
 .side-panel {
@@ -3096,8 +3111,7 @@ html[data-theme="light"] .settings-error {
   .project-tree-toggle strong,
   .project-tree-chevron,
   .project-new-session,
-  .project-session-list,
-  .inspector-toggle-label {
+  .project-session-list {
     display: none;
   }
 

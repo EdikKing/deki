@@ -537,14 +537,13 @@ export function App() {
           <div className="top-actions">
             <button
               className={`inspector-toggle${inspectorOpen ? " active" : ""}`}
-              aria-label={inspectorOpen ? (zh ? "关闭检查器" : "Close inspector") : (zh ? "打开检查器" : "Open inspector")}
+              aria-label={inspectorOpen ? (zh ? "关闭运行详情" : "Close run details") : (zh ? "打开运行详情" : "Open run details")}
               aria-expanded={inspectorOpen}
               data-testid="toggle-inspector"
+              title={inspectorOpen ? (zh ? "关闭运行详情" : "Close run details") : (zh ? "打开运行详情" : "Open run details")}
               onClick={() => setInspectorOpen((current) => !current)}
             >
-              <span aria-hidden="true">◫</span>
-              <span className="inspector-toggle-label">{zh ? "检查器" : "Inspector"}</span>
-              {(toolActivities.length + diffs.length) > 0 && <b>{toolActivities.length + diffs.length}</b>}
+              <span className="run-details-icon" aria-hidden="true" />
             </button>
           </div>
         </header>
@@ -726,7 +725,7 @@ export function App() {
           {compactLayout && inspectorOpen && (
             <button
               className="inspector-scrim"
-              aria-label={zh ? "关闭检查器" : "Close inspector"}
+              aria-label={zh ? "关闭运行详情" : "Close run details"}
               onClick={() => setInspectorOpen(false)}
             />
           )}
@@ -735,7 +734,7 @@ export function App() {
               <div
                 className="inspector-resizer"
                 role="separator"
-                aria-label={zh ? "调整检查器宽度" : "Resize inspector"}
+                aria-label={zh ? "调整运行详情宽度" : "Resize run details"}
                 aria-orientation="vertical"
                 tabIndex={0}
                 onPointerDown={(event) => startInspectorResize(event.clientX, inspectorWidth, setInspectorWidth)}
@@ -746,8 +745,8 @@ export function App() {
               />
             )}
             <header className="inspector-header">
-              <strong>{zh ? "运行检查器" : "Run inspector"}</strong>
-              <button className="icon-button" aria-label={zh ? "关闭检查器" : "Close inspector"} onClick={() => setInspectorOpen(false)}>×</button>
+              <strong>{zh ? "运行详情" : "Run details"}</strong>
+              <button className="icon-button" aria-label={zh ? "关闭运行详情" : "Close run details"} onClick={() => setInspectorOpen(false)}>×</button>
             </header>
             {diffs.length > 0 && (
               <Panel title={zh ? "变更 Diff" : "Change diffs"} count={diffs.length}>

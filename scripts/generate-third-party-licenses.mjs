@@ -3,13 +3,23 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
 const root = resolve(import.meta.dirname, "..");
-const result = spawnSync("pnpm", ["licenses", "list", "--json"], {
+const pnpmArgs = ["licenses", "list", "--json"];
+const isWindows = process.platform === "win32";
+const command = isWindows ? process.env.ComSpec ?? "cmd.exe" : "pnpm";
+const args = isWindows
+  ? ["/d", "/s", "/c", `pnpm ${pnpmArgs.join(" ")}`]
+  : pnpmArgs;
+const result = spawnSync(command, args, {
   cwd: root,
   encoding: "utf8",
   maxBuffer: 20 * 1024 * 1024,
 });
 if (result.status !== 0) {
-  throw new Error(result.stderr || "Unable to enumerate third-party licenses");
+  throw new Error(
+    result.error?.message
+      || result.stderr?.trim()
+      || "Unable to enumerate third-party licenses",
+  );
 }
 const groups = JSON.parse(result.stdout);
 const rows = Object.entries(groups).flatMap(([license, packages]) =>

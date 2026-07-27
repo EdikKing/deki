@@ -796,8 +796,7 @@ function ConversationTurn(props: {
             title={props.zh ? "复制消息" : "Copy message"}
             onClick={() => void navigator.clipboard.writeText(props.message.content)}
           >
-            <span aria-hidden="true">▣</span>
-            <span>{props.zh ? "复制" : "Copy"}</span>
+            <span className="copy-message-icon" aria-hidden="true" />
           </button>
         </div>
       </div>

@@ -309,7 +309,32 @@ test("trusts a workspace, streams fixture events, and recalls memory", async ({}
     await expect(window.locator(".status-line", { hasText: "Skills" })).toContainText(
       "test-skill",
     );
+    const inspectorDivider = await window.evaluate(() => {
+      const chat = getComputedStyle(document.querySelector<HTMLElement>(".chat-panel")!);
+      const inspector = getComputedStyle(document.querySelector<HTMLElement>(".side-panel")!);
+      return {
+        chatBorder: chat.borderRightWidth,
+        inspectorBorder: inspector.borderLeftWidth,
+      };
+    });
+    expect(inspectorDivider).toEqual({
+      chatBorder: "0px",
+      inspectorBorder: "1px",
+    });
     await expect(window.getByText("这是模拟的流式响应。")).toBeVisible();
+    const messageLayout = await window.evaluate(() => {
+      const region = document.querySelector<HTMLElement>(".messages")!.getBoundingClientRect();
+      const turn = document.querySelector<HTMLElement>(".message-turn")!.getBoundingClientRect();
+      return {
+        leftGap: turn.left - region.left,
+        rightGap: region.right - turn.right,
+      };
+    });
+    expect(messageLayout.leftGap).toBeLessThanOrEqual(41);
+    expect(messageLayout.rightGap).toBeLessThanOrEqual(41);
+    const copyMessage = window.getByRole("button", { name: "复制消息" }).first();
+    await expect(copyMessage.locator(".copy-message-icon")).toHaveCount(1);
+    await expect(copyMessage).toHaveText("");
     const reasoning = window.locator(".message-reasoning");
     await expect(reasoning).not.toHaveAttribute("open", "");
     await expect(reasoning.locator(".reasoning-content")).not.toBeVisible();

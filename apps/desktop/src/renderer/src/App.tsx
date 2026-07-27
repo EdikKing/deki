@@ -430,7 +430,7 @@ export function App() {
                         aria-expanded={expanded}
                         onClick={() => toggleProjectNode(node.workspace)}
                       >
-                        <span className="navigation-icon folder-icon" aria-hidden="true" />
+                        <FolderIcon />
                         <strong>{node.name}</strong>
                         <span className={`project-tree-chevron${expanded ? " expanded" : ""}`} aria-hidden="true">›</span>
                       </button>
@@ -719,7 +719,7 @@ export function App() {
                         refresh,
                       )}
                     >
-                      <span className="navigation-icon folder-icon" aria-hidden="true" />
+                      <FolderIcon />
                     </button>
                     {busy ? (<>
                       {(settings?.effective.agent.maxConcurrentRuns ?? 1) > 1 && (
@@ -734,12 +734,12 @@ export function App() {
                         </button>
                       )}
                       <button
-                        className="composer-submit danger"
+                        className="composer-submit composer-stop danger"
                         aria-label={zh ? "停止" : "Stop"}
                         title={zh ? "停止" : "Stop"}
                         onClick={() => void runCommand(window.deki.abortRun(), setError, refresh)}
                       >
-                        <span aria-hidden="true">■</span>
+                        <span className="composer-stop-glyph" aria-hidden="true" />
                       </button>
                     </>) : (
                       <button
@@ -1335,6 +1335,16 @@ function ProviderBrandLogo(props: {
     : <span className="provider-brand-logo-fallback" aria-hidden="true">
         {props.presentation.shortName}
       </span>;
+}
+
+function FolderIcon() {
+  return <svg
+    className="navigation-icon folder-icon"
+    viewBox="0 0 24 24"
+    aria-hidden="true"
+  >
+    <path d="M2.75 6.25A2.25 2.25 0 0 1 5 4h4.05c.6 0 1.17.24 1.59.66l1.34 1.34H19a2.25 2.25 0 0 1 2.25 2.25v8.5A2.25 2.25 0 0 1 19 19H5a2.25 2.25 0 0 1-2.25-2.25V6.25Z" />
+  </svg>;
 }
 
 function resolveLocale(settings: SettingsSnapshot | undefined): "zh-CN" | "en-US" {

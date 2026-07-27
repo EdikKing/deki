@@ -213,7 +213,7 @@ describe("PermissionEngine", () => {
       "bash",
       {
         command: process.platform === "win32"
-          ? "echo partial> partial.txt & exit /b 2"
+          ? "echo partial> partial.txt & exit 2"
           : "printf 'partial\\n' > partial.txt; exit 2",
       },
       { callId: "shell-failed-diff", workspace: root },

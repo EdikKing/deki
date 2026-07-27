@@ -86,6 +86,8 @@ describe("config", () => {
     await expect(readMcpLocalConfig(file)).resolves.toEqual({
       servers: { fixture: { environment: { API_TOKEN: "secret" } } },
     });
-    expect((await stat(file)).mode & 0o777).toBe(0o600);
+    if (process.platform !== "win32") {
+      expect((await stat(file)).mode & 0o777).toBe(0o600);
+    }
   });
 });

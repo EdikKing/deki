@@ -36,7 +36,8 @@ describe("GitCheckpointManager", () => {
 
     const result = await manager.restore(checkpoint.id);
 
-    expect(await readFile(join(workspace, "tracked.txt"), "utf8")).toBe("checkpoint\n");
+    expect((await readFile(join(workspace, "tracked.txt"), "utf8")).replaceAll("\r\n", "\n"))
+      .toBe("checkpoint\n");
     expect(result.safetyCheckpoint.message).toContain("Safety checkpoint");
     expect(await git(workspace, ["show", `${result.safetyCheckpoint.commit}:tracked.txt`]))
       .toBe("later\n");

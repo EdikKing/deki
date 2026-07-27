@@ -1316,6 +1316,11 @@ function createWindow(): BrowserWindow {
     minHeight: 640,
     title: "Deki",
     backgroundColor: "#0b1020",
+    ...(process.platform === "darwin"
+      ? {
+          titleBarStyle: "hidden",
+        }
+      : {}),
     webPreferences: {
       preload: join(import.meta.dirname, "../preload/index.cjs"),
       contextIsolation: true,

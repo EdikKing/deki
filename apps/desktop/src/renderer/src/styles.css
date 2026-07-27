@@ -30,6 +30,7 @@ select,
 textarea {
   margin: 0;
   font: inherit;
+  -webkit-app-region: no-drag;
 }
 
 button {
@@ -51,6 +52,7 @@ code {
   min-height: 100vh;
   display: grid;
   place-items: center;
+  -webkit-app-region: drag;
 }
 
 .trust-card {
@@ -60,6 +62,7 @@ code {
   border-radius: 22px;
   background: rgba(14, 21, 38, 0.92);
   box-shadow: 0 32px 100px rgba(0, 0, 0, 0.45);
+  -webkit-app-region: no-drag;
 }
 
 .brand-mark {
@@ -169,6 +172,13 @@ h1 {
   gap: 11px;
   padding: 0 18px;
   border-bottom: 1px solid #202b42;
+  -webkit-app-region: drag;
+}
+
+html[data-platform="darwin"] .sidebar-brand {
+  height: 104px;
+  align-items: flex-end;
+  padding: 0 18px 14px;
 }
 
 .sidebar-brand strong,
@@ -579,6 +589,13 @@ h1 {
   padding: 0 22px;
   border-bottom: 1px solid #1c273d;
   background: rgba(9, 14, 26, 0.9);
+  -webkit-app-region: drag;
+}
+
+html[data-platform="darwin"] .topbar {
+  height: 104px;
+  align-items: flex-end;
+  padding-bottom: 14px;
 }
 
 .top-actions {
@@ -1462,7 +1479,9 @@ html[data-density="compact"] .setting-row { min-height: 58px; padding-block: 9px
   gap: 10px;
   padding: 0 8px;
   font-size: 15px;
+  -webkit-app-region: drag;
 }
+html[data-platform="darwin"] .settings-nav > header { padding-left: 78px; }
 .settings-back { font-size: 28px; }
 .settings-search {
   width: 100%;
@@ -1504,6 +1523,7 @@ html[data-density="compact"] .setting-row { min-height: 58px; padding-block: 9px
   gap: 24px;
   padding: 18px 30px;
   border-bottom: 1px solid #1c273d;
+  -webkit-app-region: drag;
 }
 .settings-toolbar h1 { margin: 0; font-size: 22px; }
 .settings-toolbar p { margin: 5px 0 0; color: #7486a4; font-size: 11px; }

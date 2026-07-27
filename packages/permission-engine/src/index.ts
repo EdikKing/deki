@@ -96,9 +96,14 @@ export class PermissionEngine {
 
   async authorize(request: PermissionRequest): Promise<void> {
     const grantKey = request.grantKey ?? request.category;
+    const fullAccess = Object.values(
+      this.#options.settings.permissions.policies,
+    ).every((policy) => policy === "allow");
     const policy = this.#sessionGrants.has(grantKey)
       ? "allow"
-      : request.policy ?? this.#options.settings.permissions.policies[request.category];
+      : fullAccess
+        ? "allow"
+        : request.policy ?? this.#options.settings.permissions.policies[request.category];
     let decision: ApprovalDecision = policy === "allow" ? "allow_once" : "deny";
     if (policy === "ask") decision = await this.#ask(request);
     if (decision === "allow_session") this.#sessionGrants.add(grantKey);

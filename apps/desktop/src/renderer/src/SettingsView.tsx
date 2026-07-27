@@ -33,6 +33,14 @@ import {
   isBuiltinModelProvider,
   type BuiltinModelProvider,
 } from "./builtinModelProviders";
+import { PermissionModeIcon } from "./PermissionModeIcon";
+import {
+  detectPermissionMode,
+  permissionModeCopy,
+  permissionModes,
+  policiesForPermissionMode,
+  type PermissionMode,
+} from "./permissionModes";
 
 type Locale = "zh-CN" | "en-US";
 type SectionId =
@@ -96,11 +104,12 @@ export function SettingsView(props: {
   taskId?: string;
   locale: Locale;
   initialSection?: SectionId;
+  initialScope?: SettingsScope;
   onChanged: (snapshot: SettingsSnapshot) => void;
   onClose: () => void;
   onRefreshState: () => Promise<void>;
 }) {
-  const [scope, setScope] = useState<SettingsScope>("global");
+  const [scope, setScope] = useState<SettingsScope>(props.initialScope ?? "global");
   const [resetKey, setResetKey] = useState("");
   const [section, setSection] = useState<SectionId>(props.initialSection ?? "general");
   const [query, setQuery] = useState("");
@@ -835,6 +844,7 @@ function PermissionSettings({ value, source, zh, update }: SettingsComponentProp
   const setPolicy = (category: PermissionCategory, policy: PermissionPolicy) => {
     void update({ permissions: { policies: { ...value.permissions.policies, [category]: policy } } });
   };
+  const selectedMode = detectPermissionMode(value.permissions.policies);
   const groups: Array<{ title: string; categories: PermissionCategory[] }> = [
     {
       title: zh ? "文件与工作区" : "Files & workspace",
@@ -853,40 +863,33 @@ function PermissionSettings({ value, source, zh, update }: SettingsComponentProp
       categories: ["mcp.read", "mcp.write"],
     },
   ];
-  const applyPreset = (preset: "conservative" | "balanced" | "autonomous") => {
-    const next = { ...value.permissions.policies };
-    for (const category of Object.keys(next) as PermissionCategory[]) {
-      const alwaysDeny = category === "outsideWorkspace" || category === "sensitiveFiles" || category === "privileged";
-      if (alwaysDeny) next[category] = "deny";
-      else if (preset === "conservative") next[category] = category === "workspace.read" || category === "mcp.read" ? "allow" : "ask";
-      else if (preset === "autonomous") next[category] = ["workspace.read", "workspace.write", "shell.safe", "mcp.read"].includes(category) ? "allow" : "ask";
-      else {
-        const defaults: Partial<Record<PermissionCategory, PermissionPolicy>> = {
-          "workspace.read": "allow",
-          "workspace.write": "allow",
-          "workspace.delete": "ask",
-          "shell.safe": "allow",
-          "shell.unknown": "ask",
-          "dependencies.install": "ask",
-          "git.commit": "ask",
-          "git.push": "ask",
-          network: "ask",
-          "mcp.read": "allow",
-          "mcp.write": "ask",
-        };
-        next[category] = defaults[category] ?? "deny";
-      }
-    }
-    void update({ permissions: { policies: next } });
+  const applyMode = (mode: PermissionMode) => {
+    void update({ permissions: { policies: policiesForPermissionMode(mode) } });
   };
   return <>
-    <p className="settings-warning">{zh ? "没有 sandbox 选项。敏感文件、提权和工作区外访问默认拒绝；其他高风险操作需要审批。" : "There is no sandbox option. Sensitive, privileged, and outside-workspace access is denied by default; other risky operations require approval."}</p>
-    <div className="permission-presets" aria-label={zh ? "权限预设" : "Permission presets"}>
-      <span>{zh ? "快速预设" : "Quick presets"}</span>
-      <button className="ghost small-action" onClick={() => applyPreset("conservative")}>{zh ? "保守" : "Conservative"}</button>
-      <button className="ghost small-action" onClick={() => applyPreset("balanced")}>{zh ? "平衡（推荐）" : "Balanced (recommended)"}</button>
-      <button className="ghost small-action" onClick={() => applyPreset("autonomous")}>{zh ? "高自主" : "More autonomous"}</button>
+    <div className="permission-mode-cards" aria-label={zh ? "权限模式" : "Permission modes"}>
+      {permissionModes.map((mode) => {
+        const copy = permissionModeCopy(mode, zh);
+        return <button
+          className={`permission-mode-card${selectedMode === mode ? " selected" : ""}${mode === "full" ? " full-access" : ""}`}
+          aria-pressed={selectedMode === mode}
+          key={mode}
+          onClick={() => applyMode(mode)}
+        >
+          <PermissionModeIcon mode={mode} />
+          <span>
+            <strong>{copy.title}</strong>
+            <small>{copy.description}</small>
+          </span>
+          {selectedMode === mode && <span className="permission-mode-check" aria-hidden="true">✓</span>}
+        </button>;
+      })}
     </div>
+    <p className={selectedMode === "full" ? "settings-danger" : "settings-warning"}>
+      {selectedMode === "full"
+        ? (zh ? "完全访问权限已开启：工具调用不会再请求批准，包括敏感文件、提权、工作区外路径和网络访问。" : "Full access is enabled: tool calls will not ask for approval, including sensitive files, privileged operations, outside paths, and network access.")
+        : (zh ? "权限模式会设置整组策略；你仍可在下方逐项覆盖，覆盖后将显示为“自定义权限”。" : "A mode sets the complete policy set. Override individual items below to create custom permissions.")}
+    </p>
     {groups.map((group) => (
       <section className="settings-group" key={group.title}>
         <h2>{group.title}</h2>

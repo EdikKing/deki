@@ -25,12 +25,14 @@ describe("PermissionEngine", () => {
     expect(inspectShellBoundary("python -c 'open(\"/tmp/x\")'")?.category).toBe("outsideWorkspace");
   });
 
-  it("denies sensitive paths regardless of workspace write defaults", async () => {
+  it("honors an explicit deny policy for sensitive paths", async () => {
     const root = await mkdtemp(join(tmpdir(), "deki-permissions-"));
+    const settings = structuredClone(defaultSettings);
+    settings.permissions.policies.sensitiveFiles = "deny";
     const engine = new PermissionEngine({
       workspace: root,
       logsRoot: join(root, "logs"),
-      settings: defaultSettings,
+      settings,
       sessionId: () => "session",
       model: () => "provider/model",
       emit: () => {},
@@ -39,6 +41,33 @@ describe("PermissionEngine", () => {
       "权限策略拒绝",
     );
     expect(isSensitivePath(join(root, ".ssh", "id_ed25519"))).toBe(true);
+  });
+
+  it("lets full access override a per-tool policy", async () => {
+    const root = await mkdtemp(join(tmpdir(), "deki-permissions-full-"));
+    const settings = structuredClone(defaultSettings);
+    for (const category of Object.keys(settings.permissions.policies) as Array<
+      keyof typeof settings.permissions.policies
+    >) {
+      settings.permissions.policies[category] = "allow";
+    }
+    const engine = new PermissionEngine({
+      workspace: root,
+      logsRoot: join(root, "logs"),
+      settings,
+      sessionId: () => "session",
+      model: () => "provider/model",
+      emit: () => {},
+    });
+
+    await expect(engine.authorize({
+      callId: "full-access",
+      category: "mcp.write",
+      title: "MCP mutating tool",
+      description: "Explicit tool policy",
+      details: {},
+      policy: "deny",
+    })).resolves.toBeUndefined();
   });
 
   it("writes workspace files and returns a unified diff through the gateway", async () => {

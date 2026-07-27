@@ -30,6 +30,11 @@ layer. Individual fields, a section, or the entire selected scope can be reset.
 General chats expose no project, file, shell, MCP, project skill or project
 memory capabilities.
 
+Choosing a folder through **Add project** is an explicit local action and trusts
+that folder immediately, so the project opens without a second confirmation.
+Workspaces supplied at process startup still require confirmation unless they
+were trusted previously.
+
 Trusted projects expose Deki-owned `workspace__*` tools. The Pi SDK's raw write
 and shell tools are not enabled. Every controlled operation is classified as
 `allow`, `ask` or `deny` before I/O:
@@ -37,8 +42,16 @@ and shell tools are not enabled. Every controlled operation is classified as
 - project reads and ordinary text edits default to `allow`;
 - deletes, dependency changes, Git writes and complex shell default to `ask`;
 - sensitive files, privilege escalation and paths outside the workspace default
-  to `deny`;
+  to `ask`;
 - MCP tools are classified as read-only or potentially mutating.
+
+The composer exposes three session-scoped permission modes: **Request
+approval** asks before higher-risk mutations and risk boundaries, **Agent
+decides** only asks for high-risk boundaries, and **Full access** allows every
+category without approval. Selecting a mode updates the complete policy set;
+individual category overrides remain available in Settings and are reported as
+custom permissions. Full access also overrides per-tool MCP policies for the
+current runtime.
 
 Approved writes emit a complete unified diff in the conversation UI. The audit
 record is finalized after real I/O and includes whether execution succeeded or

@@ -23,6 +23,14 @@ import { SettingsView } from "./SettingsView";
 import {
   builtinModelProviders,
 } from "./builtinModelProviders";
+import { PermissionModeIcon } from "./PermissionModeIcon";
+import {
+  detectPermissionMode,
+  permissionModeCopy,
+  permissionModes,
+  policiesForPermissionMode,
+  type PermissionMode,
+} from "./permissionModes";
 
 type ChatMessage = ConversationMessage;
 type ToolActivity = {
@@ -49,7 +57,7 @@ export function App() {
   const [activeSession, setActiveSession] = useState<SessionSummary>();
   const [sessionQuery, setSessionQuery] = useState("");
   const [expandedProjectKey, setExpandedProjectKey] = useState<string>(GENERAL_PROJECT_KEY);
-  const [settingsSection, setSettingsSection] = useState<"models">();
+  const [settingsSection, setSettingsSection] = useState<"models" | "permissions">();
   const [compactLayout, setCompactLayout] = useState(() => window.innerWidth <= 980);
   const [inspectorOpen, setInspectorOpen] = useState(() => window.innerWidth > 980);
   const [inspectorWidth, setInspectorWidth] = useState(330);
@@ -271,6 +279,7 @@ export function App() {
       <SettingsView
         snapshot={settings}
         {...(settingsSection ? { initialSection: settingsSection } : {})}
+        {...(settingsSection === "permissions" ? { initialScope: "session" as const } : {})}
         hasWorkspace={Boolean(state.workspace && state.trusted)}
         {...(state.sessionId ? { taskId: state.sessionId } : {})}
         locale={locale}
@@ -652,6 +661,30 @@ export function App() {
                         );
                       }}
                     />
+                    {settings && (
+                      <PermissionModePicker
+                        policies={settings.effective.permissions.policies}
+                        zh={zh}
+                        disabled={busy}
+                        available={Boolean(state.workspace)}
+                        onSelect={async (mode) => {
+                          try {
+                            const next = await window.deki.updateSettings(
+                              "session",
+                              { permissions: { policies: policiesForPermissionMode(mode) } },
+                              settings.revision,
+                            );
+                            setSettings(next);
+                          } catch (reason) {
+                            setError(reason instanceof Error ? reason.message : String(reason));
+                          }
+                        }}
+                        onOpenSettings={() => {
+                          setSettingsSection("permissions");
+                          setShowSettings(true);
+                        }}
+                      />
+                    )}
                     <span className="composer-mode" title={zh ? "思考强度" : "Thinking level"}>
                       {thinkingLabel}
                     </span>
@@ -1064,6 +1097,112 @@ function ModelPicker(props: {
           {props.zh ? "没有匹配的模型" : "No matching models"}
         </p>}
       </div>
+    </section>}
+  </div>;
+}
+
+function PermissionModePicker(props: {
+  policies: SettingsSnapshot["effective"]["permissions"]["policies"];
+  zh: boolean;
+  disabled: boolean;
+  available: boolean;
+  onSelect: (mode: PermissionMode) => Promise<void>;
+  onOpenSettings: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const selectedMode = detectPermissionMode(props.policies);
+  const selectedCopy = selectedMode === "custom"
+    ? {
+        title: props.zh ? "自定义权限" : "Custom permissions",
+        description: props.zh ? "已逐项配置权限策略" : "Per-category policies are configured",
+      }
+    : permissionModeCopy(selectedMode, props.zh);
+  const triggerTitle = props.available
+    ? selectedCopy.description
+    : (props.zh
+        ? "普通会话不会访问本地文件；关联项目后可选择权限模式"
+        : "General chats cannot access local files. Connect a project to choose a permission mode.");
+  const triggerLabel = props.available
+    ? `${props.zh ? "权限" : "Permissions"} · ${selectedCopy.title}`
+    : (props.zh ? "权限 · 无本地访问" : "Permissions · No local access");
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    window.addEventListener("pointerdown", onPointerDown);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [open]);
+
+  const choose = async (mode: PermissionMode) => {
+    setSaving(true);
+    try {
+      await props.onSelect(mode);
+      setOpen(false);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return <div className="permission-mode-picker" ref={rootRef}>
+    <button
+      className={`permission-mode-trigger${selectedMode === "full" ? " full-access" : ""}${props.available ? "" : " unavailable"}`}
+      aria-label={props.available
+        ? (props.zh ? "选择权限模式" : "Select permission mode")
+        : (props.zh ? "权限模式，需要先关联项目" : "Permission mode, connect a project first")}
+      aria-haspopup="listbox"
+      aria-expanded={open}
+      disabled={props.disabled || saving || !props.available}
+      title={triggerTitle}
+      onClick={() => setOpen((current) => !current)}
+    >
+      <PermissionModeIcon mode={props.available ? selectedMode : "custom"} />
+      <span>{saving ? (props.zh ? "正在切换…" : "Switching…") : triggerLabel}</span>
+      {props.available && <span className="composer-model-chevron" aria-hidden="true">⌄</span>}
+    </button>
+    {open && <section
+      className="permission-mode-popover"
+      role="listbox"
+      aria-label={props.zh ? "权限模式" : "Permission modes"}
+    >
+      {permissionModes.map((mode) => {
+        const copy = permissionModeCopy(mode, props.zh);
+        const selected = selectedMode === mode;
+        return <button
+          className={`permission-mode-option${selected ? " selected" : ""}${mode === "full" ? " full-access" : ""}`}
+          role="option"
+          aria-selected={selected}
+          disabled={saving}
+          key={mode}
+          onClick={() => void choose(mode)}
+        >
+          <PermissionModeIcon mode={mode} />
+          <span className="permission-mode-option-copy">
+            <strong>{copy.title}</strong>
+            <small>{copy.description}</small>
+          </span>
+          {selected && <span className="permission-mode-check" aria-hidden="true">✓</span>}
+        </button>;
+      })}
+      <button
+        className="permission-mode-settings-link"
+        onClick={() => {
+          setOpen(false);
+          props.onOpenSettings();
+        }}
+      >
+        {props.zh ? "逐项配置权限…" : "Configure individual permissions…"}
+      </button>
     </section>}
   </div>;
 }

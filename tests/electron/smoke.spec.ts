@@ -1,5 +1,12 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -63,6 +70,10 @@ test("starts a general chat without a workspace", async ({}, testInfo) => {
       outlineWidth: "0px",
     });
     await expect(composer.getByRole("button", { name: "选择模型" })).toBeVisible();
+    const generalPermissionMode = composer.getByRole("button", { name: "权限模式，需要先关联项目" });
+    await expect(generalPermissionMode).toBeVisible();
+    await expect(generalPermissionMode).toContainText("权限 · 无本地访问");
+    await expect(generalPermissionMode).toBeDisabled();
     await expect(composer.getByRole("button", { name: "保存记忆" })).toBeVisible();
     await expect(composer.getByRole("button", { name: "选择项目" })).toBeVisible();
     await expect(composer.getByRole("button", { name: "发送" })).toBeVisible();
@@ -275,6 +286,42 @@ test("can leave an untrusted workspace for a general chat", async ({}) => {
 
 // Playwright requires an object-destructured fixtures parameter.
 // eslint-disable-next-line no-empty-pattern
+test("automatically trusts a workspace selected from Add project", async ({}) => {
+  const temporaryHome = await mkdtemp(resolve(tmpdir(), "deki-electron-auto-trust-"));
+  const workspace = await mkdtemp(resolve(tmpdir(), "deki-electron-selected-workspace-"));
+  await seedChineseSettings(temporaryHome);
+  const electronApp = await electron.launch({
+    executablePath: electronPath,
+    args: createElectronArguments(temporaryHome),
+    env: createTestEnvironment(temporaryHome),
+  });
+
+  try {
+    await electronApp.evaluate(({ dialog }, selectedWorkspace) => {
+      dialog.showOpenDialog = async () => ({
+        canceled: false,
+        filePaths: [selectedWorkspace],
+      });
+    }, workspace);
+    const window = await electronApp.firstWindow();
+    await window.getByRole("button", { name: "添加项目" }).click();
+    await expect(window.getByRole("heading", { name: "从理解项目开始" })).toBeVisible();
+    await expect(window.getByRole("heading", { name: "信任这个工作区？" })).toHaveCount(0);
+    await expect(window.getByRole("button", { name: "选择权限模式" })).toBeEnabled();
+
+    const config = JSON.parse(
+      await readFile(join(temporaryHome, ".deki", "config.json"), "utf8"),
+    ) as { trustedWorkspaces: Record<string, unknown> };
+    expect(config.trustedWorkspaces[await realpath(workspace)]).toBeDefined();
+  } finally {
+    await electronApp.close();
+    await rm(temporaryHome, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+// Playwright requires an object-destructured fixtures parameter.
+// eslint-disable-next-line no-empty-pattern
 test("trusts a workspace, streams fixture events, and recalls memory", async ({}, testInfo) => {
   const temporaryHome = await mkdtemp(resolve(tmpdir(), "deki-electron-home-"));
   await seedChineseSettings(temporaryHome);
@@ -359,6 +406,21 @@ test("trusts a workspace, streams fixture events, and recalls memory", async ({}
     await expect(window.locator(".side-panel")).toHaveClass(/open/);
     await window.getByTestId("toggle-inspector").click();
     await expect(window.locator(".side-panel")).not.toHaveClass(/open/);
+
+    const permissionTrigger = window.getByRole("button", { name: "选择权限模式" });
+    await expect(permissionTrigger).toContainText("请求批准");
+    await permissionTrigger.click();
+    const permissionPicker = window.getByRole("listbox", { name: "权限模式" });
+    await expect(permissionPicker.getByRole("option")).toHaveCount(3);
+    await expect(permissionPicker.getByRole("option", { name: /^请求批准 / })).toHaveAttribute("aria-selected", "true");
+    await permissionPicker.getByRole("option", { name: /完全访问权限/ }).click();
+    await expect(permissionTrigger).toContainText("完全访问权限");
+    await permissionTrigger.click();
+    await permissionPicker.getByRole("button", { name: "逐项配置权限…" }).click();
+    await expect(window.getByRole("heading", { name: "权限" })).toBeVisible();
+    await expect(window.locator(".scope-picker select").first()).toHaveValue("session");
+    await expect(window.getByText(/完全访问权限已开启/)).toBeVisible();
+    await window.getByRole("button", { name: "返回" }).click();
 
     await window.getByTestId("open-settings").click();
     await window.getByTestId("settings-section-mcp").click();

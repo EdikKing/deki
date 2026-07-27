@@ -1398,7 +1398,9 @@ function registerIpcHandlers(): void {
         ["--workspace", selection.filePaths[0]],
         process.cwd(),
       );
-      return commandResultSchema.parse(await switchToWorkspace(workspace));
+      return commandResultSchema.parse(await switchToWorkspace(workspace, {
+        trustSelectedWorkspace: true,
+      }));
     } catch (error) {
       return commandResultSchema.parse({
         ok: false,
@@ -1863,10 +1865,20 @@ function createEmptyBootstrapState(): BootstrapState {
   });
 }
 
-async function switchToWorkspace(workspace: string | undefined): Promise<CommandResult> {
+async function switchToWorkspace(
+  workspace: string | undefined,
+  options: { trustSelectedWorkspace?: boolean } = {},
+): Promise<CommandResult> {
   try {
     await controller?.dispose();
     controller = await DesktopController.create(workspace);
+    if (
+      workspace
+      && options.trustSelectedWorkspace
+      && !controller.getState().trusted
+    ) {
+      return controller.trust();
+    }
     return { ok: true };
   } catch (error) {
     return { ok: false, error: formatError(error) };

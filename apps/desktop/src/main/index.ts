@@ -1325,6 +1325,11 @@ function createWindow(): BrowserWindow {
   });
 
   window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  if (process.env.DEKI_LAUNCH_SMOKE === "1") {
+    window.webContents.once("did-finish-load", () => {
+      console.log("DEKI_LAUNCH_SMOKE_READY");
+    });
+  }
   window.on("close", () => {
     if (
       process.platform === "darwin"

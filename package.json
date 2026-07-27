@@ -25,6 +25,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:electron": "pnpm build && playwright test --config playwright.config.ts",
+    "test:electron:launch": "node scripts/smoke-electron-launch.mjs",
     "license:generate": "node scripts/generate-third-party-licenses.mjs"
   },
   "devDependencies": {
@@ -32,7 +33,7 @@
     "@modelcontextprotocol/sdk": "1.29.0",
     "@playwright/test": "1.62.0",
     "@types/node": "24.13.3",
-    "electron": "43.1.1",
+    "electron": "43.2.0",
     "eslint": "10.0.1",
     "globals": "16.5.0",
     "typescript": "6.0.3",

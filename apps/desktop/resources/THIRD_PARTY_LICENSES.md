@@ -280,7 +280,7 @@ Generated from the locked pnpm dependency graph. Refer to each linked package fo
 | ecdsa-sig-formatter | 1.0.11 | Apache-2.0 | [link](https://github.com/Brightspace/node-ecdsa-sig-formatter#readme) |
 | ee-first | 1.1.1 | MIT | [link](https://github.com/jonathanong/ee-first#readme) |
 | ejs | 3.1.8 | Apache-2.0 | [link](https://github.com/mde/ejs) |
-| electron | 43.1.1 | MIT | [link](https://github.com/electron/electron#readme) |
+| electron | 43.2.0 | MIT | [link](https://github.com/electron/electron#readme) |
 | electron-builder | 26.0.12 | MIT | [link](https://github.com/electron-userland/electron-builder) |
 | electron-builder-squirrel-windows | 26.0.12 | MIT | [link](https://github.com/electron-userland/electron-builder) |
 | electron-publish | 26.0.11 | MIT | [link](https://github.com/electron-userland/electron-builder) |

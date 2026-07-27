@@ -438,11 +438,7 @@ test("creates and previews a branch-neutral Git checkpoint", async ({}) => {
 });
 
 function createElectronArguments(...extraArguments: string[]) {
-  const windowsCiArguments = process.platform === "win32" && process.env.CI
-    ? ["--no-sandbox", "--disable-gpu"]
-    : [];
   return [
-    ...windowsCiArguments,
     resolve("apps/desktop"),
     "--lang=zh-CN",
     ...extraArguments,

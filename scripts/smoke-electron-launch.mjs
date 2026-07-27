@@ -23,6 +23,7 @@ try {
 
   child = spawn(electronPath, [
     "--enable-logging=stderr",
+    `--user-data-dir=${join(temporaryHome, "electron-user-data")}`,
     resolve(root, "apps/desktop"),
     "--lang=zh-CN",
   ], {
@@ -36,8 +37,8 @@ try {
         )),
       ),
       DEKI_LAUNCH_SMOKE: "1",
-      HOME: temporaryHome,
-      USERPROFILE: temporaryHome,
+      DEKI_HOME: settingsRoot,
+      ...(process.platform === "win32" ? {} : { HOME: temporaryHome }),
       LANG: "zh_CN.UTF-8",
     },
     stdio: ["ignore", "pipe", "pipe"],

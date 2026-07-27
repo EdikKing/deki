@@ -48,7 +48,9 @@ export interface DekiPaths {
   logsRoot: string;
 }
 
-export function getDekiPaths(root = join(homedir(), ".deki")): DekiPaths {
+export function getDekiPaths(
+  root = process.env.DEKI_HOME ?? join(homedir(), ".deki"),
+): DekiPaths {
   return {
     root,
     configFile: join(root, "config.json"),

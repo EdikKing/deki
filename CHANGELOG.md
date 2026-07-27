@@ -10,6 +10,9 @@
 
 ### Added
 
+- 三平台正式安装器：macOS DMG/ZIP、Windows NSIS/Portable、Linux AppImage/DEB。
+- SemVer Tag Release 工作流、macOS 签名与公证、Windows Authenticode、GitHub Releases 更新源。
+- SHA-256 校验和、CycloneDX SBOM、Artifact Attestation 和应用内 Stable/Beta 自动更新。
 - 自有 Deki CLI，覆盖启动/恢复、doctor、模型、Skill、MCP、权限、审计和 Git Checkpoint 管理。
 - 基于 `refs/deki/checkpoints/*` 的分支无侵入 Checkpoint、Agent 修改前自动快照、Diff 预览和安全恢复。
 - 阶段 0 Electron + React 桌面 PoC。

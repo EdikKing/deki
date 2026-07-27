@@ -212,7 +212,7 @@ Generated from the locked pnpm dependency graph. Refer to each linked package fo
 | buffer-equal-constant-time | 1.0.1 | BSD-3-Clause | [link](https://github.com/goinstant/buffer-equal-constant-time#readme) |
 | buffer-from | 1.1.2 | MIT | [link](https://github.com/LinusU/buffer-from#readme) |
 | builder-util | 26.0.11 | MIT | [link](https://github.com/electron-userland/electron-builder) |
-| builder-util-runtime | 9.3.1 | MIT | [link](https://github.com/electron-userland/electron-builder) |
+| builder-util-runtime | 9.3.1, 9.7.0 | MIT | [link](https://github.com/electron-userland/electron-builder) |
 | bytes | 3.1.2 | MIT | [link](https://github.com/visionmedia/bytes.js#readme) |
 | cac | 6.7.14 | MIT | [link](https://github.com/egoist/cac#readme) |
 | cacache | 16.1.0 | ISC | [link](https://github.com/npm/cacache#readme) |
@@ -285,6 +285,7 @@ Generated from the locked pnpm dependency graph. Refer to each linked package fo
 | electron-builder-squirrel-windows | 26.0.12 | MIT | [link](https://github.com/electron-userland/electron-builder) |
 | electron-publish | 26.0.11 | MIT | [link](https://github.com/electron-userland/electron-builder) |
 | electron-to-chromium | 1.5.396 | ISC | [link](https://github.com/Kilian/electron-to-chromium#readme) |
+| electron-updater | 6.8.9 | MIT | [link](https://github.com/electron-userland/electron-builder) |
 | electron-vite | 5.0.0 | MIT | [link](https://electron-vite.org) |
 | electron-winstaller | 5.4.0 | MIT | [link](https://github.com/electron/windows-installer#readme) |
 | emoji-regex | 8.0.0, 9.2.2 | MIT | [link](https://mths.be/emoji-regex) |
@@ -425,6 +426,8 @@ Generated from the locked pnpm dependency graph. Refer to each linked package fo
 | levn | 0.4.1 | MIT | [link](https://github.com/gkz/levn) |
 | locate-path | 6.0.0 | MIT | [link](https://github.com/sindresorhus/locate-path#readme) |
 | lodash | 4.18.1 | MIT | [link](https://lodash.com/) |
+| lodash.escaperegexp | 4.1.2 | MIT | [link](https://lodash.com/) |
+| lodash.isequal | 4.5.0 | MIT | [link](https://lodash.com/) |
 | log-symbols | 4.1.0 | MIT | [link](https://github.com/sindresorhus/log-symbols#readme) |
 | long | 5.3.2 | Apache-2.0 | [link](https://github.com/dcodeIO/long.js#readme) |
 | longest-streak | 3.1.0 | MIT | [link](https://github.com/wooorm/longest-streak#readme) |
@@ -584,7 +587,7 @@ Generated from the locked pnpm dependency graph. Refer to each linked package fo
 | sanitize-filename | 1.6.4 | WTFPL OR ISC | [link](https://github.com/parshap/node-sanitize-filename#readme) |
 | sax | 1.6.1 | BlueOak-1.0.0 | [link](https://github.com/isaacs/sax-js#readme) |
 | scheduler | 0.27.0 | MIT | [link](https://react.dev/) |
-| semver | 5.5.0, 6.3.1, 7.8.0, 7.8.5 | ISC | [link](https://github.com/npm/node-semver#readme) |
+| semver | 5.5.0, 6.3.1, 7.7.4, 7.8.0, 7.8.5 | ISC | [link](https://github.com/npm/node-semver#readme) |
 | send | 1.2.1 | MIT | [link](https://github.com/pillarjs/send#readme) |
 | serve-static | 2.2.1 | MIT | [link](https://github.com/expressjs/serve-static#readme) |
 | setprototypeof | 1.2.0 | ISC | [link](https://github.com/wesleytodd/setprototypeof) |
@@ -621,6 +624,7 @@ Generated from the locked pnpm dependency graph. Refer to each linked package fo
 | temp | 0.9.4 | MIT | [link](https://github.com/bruce/node-temp#readme) |
 | temp-file | 3.4.0 | MIT | [link](https://github.com/develar/temp-file) |
 | tiny-async-pool | 1.3.0 | MIT | [link](https://github.com/rxaviers/async-pool#readme) |
+| tiny-typed-emitter | 2.1.0 | MIT | [link](https://github.com/binier/tiny-typed-emitter#readme) |
 | tinybench | 2.9.0 | MIT | [link](https://github.com/tinylibs/tinybench#readme) |
 | tinyexec | 1.2.4 | MIT | [link](https://github.com/tinylibs/tinyexec#readme) |
 | tinyglobby | 0.2.17 | MIT | [link](https://superchupu.dev/tinyglobby) |

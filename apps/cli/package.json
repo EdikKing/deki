@@ -15,7 +15,8 @@
     "@deki-ai/config": "workspace:*",
     "@deki-ai/git-checkpoint": "workspace:*",
     "@deki-ai/mcp-manager": "workspace:*",
-    "@deki-ai/settings": "workspace:*"
+    "@deki-ai/settings": "workspace:*",
+    "@deki-ai/shared": "workspace:*"
   },
   "devDependencies": {
     "vite": "7.3.6"

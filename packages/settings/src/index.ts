@@ -121,7 +121,7 @@ const advancedSchema = z.object({
 const updatesSchema = z.object({
   enabled: z.boolean(),
   channel: z.enum(["stable", "beta"]),
-  sourceConfigured: z.literal(false),
+  sourceConfigured: z.boolean(),
 }).strict();
 
 export const settingsSchema = z.object({
@@ -244,7 +244,7 @@ export const defaultSettings: DekiSettings = settingsSchema.parse({
   updates: {
     enabled: true,
     channel: "stable",
-    sourceConfigured: false,
+    sourceConfigured: true,
   },
 });
 

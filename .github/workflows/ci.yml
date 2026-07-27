@@ -36,4 +36,4 @@ jobs:
         run: xvfb-run -a pnpm test:electron
       - if: runner.os != 'Linux'
         run: pnpm test:electron
-      - run: pnpm package
+      - run: pnpm package:dir

@@ -10,7 +10,11 @@
   "scripts": {
     "dev": "electron-vite dev",
     "build": "pnpm --dir ../.. license:generate && electron-vite build && node ../../scripts/verify-desktop-bundle.mjs",
-    "package": "pnpm --dir ../.. cli:build && pnpm build && electron-builder --dir"
+    "package": "pnpm --dir ../.. cli:build && pnpm build && electron-builder --publish never",
+    "package:dir": "pnpm --dir ../.. cli:build && pnpm build && electron-builder --dir",
+    "package:mac": "pnpm --dir ../.. cli:build && pnpm build && electron-builder --mac dmg zip --universal --publish never",
+    "package:win": "pnpm --dir ../.. cli:build && pnpm build && electron-builder --win nsis portable --x64 --publish never",
+    "package:linux": "pnpm --dir ../.. cli:build && pnpm build && electron-builder --linux AppImage deb --x64 --publish never"
   },
   "dependencies": {
     "@deki-ai/agent-runtime": "workspace:*",
@@ -26,6 +30,7 @@
     "@earendil-works/pi-coding-agent": "0.82.1",
     "@lobehub/icons-static-svg": "1.94.0",
     "@modelcontextprotocol/sdk": "1.29.0",
+    "electron-updater": "6.8.9",
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "react-markdown": "^10.1.0",
@@ -63,15 +68,52 @@
       }
     ],
     "asar": true,
+    "artifactName": "${productName}-${version}-${os}-${arch}.${ext}",
     "mac": {
-      "target": ["dir"]
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "category": "public.app-category.developer-tools",
+      "hardenedRuntime": true,
+      "notarize": true
     },
     "win": {
-      "target": ["dir"]
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "signtoolOptions": {
+        "signingHashAlgorithms": [
+          "sha256"
+        ],
+        "rfc3161TimeStampServer": "http://timestamp.digicert.com"
+      }
     },
     "linux": {
-      "target": ["dir"],
-      "category": "Development"
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "category": "Development",
+      "maintainer": "Edik Labs",
+      "synopsis": "Local-first AI development workspace"
+    },
+    "nsis": {
+      "artifactName": "${productName}-${version}-windows-${arch}-Setup.${ext}",
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false,
+      "deleteAppDataOnUninstall": false
+    },
+    "portable": {
+      "artifactName": "${productName}-${version}-windows-${arch}-Portable.${ext}"
+    },
+    "appImage": {
+      "artifactName": "${productName}-${version}-linux-${arch}.${ext}"
+    },
+    "deb": {
+      "artifactName": "${productName}-${version}-linux-${arch}.${ext}"
     }
   }
 }

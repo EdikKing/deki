@@ -26,6 +26,7 @@ import type {
   SettingsSnapshot,
   SkillStatus,
 } from "@deki-ai/shared";
+import { DEKI_VERSION } from "@deki-ai/shared";
 import {
   builtinModelProviders,
   builtinProviderInput,
@@ -303,7 +304,7 @@ function GeneralSettings({ value, source, zh, update }: SettingsComponentProps) 
     <Toggle title={zh ? "恢复上次会话" : "Restore last session"} path="general.restoreSession" checked={value.general.restoreSession} source={source} onChange={(restoreSession) => update({ general: { restoreSession } })} />
     <Setting title={zh ? "关闭窗口时" : "When closing the window"} source={source("general.closeBehavior")}><select value={value.general.closeBehavior} onChange={(e) => void update({ general: { closeBehavior: e.target.value as "quit" | "keep-running" } })}><option value="quit">{zh ? "退出应用" : "Quit app"}</option><option value="keep-running">{zh ? "保持后台运行" : "Keep running"}</option></select></Setting>
     <Toggle title={zh ? "开机启动" : "Launch at login"} path="general.launchAtLogin" checked={value.general.launchAtLogin} source={source} onChange={(launchAtLogin) => update({ general: { launchAtLogin } })} />
-    <Toggle title={zh ? "检查更新" : "Check for updates"} description={zh ? "当前尚未配置发布源，因此暂不可用。" : "No release source is configured, so this is currently unavailable."} path="general.checkUpdates" checked={value.general.checkUpdates} disabled source={source} onChange={() => Promise.resolve()} />
+    <Toggle title={zh ? "检查更新" : "Check for updates"} description={zh ? "启动后从 GitHub Releases 检查签名更新；下载完成后将在退出时安装。" : "Checks GitHub Releases for signed updates after startup and installs downloaded updates on quit."} path="general.checkUpdates" checked={value.general.checkUpdates} source={source} onChange={(checkUpdates) => update({ general: { checkUpdates } })} />
   </>;
 }
 
@@ -1183,10 +1184,10 @@ function AdvancedSettings({ value, source, zh, update }: SettingsComponentProps)
 
 function AboutSettings({ value, zh, update }: Pick<SettingsComponentProps, "value" | "zh" | "update">) {
   return <>
-    <div className="about-card"><div className="brand-mark">D</div><div><h2>Deki 0.0.0</h2><p>Electron 43.2.0 · Pi SDK 0.82.1 · MCP SDK 1.29.0</p></div></div>
+    <div className="about-card"><div className="brand-mark">D</div><div><h2>Deki {DEKI_VERSION}</h2><p>Electron 43.2.0 · Pi SDK 0.82.1 · MCP SDK 1.29.0</p></div></div>
     <Setting title={zh ? "开源许可证" : "Open-source license"} description="AGPL-3.0-or-later" source="product"><span className="value-text">GNU Affero General Public License v3.0 or later</span></Setting>
     <Setting title={zh ? "第三方许可证" : "Third-party licenses"} description={zh ? "根据锁文件自动生成完整依赖清单，并随应用打包。" : "A complete inventory is generated from the lockfile and packaged with the app."} source="product"><button className="ghost" onClick={() => void window.deki.openThirdPartyLicenses()}>{zh ? "打开完整清单" : "Open complete inventory"}</button></Setting>
-    <Setting title={zh ? "更新通道" : "Update channel"} description={zh ? "尚未配置发布源；不会自动下载更新。" : "No release source configured; updates are not downloaded."} source="global"><select value={value.updates.channel} onChange={(e) => void update({ updates: { channel: e.target.value as "stable" | "beta" } })}><option value="stable">Stable</option><option value="beta">Beta</option></select></Setting>
+    <Setting title={zh ? "更新通道" : "Update channel"} description={zh ? "Stable 仅接收正式版；Beta 可接收预发布版本。发布源为 GitHub Releases。" : "Stable receives final releases; Beta can receive prereleases. Updates are served by GitHub Releases."} source="global"><select value={value.updates.channel} onChange={(e) => void update({ updates: { channel: e.target.value as "stable" | "beta" } })}><option value="stable">Stable</option><option value="beta">Beta</option></select></Setting>
   </>;
 }
 

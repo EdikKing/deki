@@ -97,7 +97,7 @@ const advancedSettingsSchema = z.object({
 const updatesSettingsSchema = z.object({
   enabled: z.boolean(),
   channel: z.enum(["stable", "beta"]),
-  sourceConfigured: z.literal(false),
+  sourceConfigured: z.boolean(),
 }).strict();
 export const settingsSchema = z.object({
   general: generalSchema,

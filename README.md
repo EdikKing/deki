@@ -21,8 +21,10 @@
 - 受权限网关保护的文件修改、Shell、MCP、完整 Diff Viewer、历史审计与脱敏诊断
 - 自有 `deki` CLI：启动/恢复、doctor、模型、Skill、MCP、权限、审计与 Checkpoint 管理
 - 修改前 Git Checkpoint：不移动 HEAD、不改变当前分支或暂存区，可预览并安全恢复
+- macOS DMG/ZIP、Windows NSIS/Portable、Linux AppImage/DEB 正式打包流水线
+- GitHub Releases 自动更新源、平台代码签名与公证、SHA-256、CycloneDX SBOM 和构建 Attestation
 
-当前版本不支持真实 Sandbox、本地模型、HTTP/OAuth MCP、内置 MCP Server 或自动更新下载。
+当前版本不支持真实 Sandbox、本地模型、HTTP/OAuth MCP 或内置 MCP Server。
 
 ## 环境要求
 
@@ -67,6 +69,9 @@ pnpm test:electron
 pnpm build
 pnpm package
 ```
+
+`pnpm package` 生成当前平台安装器；`pnpm package:dir` 只生成用于快速验证的目录包。
+正式 Release 的 Tag、签名 Secrets、产物与校验方法见[发布文档](docs/releasing.md)。
 
 测试专用 MCP Server 和 Skill 位于 `tests/fixtures/`，不会作为产品示例或预置 Server 发布。
 

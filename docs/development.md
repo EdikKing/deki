@@ -33,7 +33,9 @@ pnpm build
 pnpm package
 ```
 
-`pnpm package` 只生成当前平台未签名目录包到 `release/`，阶段 0 不生成正式安装器。
+`pnpm package` 生成当前平台的真实安装器到 `release/`；本地没有证书时仅用于开发验证。
+`pnpm package:dir` 生成未签名目录包，适合快速检查。正式签名、公证和三平台发布流程见
+[发布文档](releasing.md)。
 
 `pnpm build` 同时构建 CLI 和 Electron。CLI 也可单独构建并运行：
 

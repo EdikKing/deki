@@ -12,6 +12,7 @@ import {
   shell,
   type IpcMainInvokeEvent,
 } from "electron";
+import electronUpdater from "electron-updater";
 import { DekiAgentRuntime } from "@deki-ai/agent-runtime";
 import { GitCheckpointManager } from "@deki-ai/git-checkpoint";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
@@ -95,6 +96,9 @@ protocol.registerSchemesAsPrivileged([{
 
 let controller: DesktopController | undefined;
 let quitting = false;
+let updateCheckTimer: NodeJS.Timeout | undefined;
+let appliedUpdateConfiguration = "";
+const { autoUpdater } = electronUpdater;
 
 class DesktopController {
   readonly #workspace: string | undefined;
@@ -1743,6 +1747,35 @@ function applyNativeSettings(snapshot: SettingsSnapshot): void {
       ? { proxyRules: proxyUrl }
       : { mode: "direct" });
   }
+  applyAutoUpdateSettings(snapshot);
+}
+
+function applyAutoUpdateSettings(snapshot: SettingsSnapshot): void {
+  if (!app.isPackaged || !app.isReady()) return;
+
+  const enabled = snapshot.effective.updates.enabled
+    && snapshot.effective.general.checkUpdates;
+  const channel = snapshot.effective.updates.channel === "beta" ? "beta" : "latest";
+  const configuration = `${enabled}:${channel}`;
+  if (configuration === appliedUpdateConfiguration) return;
+  appliedUpdateConfiguration = configuration;
+
+  if (updateCheckTimer) {
+    clearTimeout(updateCheckTimer);
+    updateCheckTimer = undefined;
+  }
+  if (!enabled) return;
+
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = true;
+  autoUpdater.allowPrerelease = channel === "beta";
+  autoUpdater.channel = channel;
+  updateCheckTimer = setTimeout(() => {
+    updateCheckTimer = undefined;
+    void autoUpdater.checkForUpdatesAndNotify().catch((error: unknown) => {
+      console.error("Deki update check failed:", formatError(error));
+    });
+  }, 10_000);
 }
 
 function requiresRuntimeReload(before: SettingsSnapshot, after: SettingsSnapshot): boolean {

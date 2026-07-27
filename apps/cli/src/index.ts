@@ -23,6 +23,7 @@ import {
 } from "@deki-ai/config";
 import { GitCheckpointManager, isGitAvailable } from "@deki-ai/git-checkpoint";
 import { McpManager } from "@deki-ai/mcp-manager";
+import { DEKI_VERSION } from "@deki-ai/shared";
 import {
   ModelConfigStore,
   SettingsStore,
@@ -98,7 +99,7 @@ export async function runCli(
       return 0;
     }
     if (parsed.options.has("version")) {
-      io.stdout("Deki CLI 0.0.0");
+      io.stdout(`Deki CLI ${DEKI_VERSION}`);
       return 0;
     }
     const dataDirectory = optionString(parsed, "data-dir");

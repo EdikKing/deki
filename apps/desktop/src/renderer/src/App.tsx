@@ -1125,8 +1125,8 @@ function PermissionModePicker(props: {
         ? "普通会话不会访问本地文件；关联项目后可选择权限模式"
         : "General chats cannot access local files. Connect a project to choose a permission mode.");
   const triggerLabel = props.available
-    ? `${props.zh ? "权限" : "Permissions"} · ${selectedCopy.title}`
-    : (props.zh ? "权限 · 无本地访问" : "Permissions · No local access");
+    ? selectedCopy.title
+    : (props.zh ? "无本地访问" : "No local access");
 
   useEffect(() => {
     if (!open) return;

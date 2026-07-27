@@ -72,7 +72,7 @@ test("starts a general chat without a workspace", async ({}, testInfo) => {
     await expect(composer.getByRole("button", { name: "选择模型" })).toBeVisible();
     const generalPermissionMode = composer.getByRole("button", { name: "权限模式，需要先关联项目" });
     await expect(generalPermissionMode).toBeVisible();
-    await expect(generalPermissionMode).toContainText("权限 · 无本地访问");
+    await expect(generalPermissionMode).toContainText("无本地访问");
     await expect(generalPermissionMode).toBeDisabled();
     await expect(composer.getByRole("button", { name: "保存记忆" })).toBeVisible();
     await expect(composer.getByRole("button", { name: "选择项目" })).toBeVisible();

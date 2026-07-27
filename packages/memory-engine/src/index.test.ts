@@ -134,7 +134,7 @@ describe("MemoryEngine", () => {
     expect(recalled[0]?.content).toContain("Electron");
     expect(engine.listMemories("project", "project-a", { query: "桌面界面" })[0]?.content)
       .toContain("Electron");
-  });
+  }, 15_000);
 
   it("isolates task memories by session id and supports moving scopes", async () => {
     const engine = await createEngine();

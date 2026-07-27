@@ -183,7 +183,11 @@ describe("PermissionEngine", () => {
     const provider = new WorkspaceToolsProvider(engine);
     await provider.callTool(
       "bash",
-      { command: "printf 'after\\n' > shell.txt" },
+      {
+        command: process.platform === "win32"
+          ? "echo after> shell.txt"
+          : "printf 'after\\n' > shell.txt",
+      },
       { callId: "shell-diff", workspace: root },
     );
     expect(events.find((event) => event.type === "diff.available")?.diff).toContain(
@@ -207,7 +211,11 @@ describe("PermissionEngine", () => {
     const provider = new WorkspaceToolsProvider(engine);
     await expect(provider.callTool(
       "bash",
-      { command: "printf 'partial\\n' > partial.txt; exit 2" },
+      {
+        command: process.platform === "win32"
+          ? "echo partial> partial.txt & exit /b 2"
+          : "printf 'partial\\n' > partial.txt; exit 2",
+      },
       { callId: "shell-failed-diff", workspace: root },
     )).rejects.toThrow("命令退出");
     expect(events.find((event) => event.type === "diff.available")?.diff).toContain(

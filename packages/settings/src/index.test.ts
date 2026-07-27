@@ -117,7 +117,9 @@ describe("ModelConfigStore", () => {
       "x-private-token": "[REDACTED]",
     });
     expect(await readFile(file, "utf8")).toContain("super-secret-key");
-    expect((await stat(file)).mode & 0o777).toBe(0o600);
+    if (process.platform !== "win32") {
+      expect((await stat(file)).mode & 0o777).toBe(0o600);
+    }
 
     await store.upsert({
       id: "custom",

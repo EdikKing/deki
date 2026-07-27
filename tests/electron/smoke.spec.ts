@@ -22,7 +22,7 @@ test("starts a general chat without a workspace", async ({}, testInfo) => {
   await seedChineseSettings(temporaryHome);
   const electronApp = await electron.launch({
     executablePath: electronPath,
-    args: [resolve("apps/desktop"), "--lang=zh-CN"],
+    args: createElectronArguments(),
     env: createTestEnvironment(temporaryHome),
   });
 
@@ -141,7 +141,7 @@ test("groups and searches models in the composer picker", async ({}) => {
   await seedComposerModels(temporaryHome);
   const electronApp = await electron.launch({
     executablePath: electronPath,
-    args: [resolve("apps/desktop"), "--lang=zh-CN"],
+    args: createElectronArguments(),
     env: createTestEnvironment(temporaryHome),
   });
 
@@ -172,7 +172,7 @@ test("keeps the composer visible when a conversation exceeds the viewport", asyn
   await seedChineseSettings(temporaryHome);
   const electronApp = await electron.launch({
     executablePath: electronPath,
-    args: [resolve("apps/desktop"), "--lang=zh-CN"],
+    args: createElectronArguments(),
     env: createTestEnvironment(temporaryHome),
   });
 
@@ -222,7 +222,7 @@ test("stores and manages memory for the current task", async ({}) => {
   await seedChineseSettings(temporaryHome);
   const electronApp = await electron.launch({
     executablePath: electronPath,
-    args: [resolve("apps/desktop"), "--lang=zh-CN"],
+    args: createElectronArguments(),
     env: {
       ...createTestEnvironment(temporaryHome),
       OPENAI_API_KEY: "sk-test-only-not-persisted",
@@ -254,12 +254,10 @@ test("can leave an untrusted workspace for a general chat", async ({}) => {
   await seedChineseSettings(temporaryHome);
   const electronApp = await electron.launch({
     executablePath: electronPath,
-    args: [
-      resolve("apps/desktop"),
-      "--lang=zh-CN",
+    args: createElectronArguments(
       "--workspace",
       resolve("tests/fixtures/workspace"),
-    ],
+    ),
     env: createTestEnvironment(temporaryHome),
   });
 
@@ -282,13 +280,11 @@ test("trusts a workspace, streams fixture events, and recalls memory", async ({}
 
   const launch = (fixtureEvents = false) => electron.launch({
     executablePath: electronPath,
-    args: [
-      resolve("apps/desktop"),
-      "--lang=zh-CN",
+    args: createElectronArguments(
       "--workspace",
       resolve("tests/fixtures/workspace"),
       ...(fixtureEvents ? ["--e2e-fixture-events"] : []),
-    ],
+    ),
     env: createTestEnvironment(temporaryHome),
   });
 
@@ -414,7 +410,7 @@ test("creates and previews a branch-neutral Git checkpoint", async ({}) => {
   const initialHead = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: workspace })).stdout;
   const electronApp = await electron.launch({
     executablePath: electronPath,
-    args: [resolve("apps/desktop"), "--lang=zh-CN", "--workspace", workspace],
+    args: createElectronArguments("--workspace", workspace),
     env: createTestEnvironment(temporaryHome),
   });
 
@@ -440,6 +436,15 @@ test("creates and previews a branch-neutral Git checkpoint", async ({}) => {
     await rm(workspace, { recursive: true, force: true });
   }
 });
+
+function createElectronArguments(...extraArguments: string[]) {
+  return [
+    ...(process.platform === "win32" && process.env.CI ? ["--no-sandbox"] : []),
+    resolve("apps/desktop"),
+    "--lang=zh-CN",
+    ...extraArguments,
+  ];
+}
 
 function createTestEnvironment(temporaryHome: string) {
   return {

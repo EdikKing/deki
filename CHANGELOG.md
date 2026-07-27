@@ -10,6 +10,13 @@
 
 ### Added
 
+- 会话消息级分叉、完整 Timeline 恢复、异常运行恢复和会话命令集。
+- 模型 Token/上下文统计与独立会话分叉的并发运行池。
+- Skill 全局兼容目录、来源更新和版本锁定。
+- MCP 周期健康检查、原连接自动重连、指数退避和 `${secret:NAME}` 引用。
+- workspace/branch 记忆作用域、Token Budget、冲突 supersede、过期与低置信度治理。
+- 可手动检查、后台下载并退出安装的 GitHub Releases 更新客户端。
+
 - 三平台正式安装器：macOS DMG/ZIP、Windows NSIS/Portable、Linux AppImage/DEB。
 - SemVer Tag Release 工作流、macOS 签名与公证、Windows Authenticode、GitHub Releases 更新源。
 - SHA-256 校验和、CycloneDX SBOM、Artifact Attestation 和应用内 Stable/Beta 自动更新。

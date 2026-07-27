@@ -357,6 +357,18 @@ h1 {
   opacity: 0.72;
 }
 
+.session-search {
+  width: calc(100% - 20px);
+  margin: 6px 10px 2px;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-raised);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+}
+
 .icon-button {
   width: 24px;
   height: 24px;

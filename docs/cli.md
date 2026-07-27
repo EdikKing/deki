@@ -24,6 +24,9 @@ deki models remove <provider-id>
 deki skills list [--workspace path]
 deki skills create <name> [--description text]
 deki skills validate <path>
+deki skills update <path>
+deki skills pin <path>
+deki skills unpin <path>
 deki mcp list [--workspace path]
 deki mcp add <id> --command cmd [--arg value] [--cwd relative]
 deki mcp remove <id>

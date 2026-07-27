@@ -68,7 +68,16 @@
       }
     ],
     "asar": true,
+    "generateUpdatesFilesForAllChannels": true,
     "artifactName": "${productName}-${version}-${os}-${arch}.${ext}",
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "edik-labs",
+        "repo": "deki",
+        "releaseType": "release"
+      }
+    ],
     "mac": {
       "target": [
         "dmg",

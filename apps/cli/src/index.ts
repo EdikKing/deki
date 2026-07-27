@@ -4,6 +4,7 @@ import {
   mkdir,
   readFile,
   readdir,
+  rename,
   stat,
   writeFile,
 } from "node:fs/promises";
@@ -292,6 +293,44 @@ async function runSkills(
       "",
     ].join("\n"), { encoding: "utf8", mode: 0o644 });
     io.stdout(`已创建 ${join(directory, "SKILL.md")}`);
+    return 0;
+  }
+  if (action === "pin" || action === "unpin") {
+    const requested = parsed.positionals[2];
+    if (!requested) throw new Error(`用法：deki skills ${action} <path>`);
+    const path = await skillFilePath(resolve(requested));
+    const content = await readFile(path, "utf8");
+    const version = /^---[\s\S]*?^version:\s*(.+?)\s*$[\s\S]*?^---/mu.exec(content)?.[1]?.trim();
+    if (action === "pin" && !version) throw new Error("Skill 未声明 version");
+    await writeFile(
+      path,
+      setSkillFrontmatterValue(content, "pinned-version", action === "pin" ? version : undefined),
+      { encoding: "utf8", mode: 0o600 },
+    );
+    io.stdout(action === "pin" ? `已锁定 Skill 版本 ${version}` : "已解除 Skill 版本锁定");
+    return 0;
+  }
+  if (action === "update") {
+    const requested = parsed.positionals[2];
+    if (!requested) throw new Error("用法：deki skills update <path>");
+    const path = await skillFilePath(resolve(requested));
+    const content = await readFile(path, "utf8");
+    if (/^pinned-version:\s*\S+/mu.test(content)) {
+      throw new Error("Skill 已锁定版本，请先运行 skills unpin");
+    }
+    const source = /^---[\s\S]*?^source:\s*(https:\/\/\S+)\s*$[\s\S]*?^---/mu.exec(content)?.[1];
+    if (!source) throw new Error("Skill 未声明 HTTPS source");
+    const response = await fetch(source);
+    if (!response.ok) throw new Error(`更新源返回 HTTP ${response.status}`);
+    const next = await response.text();
+    if (next.length > 1_000_000) throw new Error("Skill 更新内容超过 1 MB 限制");
+    const currentName = /^---[\s\S]*?^name:\s*(.+?)\s*$[\s\S]*?^---/mu.exec(content)?.[1]?.trim();
+    const nextName = /^---[\s\S]*?^name:\s*(.+?)\s*$[\s\S]*?^---/mu.exec(next)?.[1]?.trim();
+    if (!currentName || currentName !== nextName) throw new Error("更新源的 Skill 名称不一致");
+    const temporary = `${path}.update-${crypto.randomUUID()}`;
+    await writeFile(temporary, next, { encoding: "utf8", mode: 0o600 });
+    await rename(temporary, path);
+    io.stdout(`已更新 ${currentName}`);
     return 0;
   }
   throw new Error(`未知 skills 子命令：${action}`);
@@ -629,6 +668,9 @@ async function discoverSkills(
     join(workspace, ".deki", "skills"),
     join(workspace, ".agents", "skills"),
     join(workspace, ".pi", "skills"),
+    join(homedir(), ".pi", "agent", "skills"),
+    join(homedir(), ".agents", "skills"),
+    join(homedir(), ".codex", "skills"),
     ...globalPaths,
   ];
   const skills: SkillResult[] = [];
@@ -665,6 +707,25 @@ async function validateSkill(path: string): Promise<SkillResult> {
   if (!name) diagnostics.push("缺少 frontmatter name");
   if (!description) diagnostics.push("缺少 frontmatter description");
   return { name, path, valid: diagnostics.length === 0, diagnostics };
+}
+
+function setSkillFrontmatterValue(
+  content: string,
+  key: string,
+  value: string | undefined,
+): string {
+  const frontmatter = /^---\r?\n([\s\S]*?)\r?\n---/u.exec(content);
+  if (!frontmatter) throw new Error("Skill 缺少 YAML frontmatter");
+  const line = new RegExp(`^${key}:.*$`, "mu");
+  let body = frontmatter[1] ?? "";
+  if (value) {
+    body = line.test(body)
+      ? body.replace(line, `${key}: ${value}`)
+      : `${body}\n${key}: ${value}`;
+  } else {
+    body = body.replace(line, "").replaceAll(/\n{3,}/g, "\n\n").trimEnd();
+  }
+  return content.replace(frontmatter[0], `---\n${body}\n---`);
 }
 
 async function skillFilePath(path: string): Promise<string> {
@@ -762,6 +823,8 @@ const helpText = `Deki CLI
   deki skills list [--workspace path]
   deki skills create <name> [--description text]
   deki skills validate <path>
+  deki skills update <path>
+  deki skills pin|unpin <path>
   deki mcp list [--workspace path]
   deki mcp add <id> --command cmd [--arg value] [--cwd relative]
   deki mcp remove <id>

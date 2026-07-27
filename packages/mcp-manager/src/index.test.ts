@@ -1,6 +1,6 @@
 import { resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { McpManager } from "./index";
+import { McpManager, resolveSecretReferences } from "./index";
 
 const managers: McpManager[] = [];
 
@@ -9,6 +9,16 @@ afterEach(async () => {
 });
 
 describe("McpManager", () => {
+  it("resolves explicit secret references", async () => {
+    await expect(resolveSecretReferences({
+      TOKEN: "${secret:DEKI_TEST_TOKEN}",
+      MODE: "local",
+    }, (name) => name === "DEKI_TEST_TOKEN" ? "resolved-value" : undefined))
+      .resolves.toEqual({ TOKEN: "resolved-value", MODE: "local" });
+    await expect(resolveSecretReferences({
+      TOKEN: "${secret:MISSING_TOKEN}",
+    }, () => undefined)).rejects.toThrow("MISSING_TOKEN");
+  });
   it("starts a stdio server, lists tools, and normalizes success and error results", async () => {
     const manager = new McpManager();
     managers.push(manager);

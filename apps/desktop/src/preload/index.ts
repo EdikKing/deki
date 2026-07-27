@@ -20,10 +20,14 @@ import {
   modelProviderCatalogResultSchema,
   redactedModelProviderSchema,
   conversationMessageSchema,
+  forkSessionInputSchema,
   renameSessionInputSchema,
   sessionIdInputSchema,
+  sessionHistoryStateSchema,
+  sessionSearchInputSchema,
   sessionSummarySchema,
   skillStatusSchema,
+  skillActionInputSchema,
   settingsPatchSchema,
   settingsScopeSchema,
   settingsSnapshotSchema,
@@ -71,14 +75,30 @@ const api: DekiDesktopApi = {
       await ipcRenderer.invoke(IPC_CHANNELS.newSession),
     );
   },
-  async listSessions() {
+  async listSessions(query) {
     return sessionSummarySchema.array().parse(
-      await ipcRenderer.invoke(IPC_CHANNELS.listSessions),
+      await ipcRenderer.invoke(
+        IPC_CHANNELS.listSessions,
+        sessionSearchInputSchema.parse({ query: query ?? "" }),
+      ),
     );
   },
   async getSessionHistory() {
     return conversationMessageSchema.array().parse(
       await ipcRenderer.invoke(IPC_CHANNELS.getSessionHistory),
+    );
+  },
+  async getSessionHistoryState() {
+    return sessionHistoryStateSchema.parse(
+      await ipcRenderer.invoke(IPC_CHANNELS.getSessionHistoryState),
+    );
+  },
+  async forkSession(entryId) {
+    return commandResultSchema.parse(
+      await ipcRenderer.invoke(
+        IPC_CHANNELS.forkSession,
+        forkSessionInputSchema.parse({ entryId }),
+      ),
     );
   },
   async switchSession(id) {
@@ -213,6 +233,11 @@ const api: DekiDesktopApi = {
       await ipcRenderer.invoke(IPC_CHANNELS.openThirdPartyLicenses),
     );
   },
+  async checkForUpdates() {
+    return commandResultSchema.parse(
+      await ipcRenderer.invoke(IPC_CHANNELS.checkForUpdates),
+    );
+  },
   async listMcpServers() {
     return mcpServerEditorSchema.array().parse(
       await ipcRenderer.invoke(IPC_CHANNELS.listMcpServers),
@@ -269,6 +294,25 @@ const api: DekiDesktopApi = {
   async reloadSkills() {
     return commandResultSchema.parse(
       await ipcRenderer.invoke(IPC_CHANNELS.reloadSkills),
+    );
+  },
+  async updateSkill(path) {
+    return commandResultSchema.parse(
+      await ipcRenderer.invoke(
+        IPC_CHANNELS.updateSkill,
+        skillActionInputSchema.parse({ path }),
+      ),
+    );
+  },
+  async pinSkillVersion(path, version) {
+    return commandResultSchema.parse(
+      await ipcRenderer.invoke(
+        IPC_CHANNELS.pinSkillVersion,
+        skillActionInputSchema.parse({
+          path,
+          pinnedVersion: version ?? null,
+        }),
+      ),
     );
   },
   async updateMemory(input) {

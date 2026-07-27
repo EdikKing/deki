@@ -46,36 +46,53 @@ export function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [approval, setApproval] = useState<Extract<AgentEvent, { type: "approval.requested" }>>();
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [sessionQuery, setSessionQuery] = useState("");
   const [expandedProjectKey, setExpandedProjectKey] = useState<string>(GENERAL_PROJECT_KEY);
   const [settingsSection, setSettingsSection] = useState<"models">();
   const [compactLayout, setCompactLayout] = useState(() => window.innerWidth <= 980);
   const [inspectorOpen, setInspectorOpen] = useState(() => window.innerWidth > 980);
   const [inspectorWidth, setInspectorWidth] = useState(330);
+  const activeSessionId = useRef<string | undefined>(undefined);
 
   async function refresh() {
     setState(await window.deki.getBootstrapState());
   }
 
-  async function refreshSessions() {
-    setSessions(await window.deki.listSessions());
+  async function refreshSessions(query = sessionQuery) {
+    setSessions(await window.deki.listSessions(query));
   }
 
   useEffect(() => {
     void refresh().catch((reason) => setError(String(reason)));
     void window.deki.getSettings().then(setSettings).catch((reason) => setError(String(reason)));
     const unsubscribeAgent = window.deki.subscribeAgentEvents((event) => {
-      setEvents((current) => [...current.slice(-199), event]);
-      if (event.type === "message.delta") {
+      const belongsToActiveSession = !event.sessionId
+        || !activeSessionId.current
+        || event.sessionId === activeSessionId.current;
+      if (belongsToActiveSession) {
+        setEvents((current) => [...current.slice(-199), event]);
+      }
+      if (belongsToActiveSession && event.type === "message.delta") {
         setMessages((current) => appendAssistantDelta(current, event.delta, "content", event));
       }
-      if (event.type === "message.reasoning.delta") {
+      if (belongsToActiveSession && event.type === "message.reasoning.delta") {
         setMessages((current) => appendAssistantDelta(current, event.delta, "reasoning", event));
       }
-      if (event.type === "run.completed" || event.type === "run.failed") {
+      if (belongsToActiveSession && event.type === "run.started") setBusy(true);
+      if (belongsToActiveSession && event.type === "command.result") {
+        setMessages((current) => [...current, {
+          id: event.eventId,
+          role: "assistant",
+          content: event.output,
+          timestamp: event.timestamp,
+        }]);
         setBusy(false);
-        void refreshSessions();
       }
-      if (event.type === "run.failed") {
+      if (belongsToActiveSession && (event.type === "run.completed" || event.type === "run.failed")) {
+        setBusy(false);
+      }
+      if (event.type === "run.completed" || event.type === "run.failed") void refreshSessions();
+      if (belongsToActiveSession && event.type === "run.failed") {
         setError(event.error);
       }
       if (event.type === "approval.requested") setApproval(event);
@@ -114,15 +131,36 @@ export function App() {
 
   useEffect(() => {
     if (!state) return;
+    activeSessionId.current = state.sessionId;
     void refreshSessions().catch((reason) => setError(String(reason)));
     if (!state.sessionId) {
       setMessages([]);
       return;
     }
-    void window.deki.getSessionHistory()
-      .then(setMessages)
+    void window.deki.getSessionHistoryState()
+      .then((history) => {
+        setMessages(history.messages);
+        setEvents(history.events);
+        setBusy(history.runState === "running");
+        const pending = [...history.events].reverse().find(
+          (event): event is Extract<AgentEvent, { type: "approval.requested" }> =>
+            event.type === "approval.requested"
+            && !history.events.some(
+              (candidate) => candidate.type === "approval.resolved"
+                && candidate.requestId === event.requestId,
+            ),
+        );
+        setApproval(pending);
+      })
       .catch((reason) => setError(String(reason)));
   }, [state?.trusted, state?.workspace, state?.sessionId]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      void refreshSessions(sessionQuery).catch((reason) => setError(String(reason)));
+    }, 150);
+    return () => window.clearTimeout(timer);
+  }, [sessionQuery]);
 
   useEffect(() => {
     if (!state) return;
@@ -169,9 +207,7 @@ export function App() {
   );
   const locale = resolveLocale(settings);
   const zh = locale === "zh-CN";
-  const isRememberCommand = Boolean(
-    state?.workspace || settings?.effective.memory.userMemoryEnabled,
-  ) && prompt.trimStart().startsWith("/remember ");
+  const isSessionCommand = prompt.trimStart().startsWith("/");
   const canRemember = Boolean(
     state?.workspace || settings?.effective.memory.userMemoryEnabled,
   );
@@ -244,26 +280,38 @@ export function App() {
 
   async function submit() {
     const value = prompt.trim();
-    if (!value || busy) return;
-    const rememberCommand = value.startsWith("/remember ");
+    if (!value || (busy && (settings?.effective.agent.maxConcurrentRuns ?? 1) <= 1)) return;
+    const concurrentBranch = busy;
+    const sessionCommand = value.startsWith("/");
     setPrompt("");
     setError(undefined);
-    setMessages((current) => [
-      ...current,
-      {
-        id: crypto.randomUUID(),
-        role: "user",
-        content: value,
-        timestamp: new Date().toISOString(),
-      },
-    ]);
+    if (!concurrentBranch) {
+      setMessages((current) => [
+        ...current,
+        {
+          id: crypto.randomUUID(),
+          role: "user",
+          content: value,
+          timestamp: new Date().toISOString(),
+        },
+      ]);
+    }
     setBusy(true);
     const result = await window.deki.sendPrompt(value);
-    if (!result.ok || rememberCommand) {
+    if (!result.ok || sessionCommand) {
       setBusy(false);
     }
     if (!result.ok) {
       setError(result.error ?? "请求失败");
+    } else if (concurrentBranch) {
+      setMessages((current) => [...current, {
+        id: crypto.randomUUID(),
+        role: "assistant",
+        content: zh
+          ? "已从当前上下文创建并发分叉；运行结果会出现在新的会话中。"
+          : "Created a concurrent fork from the current context; its result will appear in a new chat.",
+        timestamp: new Date().toISOString(),
+      }]);
     }
     await refresh();
   }
@@ -397,7 +445,10 @@ export function App() {
                               }}
                             >
                               <strong>{session.name || session.firstMessage || (zh ? "新会话" : "New chat")}</strong>
-                              <time dateTime={session.updatedAt}>{formatRelativeTime(session.updatedAt, zh)}</time>
+                              <time dateTime={session.updatedAt}>
+                                {session.runState !== "idle" ? `${session.runState} · ` : ""}
+                                {formatRelativeTime(session.updatedAt, zh)}
+                              </time>
                             </button>
                             <div className="session-actions">
                               <button
@@ -420,6 +471,12 @@ export function App() {
                             </div>
                           </div>
                         ))}
+                        <input
+                          className="session-search"
+                          value={sessionQuery}
+                          onChange={(event) => setSessionQuery(event.target.value)}
+                          placeholder={zh ? "搜索会话…" : "Search chats…"}
+                        />
                         {sessions.length === 0 && (
                           <button className="session-tree-item placeholder" disabled>
                             <strong>{zh ? "新会话" : "New chat"}</strong>
@@ -524,6 +581,16 @@ export function App() {
                   selectedModel={state.selectedModel}
                   showReasoning={settings?.effective.agent.showThinkingSummary ?? true}
                   zh={zh}
+                  {...(message.entryId
+                    ? { onFork: () => void runCommand(
+                        window.deki.forkSession(message.entryId!),
+                        setError,
+                        async () => {
+                          await refresh();
+                          await refreshSessions();
+                        },
+                      ) }
+                    : {})}
                 />
               ))}
               {toolActivities.length > 0 && (
@@ -539,7 +606,7 @@ export function App() {
                 <textarea
                   className="composer-input"
                   value={prompt}
-                  disabled={busy}
+                  disabled={busy && (settings?.effective.agent.maxConcurrentRuns ?? 1) <= 1}
                   placeholder={state.ready
                     ? (zh
                         ? "输入消息…（Enter 发送，Shift+Enter 换行，/remember 保存记忆）"
@@ -602,7 +669,18 @@ export function App() {
                     >
                       <span className="navigation-icon folder-icon" aria-hidden="true" />
                     </button>
-                    {busy ? (
+                    {busy ? (<>
+                      {(settings?.effective.agent.maxConcurrentRuns ?? 1) > 1 && (
+                        <button
+                          className="composer-submit primary"
+                          aria-label={zh ? "并发提交" : "Submit concurrently"}
+                          title={zh ? "提交为并发后续运行" : "Submit as another run"}
+                          disabled={!prompt.trim()}
+                          onClick={() => void submit()}
+                        >
+                          <span aria-hidden="true">↑</span>
+                        </button>
+                      )}
                       <button
                         className="composer-submit danger"
                         aria-label={zh ? "停止" : "Stop"}
@@ -611,12 +689,12 @@ export function App() {
                       >
                         <span aria-hidden="true">■</span>
                       </button>
-                    ) : (
+                    </>) : (
                       <button
                         className="composer-submit primary"
                         aria-label={zh ? "发送" : "Send"}
                         title={zh ? "发送" : "Send"}
-                        disabled={!state.ready && !isRememberCommand}
+                        disabled={!state.ready && !isSessionCommand}
                         onClick={() => void submit()}
                       >
                         <span aria-hidden="true">↑</span>
@@ -694,6 +772,19 @@ export function App() {
             )}
 
             <Panel title={zh ? "运行状态" : "Runtime status"} count={state.skills.length + state.mcpServers.length}>
+              {state.modelUsage && <>
+                <StatusLine
+                  label={zh ? "上下文" : "Context"}
+                  value={state.modelUsage.contextTokens === null
+                    ? `— / ${state.modelUsage.contextWindow.toLocaleString()}`
+                    : `${state.modelUsage.contextTokens.toLocaleString()} / ${state.modelUsage.contextWindow.toLocaleString()} (${Math.round(state.modelUsage.percent ?? 0)}%)`}
+                />
+                <StatusLine
+                  label="Tokens"
+                  value={`↑ ${state.modelUsage.inputTokens.toLocaleString()} · ↓ ${state.modelUsage.outputTokens.toLocaleString()} · ${zh ? "剩余" : "remaining"} ${state.modelUsage.remainingTokens?.toLocaleString() ?? "—"}`}
+                />
+              </>}
+              <StatusLine label={zh ? "运行" : "Runs"} value={`${state.activeRunCount}`} />
               <StatusLine label="Skills" value={state.skills.join(", ") || (zh ? "未加载" : "Not loaded")} />
               <StatusLine
                 label="MCP"
@@ -745,6 +836,7 @@ function ConversationTurn(props: {
   selectedModel: ModelSummary | undefined;
   showReasoning: boolean;
   zh: boolean;
+  onFork?: () => void;
 }) {
   const assistant = props.message.role === "assistant";
   const model = assistant
@@ -797,6 +889,15 @@ function ConversationTurn(props: {
           >
             <span className="copy-message-icon" aria-hidden="true" />
           </button>
+          {props.onFork && (
+            <button
+              aria-label={props.zh ? "从此消息分叉会话" : "Fork chat from this message"}
+              title={props.zh ? "从此消息分叉" : "Fork from this message"}
+              onClick={props.onFork}
+            >
+              <span aria-hidden="true">⑂</span>
+            </button>
+          )}
         </div>
       </div>
     </article>

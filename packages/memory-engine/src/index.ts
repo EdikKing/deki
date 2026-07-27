@@ -71,6 +71,9 @@ export class MemoryEngine {
     source: MemorySource;
     type?: MemoryRecord["type"];
     status?: MemoryRecord["status"];
+    confidence?: number;
+    expiresAt?: string;
+    lowConfidenceArchiveThreshold?: number;
   }): MemoryRecord {
     const content = input.content.trim();
     if (!content) {
@@ -81,6 +84,13 @@ export class MemoryEngine {
     }
 
     const now = new Date().toISOString();
+    const confidence = input.confidence ?? 1;
+    const expired = input.expiresAt !== undefined
+      && Date.parse(input.expiresAt) <= Date.now();
+    const lowConfidence = confidence < (input.lowConfidenceArchiveThreshold ?? 0.45);
+    const status = expired || lowConfidence
+      ? "archived"
+      : input.status ?? "active";
     const memory = memoryRecordSchema.parse({
       id: randomUUID(),
       scope: input.scope,
@@ -88,19 +98,20 @@ export class MemoryEngine {
       type: input.type ?? "fact",
       content,
       source: input.source,
-      confidence: 1,
+      confidence,
       createdAt: now,
       updatedAt: now,
+      ...(input.expiresAt ? { expiresAt: input.expiresAt } : {}),
       pinned: false,
       sensitive: false,
-      status: input.status ?? "active",
+      status,
     });
 
     this.#database.prepare(`
       INSERT INTO memories (
         id, scope, scope_id, type, content, source_json, confidence,
         created_at, updated_at, last_used_at, expires_at, pinned, sensitive, status
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
     `).run(
       memory.id,
       memory.scope,
@@ -111,11 +122,13 @@ export class MemoryEngine {
       memory.confidence,
       memory.createdAt,
       memory.updatedAt,
+      memory.expiresAt ?? null,
       Number(memory.pinned),
       Number(memory.sensitive),
       memory.status,
     );
     this.#indexMemory(memory.id, memory.content);
+    if (memory.status === "active") this.#supersedeConflicts(memory);
 
     return memory;
   }
@@ -129,6 +142,7 @@ export class MemoryEngine {
     scopeId: string,
     options: { limit?: number; status?: MemoryRecord["status"]; query?: string } = {},
   ): MemoryRecord[] {
+    this.archiveExpiredMemories();
     const limit = options.limit ?? 100;
     const status = options.status ?? "active";
     const query = options.query?.trim();
@@ -192,7 +206,14 @@ export class MemoryEngine {
     scope: MemoryScope,
     scopeId: string,
     id: string,
-    patch: { content?: string; pinned?: boolean; status?: MemoryRecord["status"] },
+    patch: {
+      content?: string;
+      pinned?: boolean;
+      status?: MemoryRecord["status"];
+      type?: MemoryRecord["type"];
+      confidence?: number;
+      expiresAt?: string | null;
+    },
   ): MemoryRecord {
     const current = this.#getMemory(scope, scopeId, id);
     if (!current) throw new Error("未找到记忆");
@@ -202,10 +223,14 @@ export class MemoryEngine {
     const updatedAt = new Date().toISOString();
     this.#database.prepare(`
       UPDATE memories
-      SET content = ?, pinned = ?, status = ?, updated_at = ?
+      SET content = ?, type = ?, confidence = ?, expires_at = ?,
+          pinned = ?, status = ?, updated_at = ?
       WHERE id = ? AND scope = ? AND scope_id = ?
     `).run(
       content,
+      patch.type ?? current.type,
+      patch.confidence ?? current.confidence,
+      patch.expiresAt === undefined ? current.expiresAt ?? null : patch.expiresAt,
       Number(patch.pinned ?? current.pinned),
       patch.status ?? current.status,
       updatedAt,
@@ -214,7 +239,9 @@ export class MemoryEngine {
       scopeId,
     );
     this.#indexMemory(id, content);
-    return this.#getMemory(scope, scopeId, id)!;
+    const updated = this.#getMemory(scope, scopeId, id)!;
+    if (updated.status === "active") this.#supersedeConflicts(updated);
+    return updated;
   }
 
   moveMemory(
@@ -257,7 +284,11 @@ export class MemoryEngine {
   recallProjectMemories(
     scopeId: string,
     query: string,
-    options: { limit?: number; characterBudget?: number } = {},
+    options: {
+      limit?: number;
+      tokenBudget?: number;
+      characterBudget?: number;
+    } = {},
   ): MemoryRecord[] {
     return this.recallMemories("project", scopeId, query, options);
   }
@@ -266,10 +297,16 @@ export class MemoryEngine {
     scope: MemoryScope,
     scopeId: string,
     query: string,
-    options: { limit?: number; characterBudget?: number } = {},
+    options: {
+      limit?: number;
+      tokenBudget?: number;
+      characterBudget?: number;
+    } = {},
   ): MemoryRecord[] {
+    this.archiveExpiredMemories();
     const limit = options.limit ?? 3;
-    const characterBudget = options.characterBudget ?? 1_200;
+    const tokenBudget = options.tokenBudget
+      ?? Math.max(0, Math.floor((options.characterBudget ?? 1_200) / 4));
     const queryTerms = extractTerms(query);
     const indexedRows = queryTerms.size > 0
       ? this.#searchIndex(scope, scopeId, query, Math.max(100, limit * 25), "active")
@@ -291,13 +328,14 @@ export class MemoryEngine {
       .sort((a, b) => b.score - a.score || b.memory.updatedAt.localeCompare(a.memory.updatedAt));
 
     const selected: MemoryRecord[] = [];
-    let usedCharacters = 0;
+    let usedTokens = 0;
     for (const { memory, score } of ranked) {
       if (selected.length >= limit) break;
       if (queryTerms.size > 0 && score <= 0.5) continue;
-      if (usedCharacters + memory.content.length > characterBudget) continue;
+      const tokens = estimateMemoryTokens(memory.content);
+      if (usedTokens + tokens > tokenBudget) continue;
       selected.push(memory);
-      usedCharacters += memory.content.length;
+      usedTokens += tokens;
     }
 
     if (selected.length > 0) {
@@ -313,6 +351,55 @@ export class MemoryEngine {
     return selected;
   }
 
+  archiveExpiredMemories(now = new Date()): number {
+    return Number(this.#database.prepare(`
+      UPDATE memories
+      SET status = 'archived', updated_at = ?
+      WHERE status IN ('active', 'pending')
+        AND expires_at IS NOT NULL
+        AND expires_at <= ?
+    `).run(now.toISOString(), now.toISOString()).changes);
+  }
+
+  governMemories(lowConfidenceThreshold = 0.45): {
+    expired: number;
+    lowConfidence: number;
+    superseded: number;
+  } {
+    const expired = this.archiveExpiredMemories();
+    const now = new Date().toISOString();
+    const lowConfidence = Number(this.#database.prepare(`
+      UPDATE memories
+      SET status = 'archived', updated_at = ?
+      WHERE status IN ('active', 'pending') AND pinned = 0 AND confidence < ?
+    `).run(now, lowConfidenceThreshold).changes);
+    let superseded = 0;
+    const rows = this.#database.prepare(`
+      SELECT * FROM memories
+      WHERE status = 'active'
+      ORDER BY updated_at DESC
+    `).all() as unknown as MemoryRow[];
+    const canonical: MemoryRecord[] = [];
+    for (const row of rows) {
+      const memory = rowToMemory(row);
+      const conflict = canonical.some((current) =>
+        current.scope === memory.scope
+        && current.scopeId === memory.scopeId
+        && current.type === memory.type
+        && memoriesConflict(current.content, memory.content));
+      if (conflict && !memory.pinned) {
+        superseded += Number(this.#database.prepare(`
+          UPDATE memories
+          SET status = 'superseded', updated_at = ?
+          WHERE id = ? AND status = 'active'
+        `).run(now, memory.id).changes);
+      } else {
+        canonical.push(memory);
+      }
+    }
+    return { expired, lowConfidence, superseded };
+  }
+
   close(): void {
     this.#database.close();
   }
@@ -326,6 +413,30 @@ export class MemoryEngine {
       SELECT * FROM memories WHERE id = ? AND scope = ? AND scope_id = ?
     `).get(id, scope, scopeId) as unknown as MemoryRow | undefined;
     return row ? rowToMemory(row) : undefined;
+  }
+
+  #supersedeConflicts(next: MemoryRecord): number {
+    if (next.type !== "preference" && next.type !== "decision" && next.type !== "fact") {
+      return 0;
+    }
+    const candidates = this.#database.prepare(`
+      SELECT * FROM memories
+      WHERE scope = ? AND scope_id = ? AND type = ? AND status = 'active' AND id != ?
+      ORDER BY updated_at DESC
+      LIMIT 100
+    `).all(next.scope, next.scopeId, next.type, next.id) as unknown as MemoryRow[];
+    const now = new Date().toISOString();
+    let changed = 0;
+    for (const row of candidates) {
+      const previous = rowToMemory(row);
+      if (!memoriesConflict(previous.content, next.content)) continue;
+      changed += Number(this.#database.prepare(`
+        UPDATE memories
+        SET status = 'superseded', updated_at = ?
+        WHERE id = ? AND status = 'active' AND pinned = 0
+      `).run(now, previous.id).changes);
+    }
+    return changed;
   }
 
   #searchIndex(
@@ -519,6 +630,31 @@ function scoreMemory(memory: MemoryRecord, queryTerms: Set<string>): number {
     ? 2
     : 0;
   return overlap + direct + (memory.pinned ? 2 : 0);
+}
+
+export function estimateMemoryTokens(value: string): number {
+  const normalized = value.normalize("NFKC");
+  const cjk = normalized.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/gu)?.length ?? 0;
+  const nonCjk = normalized.replaceAll(
+    /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/gu,
+    "",
+  );
+  const words = nonCjk.match(/[\p{L}\p{N}_]+|[^\s\p{L}\p{N}_]/gu)?.length ?? 0;
+  return Math.max(1, cjk + words);
+}
+
+function memoriesConflict(left: string, right: string): boolean {
+  const leftTerms = extractTerms(left);
+  const rightTerms = extractTerms(right);
+  if (leftTerms.size === 0 || rightTerms.size === 0) return false;
+  let overlap = 0;
+  for (const term of leftTerms) {
+    if (rightTerms.has(term)) overlap += 1;
+  }
+  const similarity = overlap / Math.min(leftTerms.size, rightTerms.size);
+  const different = left.normalize("NFKC").trim().toLocaleLowerCase()
+    !== right.normalize("NFKC").trim().toLocaleLowerCase();
+  return different && similarity >= 0.7;
 }
 
 function recencyScore(updatedAt: string): number {

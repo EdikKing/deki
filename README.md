@@ -9,14 +9,15 @@
 - Electron + React 中文桌面界面
 - 无需项目即可使用的普通会话模式
 - Pi `AgentSessionRuntime` 流式消息和工具事件
-- 会话搜索、恢复、切换、重命名、删除与保留期限清理
+- 会话全文搜索、消息级分叉、异常中断恢复、完整 Tool/Diff/审批 Timeline 恢复
 - 工作区信任门禁
 - 受控工作区工具：`read`、`grep`、`find`、`ls`、`edit`、`write`、`delete`、`move`、`bash`
-- stdio MCP Server 的配置、启停、重启、测试、Tool 权限/开关/超时和本机环境变量
-- `.deki/skills`、`.agents/skills`、项目内 `.pi/skills` 的发现、校验和重载
-- `/remember`、`/remember --task`、待确认记忆候选和用户/项目/任务记忆中心
-- 本地 SQLite 全文/倒排索引、逐轮混合召回和 Pi JSONL 会话
+- stdio MCP Server 的配置、健康检查、自动重启/重连、Secret 引用和 Tool 级策略
+- 项目及 Pi/Agents/Codex 全局兼容目录的 Skill 发现、校验、版本锁定和来源更新
+- 完整会话命令集、待确认记忆候选和 user/project/workspace/branch/task 记忆中心
+- 本地 SQLite 全文/倒排索引、Token Budget、冲突/过期/低置信度治理和 Pi JSONL 会话
 - 内置常用云模型 Provider 与自定义 OpenAI 兼容 Provider
+- 上下文占用、输入/输出 Token、剩余上下文统计和分叉式真正并发运行
 - 全局、项目共享、项目本机和会话设置、字段来源及修订冲突保护
 - 受权限网关保护的文件修改、Shell、MCP、完整 Diff Viewer、历史审计与脱敏诊断
 - 自有 `deki` CLI：启动/恢复、doctor、模型、Skill、MCP、权限、审计与 Checkpoint 管理

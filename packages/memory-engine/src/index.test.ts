@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   containsSensitiveData,
+  estimateMemoryTokens,
   MemoryEngine,
   SensitiveMemoryError,
 } from "./index";
@@ -156,6 +157,66 @@ describe("MemoryEngine", () => {
       "project-a",
     );
     expect(moved).toMatchObject({ scope: "project", scopeId: "project-a" });
+  });
+
+  it("supports workspace and branch scopes with token budgets", async () => {
+    const engine = await createEngine();
+    engine.createMemory({
+      scope: "workspace",
+      scopeId: "workspace-a",
+      content: "Use pnpm for dependency management",
+      source: { kind: "user_command" },
+    });
+    engine.createMemory({
+      scope: "branch",
+      scopeId: "workspace-a:feature",
+      content: "The feature branch is migrating checkout",
+      source: { kind: "user_command" },
+    });
+    expect(engine.recallMemories("workspace", "workspace-a", "pnpm", {
+      tokenBudget: 20,
+    })).toHaveLength(1);
+    expect(engine.recallMemories("branch", "workspace-a:feature", "checkout", {
+      tokenBudget: 2,
+    })).toHaveLength(0);
+    expect(estimateMemoryTokens("你好 world")).toBeGreaterThanOrEqual(3);
+  });
+
+  it("archives expired and low-confidence memories and supersedes conflicts", async () => {
+    const engine = await createEngine();
+    const expired = engine.createMemory({
+      scope: "user",
+      scopeId: "user",
+      content: "expired preference",
+      type: "preference",
+      source: { kind: "migration" },
+      expiresAt: "2020-01-01T00:00:00.000Z",
+    });
+    const low = engine.createMemory({
+      scope: "user",
+      scopeId: "user",
+      content: "uncertain fact",
+      source: { kind: "agent_candidate" },
+      confidence: 0.2,
+    });
+    const previous = engine.createMemory({
+      scope: "user",
+      scopeId: "user",
+      content: "Preferred package manager is npm for this project",
+      type: "preference",
+      source: { kind: "user_command" },
+    });
+    engine.createMemory({
+      scope: "user",
+      scopeId: "user",
+      content: "Preferred package manager is pnpm for this project",
+      type: "preference",
+      source: { kind: "user_command" },
+    });
+    expect(expired.status).toBe("archived");
+    expect(low.status).toBe("archived");
+    expect(engine.listMemories("user", "user", { status: "superseded" })
+      .map((memory) => memory.id)).toContain(previous.id);
   });
 
   it("migrates an existing v1 database and indexes its content", async () => {

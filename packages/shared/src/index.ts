@@ -61,6 +61,9 @@ const mcpSettingsSchema = z.object({
   startEnabledServers: z.boolean(),
   startupTimeoutMs: z.number().int(),
   callTimeoutMs: z.number().int(),
+  healthCheckIntervalMs: z.number().int(),
+  autoRestart: z.boolean(),
+  maxReconnectAttempts: z.number().int(),
   toolPolicies: z.record(z.string(), permissionPolicySchema),
 }).strict();
 const skillsSettingsSchema = z.object({
@@ -71,15 +74,25 @@ const skillsSettingsSchema = z.object({
 const memorySettingsSchema = z.object({
   userMemoryEnabled: z.boolean(),
   projectMemoryEnabled: z.boolean(),
+  workspaceMemoryEnabled: z.boolean(),
+  branchMemoryEnabled: z.boolean(),
   taskMemoryEnabled: z.boolean(),
   automaticCandidates: z.boolean(),
   candidateConfirmationRequired: z.literal(true),
   userRecallLimit: z.number().int(),
   userCharacterBudget: z.number().int(),
+  userTokenBudget: z.number().int(),
   projectRecallLimit: z.number().int(),
   projectCharacterBudget: z.number().int(),
+  projectTokenBudget: z.number().int(),
+  workspaceRecallLimit: z.number().int(),
+  workspaceTokenBudget: z.number().int(),
+  branchRecallLimit: z.number().int(),
+  branchTokenBudget: z.number().int(),
   taskRecallLimit: z.number().int(),
   taskCharacterBudget: z.number().int(),
+  taskTokenBudget: z.number().int(),
+  lowConfidenceArchiveThreshold: z.number(),
   sensitiveFilter: z.literal(true),
 }).strict();
 const privacySettingsSchema = z.object({
@@ -187,6 +200,7 @@ export const modelSummarySchema = z.object({
   provider: z.string(),
   id: z.string(),
   name: z.string(),
+  contextWindow: z.number().int().positive().optional(),
 });
 
 export type ModelSummary = z.infer<typeof modelSummarySchema>;
@@ -199,11 +213,14 @@ export const sessionSummarySchema = z.object({
   messageCount: z.number().int().nonnegative(),
   firstMessage: z.string(),
   current: z.boolean(),
+  parentSessionId: z.string().optional(),
+  runState: z.enum(["idle", "running", "interrupted", "failed"]).default("idle"),
 }).strict();
 export type SessionSummary = z.infer<typeof sessionSummarySchema>;
 
 export const conversationMessageSchema = z.object({
   id: z.string(),
+  entryId: z.string().optional(),
   role: z.enum(["user", "assistant"]),
   content: z.string(),
   reasoning: z.string().optional(),
@@ -221,7 +238,7 @@ export const memorySourceSchema = z.object({
 
 export type MemorySource = z.infer<typeof memorySourceSchema>;
 
-export const memoryScopeSchema = z.enum(["user", "project", "task"]);
+export const memoryScopeSchema = z.enum(["user", "project", "workspace", "branch", "task"]);
 export type MemoryScope = z.infer<typeof memoryScopeSchema>;
 
 export const memoryRecordSchema = z.object({
@@ -245,9 +262,11 @@ export type MemoryRecord = z.infer<typeof memoryRecordSchema>;
 
 export const serverStatusSchema = z.object({
   id: z.string(),
-  state: z.enum(["stopped", "starting", "ready", "error"]),
+  state: z.enum(["stopped", "starting", "ready", "degraded", "reconnecting", "error"]),
   toolCount: z.number().int().nonnegative(),
   error: z.string().optional(),
+  lastCheckedAt: z.string().optional(),
+  reconnectAttempt: z.number().int().nonnegative().optional(),
 });
 
 export type ServerStatus = z.infer<typeof serverStatusSchema>;
@@ -265,6 +284,17 @@ export const bootstrapStateSchema = z.object({
   mcpServers: z.array(serverStatusSchema),
   skills: z.array(z.string()),
   diagnostics: z.array(z.string()),
+  modelUsage: z.object({
+    inputTokens: z.number().int().nonnegative(),
+    outputTokens: z.number().int().nonnegative(),
+    cacheReadTokens: z.number().int().nonnegative(),
+    cacheWriteTokens: z.number().int().nonnegative(),
+    contextTokens: z.number().int().nonnegative().nullable(),
+    contextWindow: z.number().int().positive(),
+    remainingTokens: z.number().int().nonnegative().nullable(),
+    percent: z.number().nonnegative().nullable(),
+  }).optional(),
+  activeRunCount: z.number().int().nonnegative().default(0),
   recentWorkspaces: z.array(z.string()).default([]),
 });
 
@@ -334,6 +364,10 @@ export const agentEventSchema = z.discriminatedUnion("type", [
   }),
   z.object({
     ...eventBase,
+    type: z.literal("run.started"),
+  }),
+  z.object({
+    ...eventBase,
     type: z.literal("run.completed"),
   }),
   z.object({
@@ -375,6 +409,13 @@ export const agentEventSchema = z.discriminatedUnion("type", [
     type: z.literal("audit.recorded"),
     recordId: z.string(),
   }),
+  z.object({
+    ...eventBase,
+    type: z.literal("command.result"),
+    command: z.string(),
+    input: z.string().optional(),
+    output: z.string(),
+  }),
 ]);
 
 export type AgentEvent = z.infer<typeof agentEventSchema>;
@@ -399,6 +440,18 @@ export const selectModelInputSchema = z.object({
 export const sessionIdInputSchema = z.object({
   id: z.string().trim().min(1).max(200),
 }).strict();
+export const sessionSearchInputSchema = z.object({
+  query: z.string().trim().max(1_000).default(""),
+}).strict();
+export const forkSessionInputSchema = z.object({
+  entryId: z.string().trim().min(1).max(200),
+}).strict();
+export const sessionHistoryStateSchema = z.object({
+  messages: z.array(conversationMessageSchema),
+  events: z.array(agentEventSchema),
+  runState: z.enum(["idle", "running", "interrupted", "failed"]),
+}).strict();
+export type SessionHistoryState = z.infer<typeof sessionHistoryStateSchema>;
 export const renameSessionInputSchema = z.object({
   id: z.string().trim().min(1).max(200),
   name: z.string().trim().min(1).max(120),
@@ -447,9 +500,11 @@ export const mcpServerEditorSchema = z.object({
     permission: permissionPolicySchema.optional(),
     timeoutMs: z.number().int().min(1_000).max(600_000).optional(),
   }).strict()).default({}),
-  state: z.enum(["stopped", "starting", "ready", "error"]).optional(),
+  state: z.enum(["stopped", "starting", "ready", "degraded", "reconnecting", "error"]).optional(),
   toolCount: z.number().int().nonnegative().optional(),
   error: z.string().optional(),
+  lastCheckedAt: z.string().optional(),
+  reconnectAttempt: z.number().int().nonnegative().optional(),
 }).strict();
 export type McpServerEditor = z.infer<typeof mcpServerEditorSchema>;
 export const mcpToolSummarySchema = z.object({
@@ -469,8 +524,16 @@ export const skillStatusSchema = z.object({
   valid: z.boolean(),
   trusted: z.boolean(),
   diagnostics: z.array(z.string()),
+  version: z.string().optional(),
+  pinnedVersion: z.string().optional(),
+  sourceUrl: z.string().optional(),
+  updateAvailable: z.boolean().optional(),
 }).strict();
 export type SkillStatus = z.infer<typeof skillStatusSchema>;
+export const skillActionInputSchema = z.object({
+  path: z.string().trim().min(1).max(10_000),
+  pinnedVersion: z.string().trim().min(1).max(100).nullable().optional(),
+}).strict();
 
 export const memoryMutationSchema = z.object({
   id: z.string(),
@@ -544,6 +607,8 @@ export const IPC_CHANNELS = {
   newSession: "deki:new-session",
   listSessions: "deki:list-sessions",
   getSessionHistory: "deki:get-session-history",
+  getSessionHistoryState: "deki:get-session-history-state",
+  forkSession: "deki:fork-session",
   switchSession: "deki:switch-session",
   renameSession: "deki:rename-session",
   deleteSession: "deki:delete-session",
@@ -563,6 +628,7 @@ export const IPC_CHANNELS = {
   exportDiagnostics: "deki:export-diagnostics",
   openDataDirectory: "deki:open-data-directory",
   openThirdPartyLicenses: "deki:open-third-party-licenses",
+  checkForUpdates: "deki:check-for-updates",
   listMcpServers: "deki:list-mcp-servers",
   upsertMcpServer: "deki:upsert-mcp-server",
   removeMcpServer: "deki:remove-mcp-server",
@@ -574,6 +640,8 @@ export const IPC_CHANNELS = {
   listMcpServerTools: "deki:list-mcp-server-tools",
   listSkills: "deki:list-skills",
   reloadSkills: "deki:reload-skills",
+  updateSkill: "deki:update-skill",
+  pinSkillVersion: "deki:pin-skill-version",
   updateMemory: "deki:update-memory",
   deleteMemory: "deki:delete-memory",
   clearMemoryScope: "deki:clear-memory-scope",
@@ -601,8 +669,10 @@ export interface DekiDesktopApi {
   sendPrompt(prompt: string): Promise<CommandResult>;
   abortRun(): Promise<CommandResult>;
   newSession(): Promise<CommandResult>;
-  listSessions(): Promise<SessionSummary[]>;
+  listSessions(query?: string): Promise<SessionSummary[]>;
   getSessionHistory(): Promise<ConversationMessage[]>;
+  getSessionHistoryState(): Promise<SessionHistoryState>;
+  forkSession(entryId: string): Promise<CommandResult>;
   switchSession(id: string): Promise<CommandResult>;
   renameSession(id: string, name: string): Promise<CommandResult>;
   deleteSession(id: string): Promise<CommandResult>;
@@ -633,6 +703,7 @@ export interface DekiDesktopApi {
   exportDiagnostics(): Promise<CommandResult>;
   openDataDirectory(): Promise<CommandResult>;
   openThirdPartyLicenses(): Promise<CommandResult>;
+  checkForUpdates(): Promise<CommandResult>;
   listMcpServers(): Promise<McpServerEditor[]>;
   upsertMcpServer(server: McpServerEditor): Promise<CommandResult>;
   removeMcpServer(id: string): Promise<CommandResult>;
@@ -644,6 +715,8 @@ export interface DekiDesktopApi {
   listMcpServerTools(id: string): Promise<McpToolSummary[]>;
   listSkills(): Promise<SkillStatus[]>;
   reloadSkills(): Promise<CommandResult>;
+  updateSkill(path: string): Promise<CommandResult>;
+  pinSkillVersion(path: string, version?: string): Promise<CommandResult>;
   updateMemory(input: z.infer<typeof memoryMutationSchema>): Promise<MemoryRecord>;
   deleteMemory(id: string, scope?: MemoryScope): Promise<CommandResult>;
   clearMemoryScope(scope: MemoryScope): Promise<CommandResult>;

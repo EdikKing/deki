@@ -1,5 +1,6 @@
 import { appendFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { delimiter, isAbsolute, join, normalize, resolve, sep } from "node:path";
+import { homedir } from "node:os";
 import { pathToFileURL } from "node:url";
 import {
   app,
@@ -67,10 +68,14 @@ import {
   modelProviderCatalogResultSchema,
   redactedModelProviderSchema,
   conversationMessageSchema,
+  forkSessionInputSchema,
   renameSessionInputSchema,
   sessionIdInputSchema,
+  sessionSearchInputSchema,
+  sessionHistoryStateSchema,
   sessionSummarySchema,
   skillStatusSchema,
+  skillActionInputSchema,
   rememberInputSchema,
   removeModelProviderInputSchema,
   resetSettingsInputSchema,
@@ -165,6 +170,9 @@ class DesktopController {
         : {}),
     });
     const settingsSnapshot = await settings.initialize();
+    memory.governMemories(
+      settingsSnapshot.effective.memory.lowConfidenceArchiveThreshold,
+    );
     applyNativeSettings(settingsSnapshot);
     await cleanupGeneralLogs(
       paths.logsRoot,
@@ -214,6 +222,16 @@ class DesktopController {
           : this.#settings.snapshot().effective.memory.userMemoryEnabled
             ? this.#memory.listMemories("user", "user", { limit: 100 })
             : []),
+        ...(this.#projectFeatures && this.#settings.snapshot().effective.memory.workspaceMemoryEnabled
+          ? this.#memory.listMemories("workspace", this.#scopeId, { limit: 100 })
+          : []),
+        ...(this.#projectFeatures && this.#settings.snapshot().effective.memory.branchMemoryEnabled
+          ? this.#memory.listMemories(
+              "branch",
+              this.#runtime?.memoryScopeId("branch") ?? `${this.#scopeId}:no-branch`,
+              { limit: 100 },
+            )
+          : []),
         ...(snapshot?.sessionId && this.#settings.snapshot().effective.memory.taskMemoryEnabled
           ? this.#memory.listMemories("task", snapshot.sessionId, { limit: 100 })
           : []),
@@ -222,6 +240,8 @@ class DesktopController {
       mcpServers: this.#mcp.getStatuses(),
       skills: snapshot?.skills ?? [],
       diagnostics: [...this.#diagnostics, ...(snapshot?.diagnostics ?? [])],
+      ...(snapshot?.modelUsage ? { modelUsage: snapshot.modelUsage } : {}),
+      activeRunCount: snapshot?.activeRunCount ?? this.#activeRuns,
       recentWorkspaces: this.#recentWorkspaces,
     });
   }
@@ -262,12 +282,24 @@ class DesktopController {
     return this.#run(async (runtime) => runtime.newSession());
   }
 
-  async listSessions() {
-    return this.#runtime?.listSessions() ?? [];
+  async listSessions(query = "") {
+    return this.#runtime?.listSessions(query) ?? [];
   }
 
   getSessionHistory() {
     return this.#runtime?.getSessionHistory() ?? [];
+  }
+
+  getSessionHistoryState() {
+    return this.#runtime?.getSessionHistoryState() ?? {
+      messages: [],
+      events: [],
+      runState: "idle" as const,
+    };
+  }
+
+  async forkSession(entryId: string): Promise<CommandResult> {
+    return this.#run(async (runtime) => runtime.forkSession(entryId));
   }
 
   async switchSession(id: string): Promise<CommandResult> {
@@ -283,6 +315,9 @@ class DesktopController {
     if (!runtime) return { ok: false, error: "Agent Runtime 尚未就绪" };
     if (runtime.snapshot().sessionId === id) {
       return { ok: false, error: "不能删除当前会话，请先切换到其他会话" };
+    }
+    if (runtime.isSessionRunning(id)) {
+      return { ok: false, error: "不能删除仍在后台运行的会话" };
     }
     try {
       await shell.trashItem(await runtime.getSessionPath(id));
@@ -604,6 +639,10 @@ class DesktopController {
         state: status?.state ?? "stopped",
         toolCount: status?.toolCount ?? 0,
         ...(status?.error ? { error: status.error } : {}),
+        ...(status?.lastCheckedAt ? { lastCheckedAt: status.lastCheckedAt } : {}),
+        ...(status?.reconnectAttempt === undefined
+          ? {}
+          : { reconnectAttempt: status.reconnectAttempt }),
       };
     });
   }
@@ -753,6 +792,9 @@ class DesktopController {
             { path: join(this.#workspace, ".pi", "skills"), source: "project" as const },
           ]
         : []),
+      { path: join(homedir(), ".pi", "agent", "skills"), source: "global" as const },
+      { path: join(homedir(), ".agents", "skills"), source: "global" as const },
+      { path: join(homedir(), ".codex", "skills"), source: "global" as const },
       ...settings.globalPaths.map((path) => ({ path, source: "global" as const })),
     ];
     const skills: Array<{
@@ -763,6 +805,9 @@ class DesktopController {
       valid: boolean;
       trusted: boolean;
       diagnostics: string[];
+      version?: string;
+      pinnedVersion?: string;
+      sourceUrl?: string;
     }> = [];
     for (const root of roots) {
       let entries;
@@ -776,10 +821,23 @@ class DesktopController {
         const skillFile = join(root.path, entry.name, "SKILL.md");
         const diagnostics: string[] = [];
         let name = entry.name;
+        let metadata: {
+          version?: string;
+          pinnedVersion?: string;
+          sourceUrl?: string;
+        } = {};
         try {
           const content = await readFile(skillFile, "utf8");
           const declared = /^---[\s\S]*?^name:\s*(.+?)\s*$[\s\S]*?^---/mu.exec(content)?.[1];
           const description = /^---[\s\S]*?^description:\s*(.+?)\s*$[\s\S]*?^---/mu.exec(content)?.[1];
+          const version = /^---[\s\S]*?^version:\s*(.+?)\s*$[\s\S]*?^---/mu.exec(content)?.[1];
+          const pinnedVersion = /^---[\s\S]*?^pinned-version:\s*(.+?)\s*$[\s\S]*?^---/mu.exec(content)?.[1];
+          const sourceUrl = /^---[\s\S]*?^source:\s*(https:\/\/\S+)\s*$[\s\S]*?^---/mu.exec(content)?.[1];
+          metadata = {
+            ...(version ? { version: version.trim() } : {}),
+            ...(pinnedVersion ? { pinnedVersion: pinnedVersion.trim() } : {}),
+            ...(sourceUrl ? { sourceUrl: sourceUrl.trim() } : {}),
+          };
           if (declared) name = declared.trim();
           else diagnostics.push("缺少 frontmatter name");
           if (!description) diagnostics.push("缺少 frontmatter description");
@@ -799,6 +857,7 @@ class DesktopController {
           valid: diagnostics.length === 0,
           trusted: root.source === "project" ? this.#trusted : true,
           diagnostics,
+          ...metadata,
         });
       }
     }
@@ -811,6 +870,53 @@ class DesktopController {
 
   async reloadSkills(): Promise<CommandResult> {
     try {
+      await this.#reloadRuntimeWhenIdle();
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: formatError(error) };
+    }
+  }
+
+  async updateSkill(path: string): Promise<CommandResult> {
+    const skill = (await this.listSkills()).find((candidate) => candidate.path === path);
+    if (!skill) return { ok: false, error: "未找到 Skill" };
+    if (!skill.valid) return { ok: false, error: "Skill 校验未通过，不能更新" };
+    if (skill.pinnedVersion) {
+      return { ok: false, error: `Skill 已锁定在 ${skill.pinnedVersion}，请先解除版本锁定` };
+    }
+    if (!skill.sourceUrl) {
+      return { ok: false, error: "Skill 未声明可更新的 frontmatter source URL" };
+    }
+    try {
+      const response = await net.fetch(skill.sourceUrl);
+      if (!response.ok) throw new Error(`更新源返回 HTTP ${response.status}`);
+      const content = await response.text();
+      if (content.length > 1_000_000) throw new Error("Skill 更新内容超过 1 MB 限制");
+      const declared = /^---[\s\S]*?^name:\s*(.+?)\s*$[\s\S]*?^---/mu.exec(content)?.[1]?.trim();
+      if (!declared || declared !== skill.name) {
+        throw new Error("更新源的 Skill 名称与本地版本不一致");
+      }
+      const temporary = `${skill.path}.update-${crypto.randomUUID()}`;
+      await writeFile(temporary, content, { encoding: "utf8", mode: 0o600 });
+      await rename(temporary, skill.path);
+      await this.#reloadRuntimeWhenIdle();
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: formatError(error) };
+    }
+  }
+
+  async pinSkillVersion(path: string, version?: string): Promise<CommandResult> {
+    const skill = (await this.listSkills()).find((candidate) => candidate.path === path);
+    if (!skill) return { ok: false, error: "未找到 Skill" };
+    const pinned = version?.trim();
+    if (pinned && skill.version && pinned !== skill.version) {
+      return { ok: false, error: `只能锁定当前已安装版本 ${skill.version}` };
+    }
+    try {
+      const content = await readFile(skill.path, "utf8");
+      const next = setSkillFrontmatterValue(content, "pinned-version", pinned);
+      await writeFile(skill.path, next, { encoding: "utf8", mode: 0o600 });
       await this.#reloadRuntimeWhenIdle();
       return { ok: true };
     } catch (error) {
@@ -1093,6 +1199,17 @@ class DesktopController {
       if (!this.#projectFeatures) throw new Error("普通会话没有项目记忆作用域");
       return { scope, scopeId: this.#scopeId };
     }
+    if (scope === "workspace") {
+      if (!this.#projectFeatures) throw new Error("普通会话没有工作区记忆作用域");
+      return { scope, scopeId: this.#scopeId };
+    }
+    if (scope === "branch") {
+      if (!this.#projectFeatures) throw new Error("普通会话没有分支记忆作用域");
+      return {
+        scope,
+        scopeId: this.#runtime?.memoryScopeId("branch") ?? `${this.#scopeId}:no-branch`,
+      };
+    }
     if (scope === "task") {
       const sessionId = this.#runtime?.snapshot().sessionId;
       if (!sessionId) throw new Error("当前会话尚未就绪，没有任务记忆作用域");
@@ -1325,13 +1442,27 @@ function registerIpcHandlers(): void {
     assertTrustedSender(event);
     return commandResultSchema.parse(await controller?.newSession());
   });
-  ipcMain.handle(IPC_CHANNELS.listSessions, async (event) => {
+  ipcMain.handle(IPC_CHANNELS.listSessions, async (event, raw) => {
     assertTrustedSender(event);
-    return sessionSummarySchema.array().parse(await controller?.listSessions() ?? []);
+    const { query } = sessionSearchInputSchema.parse(raw ?? {});
+    return sessionSummarySchema.array().parse(await controller?.listSessions(query) ?? []);
   });
   ipcMain.handle(IPC_CHANNELS.getSessionHistory, (event) => {
     assertTrustedSender(event);
     return conversationMessageSchema.array().parse(controller?.getSessionHistory() ?? []);
+  });
+  ipcMain.handle(IPC_CHANNELS.getSessionHistoryState, (event) => {
+    assertTrustedSender(event);
+    return sessionHistoryStateSchema.parse(controller?.getSessionHistoryState() ?? {
+      messages: [],
+      events: [],
+      runState: "idle",
+    });
+  });
+  ipcMain.handle(IPC_CHANNELS.forkSession, async (event, raw) => {
+    assertTrustedSender(event);
+    const { entryId } = forkSessionInputSchema.parse(raw);
+    return commandResultSchema.parse(await controller?.forkSession(entryId));
   });
   ipcMain.handle(IPC_CHANNELS.switchSession, async (event, raw) => {
     assertTrustedSender(event);
@@ -1442,6 +1573,25 @@ function registerIpcHandlers(): void {
         ?? { ok: false, error: "设置系统尚未就绪" },
     );
   });
+  ipcMain.handle(IPC_CHANNELS.checkForUpdates, async (event) => {
+    assertTrustedSender(event);
+    if (!app.isPackaged) {
+      return commandResultSchema.parse({
+        ok: false,
+        error: "开发构建不检查更新；请使用已签名安装包验证更新源",
+      });
+    }
+    try {
+      const result = await autoUpdater.checkForUpdatesAndNotify();
+      const version = result?.updateInfo.version;
+      return commandResultSchema.parse({
+        ok: true,
+        ...(version ? { error: `更新检查完成，远端版本 ${version}` } : {}),
+      });
+    } catch (error) {
+      return commandResultSchema.parse({ ok: false, error: formatError(error) });
+    }
+  });
   ipcMain.handle(IPC_CHANNELS.exportDiagnostics, async (event) => {
     assertTrustedSender(event);
     return commandResultSchema.parse(
@@ -1498,6 +1648,21 @@ function registerIpcHandlers(): void {
     assertTrustedSender(event);
     return commandResultSchema.parse(
       await controller?.reloadSkills() ?? { ok: false, error: "Skill Loader 尚未就绪" },
+    );
+  });
+  ipcMain.handle(IPC_CHANNELS.updateSkill, async (event, raw) => {
+    assertTrustedSender(event);
+    const { path } = skillActionInputSchema.parse(raw);
+    return commandResultSchema.parse(
+      await controller?.updateSkill(path) ?? { ok: false, error: "Skill Registry 尚未就绪" },
+    );
+  });
+  ipcMain.handle(IPC_CHANNELS.pinSkillVersion, async (event, raw) => {
+    assertTrustedSender(event);
+    const { path, pinnedVersion } = skillActionInputSchema.parse(raw);
+    return commandResultSchema.parse(
+      await controller?.pinSkillVersion(path, pinnedVersion ?? undefined)
+        ?? { ok: false, error: "Skill Registry 尚未就绪" },
     );
   });
   ipcMain.handle(IPC_CHANNELS.updateMemory, (event, raw) => {
@@ -1897,6 +2062,25 @@ function isMemoryType(
   return ["preference", "fact", "decision", "experience", "task-state"].includes(
     String(value),
   );
+}
+
+function setSkillFrontmatterValue(
+  content: string,
+  key: string,
+  value: string | undefined,
+): string {
+  const frontmatter = /^---\r?\n([\s\S]*?)\r?\n---/u.exec(content);
+  if (!frontmatter) throw new Error("Skill 缺少 YAML frontmatter");
+  const line = new RegExp(`^${key}:.*$`, "mu");
+  let body = frontmatter[1] ?? "";
+  if (value) {
+    body = line.test(body)
+      ? body.replace(line, `${key}: ${value}`)
+      : `${body}\n${key}: ${value}`;
+  } else {
+    body = body.replace(line, "").replaceAll(/\n{3,}/g, "\n\n").trimEnd();
+  }
+  return content.replace(frontmatter[0], `---\n${body}\n---`);
 }
 
 async function moveToTrashOrBackup(target: string): Promise<void> {

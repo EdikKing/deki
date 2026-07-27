@@ -953,6 +953,9 @@ function McpSettings({ value, source, zh, update, hasWorkspace }: SettingsCompon
     <Toggle title={zh ? "启动已启用的 Server" : "Start enabled servers"} path="mcp.startEnabledServers" checked={value.mcp.startEnabledServers} source={source} onChange={(startEnabledServers) => update({ mcp: { startEnabledServers } })} />
     <Range title={zh ? "启动超时（秒）" : "Startup timeout (seconds)"} path="mcp.startupTimeoutMs" value={value.mcp.startupTimeoutMs / 1000} min={1} max={120} source={source} onChange={(seconds) => update({ mcp: { startupTimeoutMs: seconds * 1000 } })} />
     <Range title={zh ? "Tool 调用超时（秒）" : "Tool timeout (seconds)"} path="mcp.callTimeoutMs" value={value.mcp.callTimeoutMs / 1000} min={1} max={600} source={source} onChange={(seconds) => update({ mcp: { callTimeoutMs: seconds * 1000 } })} />
+    <Range title={zh ? "健康检查间隔（秒）" : "Health check interval (seconds)"} path="mcp.healthCheckIntervalMs" value={value.mcp.healthCheckIntervalMs / 1000} min={5} max={3600} source={source} onChange={(seconds) => update({ mcp: { healthCheckIntervalMs: seconds * 1000 } })} />
+    <Toggle title={zh ? "异常后自动重启与重连" : "Auto-restart and reconnect"} path="mcp.autoRestart" checked={value.mcp.autoRestart} source={source} onChange={(autoRestart) => update({ mcp: { autoRestart } })} />
+    <Range title={zh ? "最大重连次数" : "Maximum reconnect attempts"} path="mcp.maxReconnectAttempts" value={value.mcp.maxReconnectAttempts} min={0} max={20} source={source} onChange={(maxReconnectAttempts) => update({ mcp: { maxReconnectAttempts } })} />
     <div className="settings-subsection">
       <div className="subsection-heading"><div><h2>stdio Servers</h2><p>{hasWorkspace ? ".deki/mcp.json" : (zh ? "普通会话不可用" : "Unavailable in general chat")}</p></div><div><button className="ghost small-action" disabled={!hasWorkspace} onClick={() => void reload()}>{zh ? "重载" : "Reload"}</button> <button className="primary small-action" disabled={!hasWorkspace} onClick={() => setEditing({ id: "server", command: "", args: [], enabled: true, tools: {}, environment: {} })}>{zh ? "添加" : "Add"}</button></div></div>
       {message && <p className="muted">{message}</p>}
@@ -962,7 +965,7 @@ function McpSettings({ value, source, zh, update, hasWorkspace }: SettingsCompon
             <strong>{server.id}</strong>
             <span className={`provider-status ${server.state === "ready" ? "configured" : ""}`}>{server.state ?? "stopped"}</span>
           </div>
-          <small>{server.command} {server.args.join(" ")} · {server.toolCount ?? 0} tools · {server.enabled ? "enabled" : "disabled"}</small>
+          <small>{server.command} {server.args.join(" ")} · {server.toolCount ?? 0} tools · {server.enabled ? "enabled" : "disabled"}{server.lastCheckedAt ? ` · checked ${new Date(server.lastCheckedAt).toLocaleTimeString()}` : ""}{server.reconnectAttempt ? ` · retry ${server.reconnectAttempt}` : ""}</small>
           {server.error && <p className="error compact">{server.error}</p>}
         </div>
         <div className="mcp-server-actions">
@@ -1013,7 +1016,7 @@ function McpSettings({ value, source, zh, update, hasWorkspace }: SettingsCompon
           </div>)}
         </div>}
       </div>)}
-      {editing && <div className="provider-editor"><div className="field-grid"><label><span>ID</span><input value={editing.id} onChange={(e) => setEditing({ ...editing, id: e.target.value })} /></label><label><span>{zh ? "命令" : "Command"}</span><input value={editing.command} onChange={(e) => setEditing({ ...editing, command: e.target.value })} /></label><label className="wide"><span>{zh ? "参数（每行一个）" : "Arguments (one per line)"}</span><textarea value={editing.args.join("\n")} onChange={(e) => setEditing({ ...editing, args: e.target.value.split("\n") })} /></label><label><span>cwd</span><input value={editing.cwd ?? ""} onChange={(e) => { const { cwd: _cwd, ...rest } = editing; setEditing(e.target.value ? { ...rest, cwd: e.target.value } : rest); }} /></label><label><span>enabled</span><input type="checkbox" checked={editing.enabled} onChange={(e) => setEditing({ ...editing, enabled: e.target.checked })} /></label><label className="wide"><span>{zh ? "本机环境变量（每行 NAME=VALUE；不会写入项目）" : "Local environment (NAME=VALUE per line; never written to project)"}</span><textarea value={Object.entries(editing.environment ?? {}).map(([key, envValue]) => `${key}=${envValue}`).join("\n")} onChange={(event) => setEditing({ ...editing, environment: parseEnvironment(event.target.value) })} /></label></div><div className="editor-actions"><button className="ghost" onClick={() => setEditing(undefined)}>{zh ? "取消" : "Cancel"}</button><button className="primary" onClick={() => void save()}>{zh ? "保存" : "Save"}</button></div></div>}
+      {editing && <div className="provider-editor"><div className="field-grid"><label><span>ID</span><input value={editing.id} onChange={(e) => setEditing({ ...editing, id: e.target.value })} /></label><label><span>{zh ? "命令" : "Command"}</span><input value={editing.command} onChange={(e) => setEditing({ ...editing, command: e.target.value })} /></label><label className="wide"><span>{zh ? "参数（每行一个）" : "Arguments (one per line)"}</span><textarea value={editing.args.join("\n")} onChange={(e) => setEditing({ ...editing, args: e.target.value.split("\n") })} /></label><label><span>cwd</span><input value={editing.cwd ?? ""} onChange={(e) => { const { cwd: _cwd, ...rest } = editing; setEditing(e.target.value ? { ...rest, cwd: e.target.value } : rest); }} /></label><label><span>enabled</span><input type="checkbox" checked={editing.enabled} onChange={(e) => setEditing({ ...editing, enabled: e.target.checked })} /></label><label className="wide"><span>{zh ? "本机环境变量（每行 NAME=VALUE；Secret 可写 ${secret:NAME}）" : "Local environment (NAME=VALUE; use ${secret:NAME} for secrets)"}</span><textarea value={Object.entries(editing.environment ?? {}).map(([key, envValue]) => `${key}=${envValue}`).join("\n")} onChange={(event) => setEditing({ ...editing, environment: parseEnvironment(event.target.value) })} /></label></div><div className="editor-actions"><button className="ghost" onClick={() => setEditing(undefined)}>{zh ? "取消" : "Cancel"}</button><button className="primary" onClick={() => void save()}>{zh ? "保存" : "Save"}</button></div></div>}
     </div>
   </>;
 }
@@ -1043,9 +1046,12 @@ function SkillSettings({ value, source, zh, update, scope }: SettingsComponentPr
         <div>
           <strong>{skill.name}</strong>
           <span className={`provider-status ${skill.valid && skill.trusted ? "configured" : ""}`}>{skill.valid ? (skill.trusted ? "valid" : "untrusted") : "invalid"}</span>
-          <small>{skill.source} · {skill.path}</small>
+          <small>{skill.source} · version {skill.version ?? "unversioned"}{skill.pinnedVersion ? ` · pinned ${skill.pinnedVersion}` : ""} · {skill.path}</small>
           {skill.diagnostics.map((diagnostic) => <p className="error compact" key={diagnostic}>{diagnostic}</p>)}
         </div>
+        <div className="button-group">
+          {skill.sourceUrl && <button className="ghost small-action" disabled={Boolean(skill.pinnedVersion)} onClick={async () => { const result = await window.deki.updateSkill(skill.path); setMessage(result.ok ? (zh ? "Skill 已更新" : "Skill updated") : result.error); await refresh(); }}>{zh ? "更新" : "Update"}</button>}
+          {skill.version && <button className="ghost small-action" onClick={async () => { const result = await window.deki.pinSkillVersion(skill.path, skill.pinnedVersion ? undefined : skill.version); setMessage(result.ok ? (skill.pinnedVersion ? (zh ? "已解除锁定" : "Version unpinned") : (zh ? "已锁定版本" : "Version pinned")) : result.error); await refresh(); }}>{skill.pinnedVersion ? (zh ? "解除锁定" : "Unpin") : (zh ? "锁定版本" : "Pin")}</button>}
         <label className="toggle">
           <input type="checkbox" checked={skill.enabled} onChange={async (event) => {
             const disabled = event.target.checked
@@ -1055,6 +1061,7 @@ function SkillSettings({ value, source, zh, update, scope }: SettingsComponentPr
           }} />
           <span />
         </label>
+        </div>
       </div>)}
     </div>
   </>;
@@ -1068,7 +1075,10 @@ function MemorySettings({ value, source, zh, update, hasWorkspace, taskId }: Set
   const refresh = async (query = memoryQuery) =>
     setMemories(await window.deki.listMemories(memoryScope, query));
   useEffect(() => {
-    if (!hasWorkspace && memoryScope === "project") {
+    if (
+      !hasWorkspace
+      && (memoryScope === "project" || memoryScope === "workspace" || memoryScope === "branch")
+    ) {
       setMemoryScope("user");
       return;
     }
@@ -1086,16 +1096,24 @@ function MemorySettings({ value, source, zh, update, hasWorkspace, taskId }: Set
     memoryScope,
     taskId,
     value.memory.projectMemoryEnabled,
+    value.memory.workspaceMemoryEnabled,
+    value.memory.branchMemoryEnabled,
     value.memory.taskMemoryEnabled,
     value.memory.userMemoryEnabled,
   ]);
   const scopeChoices: Array<{ scope: MemoryScope; label: string }> = [
     { scope: "user", label: zh ? "用户" : "User" },
     ...(hasWorkspace ? [{ scope: "project" as const, label: zh ? "当前项目" : "Project" }] : []),
+    ...(hasWorkspace ? [{ scope: "workspace" as const, label: zh ? "当前工作区" : "Workspace" }] : []),
+    ...(hasWorkspace ? [{ scope: "branch" as const, label: zh ? "当前分支" : "Branch" }] : []),
     ...(taskId ? [{ scope: "task" as const, label: zh ? "当前任务" : "Current task" }] : []),
   ];
   const scopeDescription = memoryScope === "task"
     ? `${zh ? "当前任务作用域" : "Current task scope"} · ${taskId ?? ""}`
+    : memoryScope === "branch"
+      ? (zh ? "当前 Git 分支作用域" : "Current Git branch scope")
+      : memoryScope === "workspace"
+        ? (zh ? "当前工作区作用域" : "Current workspace scope")
     : memoryScope === "project"
       ? (zh ? "当前项目作用域" : "Current project scope")
       : (zh ? "用户作用域" : "User scope");
@@ -1107,14 +1125,18 @@ function MemorySettings({ value, source, zh, update, hasWorkspace, taskId }: Set
     {view === "recall" && <>
     <Toggle title={zh ? "普通会话用户记忆" : "User memory in general chats"} path="memory.userMemoryEnabled" checked={value.memory.userMemoryEnabled} source={source} onChange={(userMemoryEnabled) => update({ memory: { userMemoryEnabled } })} />
     <Toggle title={zh ? "项目记忆" : "Project memory"} path="memory.projectMemoryEnabled" checked={value.memory.projectMemoryEnabled} source={source} onChange={(projectMemoryEnabled) => update({ memory: { projectMemoryEnabled } })} />
+    <Toggle title={zh ? "工作区记忆" : "Workspace memory"} path="memory.workspaceMemoryEnabled" checked={value.memory.workspaceMemoryEnabled} source={source} onChange={(workspaceMemoryEnabled) => update({ memory: { workspaceMemoryEnabled } })} />
+    <Toggle title={zh ? "Git 分支记忆" : "Git branch memory"} path="memory.branchMemoryEnabled" checked={value.memory.branchMemoryEnabled} source={source} onChange={(branchMemoryEnabled) => update({ memory: { branchMemoryEnabled } })} />
     <Toggle title={zh ? "当前任务记忆" : "Current task memory"} description={zh ? "仅在当前任务内检索，适合保存临时目标、约束和进度。" : "Retrieved only in the current task for temporary goals, constraints, and progress."} path="memory.taskMemoryEnabled" checked={value.memory.taskMemoryEnabled} source={source} onChange={(taskMemoryEnabled) => update({ memory: { taskMemoryEnabled } })} />
     <Toggle title={zh ? "自动生成记忆候选" : "Automatic memory candidates"} description={zh ? "默认关闭；候选必须确认后才进入召回。" : "Off by default; candidates must be accepted before recall."} path="memory.automaticCandidates" checked={value.memory.automaticCandidates} source={source} onChange={(automaticCandidates) => update({ memory: { automaticCandidates } })} />
     <Range title={zh ? "用户记忆召回数量" : "User recall count"} path="memory.userRecallLimit" value={value.memory.userRecallLimit} min={0} max={10} source={source} onChange={(userRecallLimit) => update({ memory: { userRecallLimit } })} />
-    <Range title={zh ? "用户记忆字符预算" : "User memory character budget"} path="memory.userCharacterBudget" value={value.memory.userCharacterBudget} min={0} max={10000} step={100} source={source} onChange={(userCharacterBudget) => update({ memory: { userCharacterBudget } })} />
+    <Range title={zh ? "用户记忆 Token 预算" : "User memory token budget"} path="memory.userTokenBudget" value={value.memory.userTokenBudget} min={0} max={10000} step={50} source={source} onChange={(userTokenBudget) => update({ memory: { userTokenBudget } })} />
     <Range title={zh ? "项目记忆召回数量" : "Project recall count"} path="memory.projectRecallLimit" value={value.memory.projectRecallLimit} min={0} max={10} source={source} onChange={(projectRecallLimit) => update({ memory: { projectRecallLimit } })} />
-    <Range title={zh ? "项目记忆字符预算" : "Project memory character budget"} path="memory.projectCharacterBudget" value={value.memory.projectCharacterBudget} min={0} max={10000} step={100} source={source} onChange={(projectCharacterBudget) => update({ memory: { projectCharacterBudget } })} />
+    <Range title={zh ? "项目记忆 Token 预算" : "Project memory token budget"} path="memory.projectTokenBudget" value={value.memory.projectTokenBudget} min={0} max={10000} step={50} source={source} onChange={(projectTokenBudget) => update({ memory: { projectTokenBudget } })} />
+    <Range title={zh ? "工作区记忆 Token 预算" : "Workspace memory token budget"} path="memory.workspaceTokenBudget" value={value.memory.workspaceTokenBudget} min={0} max={10000} step={50} source={source} onChange={(workspaceTokenBudget) => update({ memory: { workspaceTokenBudget } })} />
+    <Range title={zh ? "分支记忆 Token 预算" : "Branch memory token budget"} path="memory.branchTokenBudget" value={value.memory.branchTokenBudget} min={0} max={10000} step={50} source={source} onChange={(branchTokenBudget) => update({ memory: { branchTokenBudget } })} />
     <Range title={zh ? "任务记忆召回数量" : "Task recall count"} path="memory.taskRecallLimit" value={value.memory.taskRecallLimit} min={0} max={10} source={source} onChange={(taskRecallLimit) => update({ memory: { taskRecallLimit } })} />
-    <Range title={zh ? "任务记忆字符预算" : "Task memory character budget"} path="memory.taskCharacterBudget" value={value.memory.taskCharacterBudget} min={0} max={10000} step={100} source={source} onChange={(taskCharacterBudget) => update({ memory: { taskCharacterBudget } })} />
+    <Range title={zh ? "任务记忆 Token 预算" : "Task memory token budget"} path="memory.taskTokenBudget" value={value.memory.taskTokenBudget} min={0} max={10000} step={50} source={source} onChange={(taskTokenBudget) => update({ memory: { taskTokenBudget } })} />
     </>}
     {view === "center" && <div className="settings-subsection memory-center">
       <div className="subsection-heading"><div><h2>{zh ? "记忆中心" : "Memory center"}</h2><p>{scopeDescription}</p></div><div className="button-group"><select value={memoryScope} onChange={(event) => setMemoryScope(event.target.value as MemoryScope)}>{scopeChoices.map((choice) => <option value={choice.scope} key={choice.scope}>{choice.label}</option>)}</select><button className="ghost small-action" onClick={() => void refresh()}>{zh ? "刷新" : "Refresh"}</button><button className="danger small-action" onClick={async () => {
@@ -1125,7 +1147,7 @@ function MemorySettings({ value, source, zh, update, hasWorkspace, taskId }: Set
       <input className="memory-search" value={memoryQuery} onChange={(event) => setMemoryQuery(event.target.value)} placeholder={zh ? "使用全文索引搜索记忆…" : "Search memories with full-text index…"} />
       <p className="muted">{zh ? "聊天时会按每轮问题进行混合检索；使用 /remember --task 内容 可保存当前任务记忆。" : "Each prompt uses hybrid retrieval. Use /remember --task content to save task-only memory."}</p>
       {memories.length === 0 && <p className="muted">{zh ? "没有可管理的记忆。" : "No memories to manage."}</p>}
-      {memories.map((memory) => <div className="provider-card" key={memory.id}><div><strong>{memory.content}</strong><small>{memory.scope} · {memory.status} · {new Date(memory.updatedAt).toLocaleString()}</small></div><div>{memory.status === "pending" ? <><button className="primary small-action" onClick={async () => { await window.deki.updateMemory({ id: memory.id, scope: memoryScope, status: "active" }); await refresh(); }}>{zh ? "确认" : "Accept"}</button><button className="danger small-action" onClick={async () => { await window.deki.deleteMemory(memory.id, memoryScope); await refresh(); }}>{zh ? "拒绝" : "Reject"}</button></> : <><button className="ghost small-action" onClick={async () => {
+      {memories.map((memory) => <div className="provider-card" key={memory.id}><div><strong>{memory.content}</strong><small>{memory.scope} · {memory.type} · {memory.status} · confidence {memory.confidence.toFixed(2)} · source {memory.source.kind}{memory.source.detail ? ` (${memory.source.detail})` : ""} · {zh ? "更新" : "updated"} {new Date(memory.updatedAt).toLocaleString()} · {zh ? "最后使用" : "last used"} {memory.lastUsedAt ? new Date(memory.lastUsedAt).toLocaleString() : "—"} · {zh ? "过期" : "expires"} {memory.expiresAt ? new Date(memory.expiresAt).toLocaleString() : "—"}</small></div><div>{memory.status === "pending" ? <><button className="primary small-action" onClick={async () => { await window.deki.updateMemory({ id: memory.id, scope: memoryScope, status: "active" }); await refresh(); }}>{zh ? "确认" : "Accept"}</button><button className="danger small-action" onClick={async () => { await window.deki.deleteMemory(memory.id, memoryScope); await refresh(); }}>{zh ? "拒绝" : "Reject"}</button></> : <><button className="ghost small-action" onClick={async () => {
         const content = window.prompt(zh ? "编辑记忆" : "Edit memory", memory.content);
         if (content?.trim()) {
           await window.deki.updateMemory({ id: memory.id, scope: memoryScope, content: content.trim() });
@@ -1183,11 +1205,13 @@ function AdvancedSettings({ value, source, zh, update }: SettingsComponentProps)
 }
 
 function AboutSettings({ value, zh, update }: Pick<SettingsComponentProps, "value" | "zh" | "update">) {
+  const [updateMessage, setUpdateMessage] = useState<string>();
   return <>
     <div className="about-card"><div className="brand-mark">D</div><div><h2>Deki {DEKI_VERSION}</h2><p>Electron 43.2.0 · Pi SDK 0.82.1 · MCP SDK 1.29.0</p></div></div>
     <Setting title={zh ? "开源许可证" : "Open-source license"} description="AGPL-3.0-or-later" source="product"><span className="value-text">GNU Affero General Public License v3.0 or later</span></Setting>
     <Setting title={zh ? "第三方许可证" : "Third-party licenses"} description={zh ? "根据锁文件自动生成完整依赖清单，并随应用打包。" : "A complete inventory is generated from the lockfile and packaged with the app."} source="product"><button className="ghost" onClick={() => void window.deki.openThirdPartyLicenses()}>{zh ? "打开完整清单" : "Open complete inventory"}</button></Setting>
     <Setting title={zh ? "更新通道" : "Update channel"} description={zh ? "Stable 仅接收正式版；Beta 可接收预发布版本。发布源为 GitHub Releases。" : "Stable receives final releases; Beta can receive prereleases. Updates are served by GitHub Releases."} source="global"><select value={value.updates.channel} onChange={(e) => void update({ updates: { channel: e.target.value as "stable" | "beta" } })}><option value="stable">Stable</option><option value="beta">Beta</option></select></Setting>
+    <Setting title={zh ? "客户端更新" : "Client updates"} description={updateMessage ?? (zh ? "从 edik-labs/deki 的 GitHub Releases 检查、下载，并在退出后安装。" : "Checks and downloads from edik-labs/deki GitHub Releases, then installs on quit.")} source="product"><button className="primary" onClick={async () => { const result = await window.deki.checkForUpdates(); setUpdateMessage(result.error ?? (result.ok ? (zh ? "检查完成" : "Check complete") : (zh ? "检查失败" : "Check failed"))); }}>{zh ? "立即检查" : "Check now"}</button></Setting>
   </>;
 }
 

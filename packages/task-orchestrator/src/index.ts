@@ -84,6 +84,15 @@ export const promptExecutionInputSchema = z.object({
     writeSet: z.array(workerWriteSetEntrySchema).min(1).max(100),
     validationTargets: z.array(validationTargetSchema).min(1).max(30),
     wave: z.number().int().nonnegative(),
+    integratorMode: z.enum(["resolve", "review"]).optional(),
+    integrationResource: z.object({
+      id: z.string().min(1),
+      path: z.string().min(1),
+      cwd: z.string().min(1),
+      branch: z.string().min(1),
+      branchRef: z.string().min(1),
+      baseCommit: z.string().regex(/^[0-9a-f]{40,64}$/i),
+    }).strict().optional(),
   }).strict().optional(),
 }).strict();
 export type PromptExecutionInput = z.infer<typeof promptExecutionInputSchema>;
@@ -389,6 +398,7 @@ export class TaskStore {
   }
 
   createTask(input: {
+    id?: string;
     workspaceId: string;
     workspacePath?: string;
     kind: TaskKind;
@@ -399,8 +409,12 @@ export class TaskStore {
     parentTaskId?: string;
     planId?: string;
     assignedProfile?: string;
+    systemCreated?: boolean;
   }): TaskRecord {
-    const id = randomUUID();
+    if (input.kind === "integration" && input.systemCreated !== true) {
+      throw new Error("Integration Task 只能由 Orchestrator 创建");
+    }
+    const id = input.id ?? randomUUID();
     const now = new Date().toISOString();
     const task = taskRecordSchema.parse({
       id,
@@ -489,7 +503,7 @@ export class TaskStore {
       events: events.map(rowToEvent),
       requests: requests.map(rowToRequest),
       children: childRows.map((row) => this.#summaryFor(rowToTask(row))),
-      ...(task.kind === "worker"
+      ...(task.kind === "worker" || task.kind === "integration"
         ? { workerResult: this.getWorkerResult(task.id) }
         : {}),
       ...(task.kind === "worker"
@@ -595,7 +609,9 @@ export class TaskStore {
   delegateWorkers(input: WorkerDelegationInput): WorkerDelegation {
     const parent = this.#requireTask(input.parentTaskId);
     const parentRun = this.#requireRun(input.parentRunId);
-    if (parent.kind === "worker") throw new Error("Worker 不能继续创建 Worker");
+    if (parent.kind === "worker" || parent.kind === "integration") {
+      throw new Error("Worker 或 Integrator 不能继续创建 Worker");
+    }
     if (
       parent.currentRunId !== parentRun.id
       || parent.status !== "running"
@@ -673,12 +689,17 @@ export class TaskStore {
           ...(request.plan ? { plan: request.plan } : {}),
           budget,
         });
+        const worktreeContext = input.worktreeContexts?.[requestIndex];
+        const workerTitle = worktreeContext
+          ? `${workerProfileLabel(request.profile)} W${worktreeContext.wave + 1} `
+            + `[${worktreeContext.writeSet.map((entry) => entry.path).join(", ")}]`
+          : workerProfileLabel(request.profile);
         const task = this.#insertTask({
           id: workerTaskId,
           workspaceId: parent.workspaceId,
           ...(parent.workspacePath ? { workspacePath: parent.workspacePath } : {}),
           kind: "worker",
-          title: `${workerProfileLabel(request.profile)}：${request.objective.slice(0, 120)}`,
+          title: `${workerTitle}：${request.objective}`.slice(0, 200),
           goal: request.objective,
           parentTaskId: parent.id,
           rootTaskId: parent.rootTaskId,
@@ -692,8 +713,8 @@ export class TaskStore {
             interactionMode: "worker",
             workerProfile: request.profile,
             workerContext: context,
-            ...(input.worktreeContexts?.[requestIndex]
-              ? { worktreeContext: input.worktreeContexts[requestIndex] }
+            ...(worktreeContext
+              ? { worktreeContext }
               : {}),
             deliveryMode: input.deliveryMode ?? "background",
           },
@@ -772,14 +793,25 @@ export class TaskStore {
     ) {
       throw new Error("Implementation Result 只能属于 Implementer Worker");
     }
-    this.#database.prepare(`
-      INSERT INTO implementation_results (
-        task_id, run_id, result_json, created_at
-      ) VALUES (?, ?, ?, ?)
-      ON CONFLICT(task_id, run_id) DO UPDATE SET
-        result_json = excluded.result_json,
-        created_at = excluded.created_at
-    `).run(parsed.taskId, parsed.runId, JSON.stringify(parsed), parsed.createdAt);
+    this.#transaction((events) => {
+      this.#database.prepare(`
+        INSERT INTO implementation_results (
+          task_id, run_id, result_json, created_at
+        ) VALUES (?, ?, ?, ?)
+        ON CONFLICT(task_id, run_id) DO UPDATE SET
+          result_json = excluded.result_json,
+          created_at = excluded.created_at
+      `).run(parsed.taskId, parsed.runId, JSON.stringify(parsed), parsed.createdAt);
+      if (parsed.scopeViolation) {
+        events.push(this.#appendEvent(
+          task.id,
+          "worker.scope_violation",
+          { changedFiles: parsed.changedFiles },
+          run.id,
+          task.sessionId,
+        ));
+      }
+    });
     return parsed;
   }
 
@@ -821,19 +853,40 @@ export class TaskStore {
       createdAt: now,
       updatedAt: now,
     });
-    this.#database.prepare(`
-      INSERT INTO integrations (
-        id, root_task_id, task_id, record_json, status, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      record.id,
-      record.rootTaskId,
-      record.taskId,
-      JSON.stringify(record),
-      record.status,
-      record.createdAt,
-      record.updatedAt,
-    );
+    this.#transaction((events) => {
+      this.#database.prepare(`
+        INSERT INTO write_batches (
+          id, root_task_id, task_id, baseline_commit, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        record.id,
+        record.rootTaskId,
+        record.taskId,
+        record.baselineCommit,
+        record.status,
+        record.createdAt,
+        record.updatedAt,
+      );
+      this.#database.prepare(`
+        INSERT INTO integrations (
+          id, root_task_id, task_id, record_json, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        record.id,
+        record.rootTaskId,
+        record.taskId,
+        JSON.stringify(record),
+        record.status,
+        record.createdAt,
+        record.updatedAt,
+      );
+      events.push(this.#appendEvent(
+        record.taskId,
+        "integration.created",
+        { integrationId: record.id, baselineCommit: record.baselineCommit },
+        this.getTask(record.taskId)?.currentRunId,
+      ));
+    });
     return record;
   }
 
@@ -848,10 +901,38 @@ export class TaskStore {
       ...patch,
       updatedAt: new Date().toISOString(),
     });
-    this.#database.prepare(`
-      UPDATE integrations SET record_json = ?, status = ?, updated_at = ?
-      WHERE id = ?
-    `).run(JSON.stringify(updated), updated.status, updated.updatedAt, id);
+    this.#transaction((events) => {
+      this.#database.prepare(`
+        UPDATE write_batches SET status = ?, updated_at = ? WHERE id = ?
+      `).run(updated.status, updated.updatedAt, id);
+      this.#database.prepare(`
+        UPDATE integrations SET record_json = ?, status = ?, updated_at = ?
+        WHERE id = ?
+      `).run(JSON.stringify(updated), updated.status, updated.updatedAt, id);
+      const eventType = updated.status !== current.status
+        ? updated.status === "testing"
+          ? "integration.testing"
+          : updated.status === "conflicted"
+            ? "integration.conflict_detected"
+            : updated.status === "failed"
+              ? "integration.failed"
+              : undefined
+        : updated.actualOverlaps.length > current.actualOverlaps.length
+          ? "integration.overlap_detected"
+          : undefined;
+      if (eventType) {
+        events.push(this.#appendEvent(
+          updated.taskId,
+          eventType,
+          {
+            integrationId: updated.id,
+            conflictFiles: updated.conflictFiles,
+            actualOverlaps: updated.actualOverlaps,
+          },
+          this.getTask(updated.taskId)?.currentRunId,
+        ));
+      }
+    });
     return updated;
   }
 
@@ -870,6 +951,24 @@ export class TaskStore {
     return row ? integrationRecordSchema.parse(JSON.parse(row.record_json)) : undefined;
   }
 
+  recordIntegrationApplicationConflict(
+    taskId: string,
+    runId: string,
+    paths: string[],
+  ): void {
+    const task = this.#requireTask(taskId);
+    this.#requireRun(runId);
+    this.#transaction((events) => {
+      events.push(this.#appendEvent(
+        taskId,
+        "integration.application_conflict",
+        { paths: [...new Set(paths)] },
+        runId,
+        task.sessionId,
+      ));
+    });
+  }
+
   setIntegrationAwaitingApply(
     taskId: string,
     runId: string,
@@ -878,7 +977,9 @@ export class TaskStore {
   ): void {
     const task = this.#requireTask(taskId);
     const run = this.#requireRun(runId);
-    if (task.kind === "worker") throw new Error("Worker 不能直接等待集成应用");
+    if (task.kind === "worker" || task.kind === "integration") {
+      throw new Error("Worker 或 Integrator 不能直接等待集成应用");
+    }
     this.#assertTaskTransition(task.status, "awaiting_apply");
     this.#assertRunTransition(run.status, "awaiting_apply");
     const now = new Date().toISOString();
@@ -1009,11 +1110,34 @@ export class TaskStore {
     status: RunnerResourceRecord["status"],
     cleanupError?: string,
   ): void {
-    this.#database.prepare(`
-      UPDATE runner_resources
-      SET status = ?, cleanup_error = ?, updated_at = ?
-      WHERE id = ?
-    `).run(status, cleanupError ?? null, new Date().toISOString(), id);
+    const resource = this.#database.prepare(`
+      SELECT task_id, run_id FROM runner_resources WHERE id = ?
+    `).get(id) as { task_id: string; run_id: string | null } | undefined;
+    if (!resource) return;
+    this.#transaction((events) => {
+      this.#database.prepare(`
+        UPDATE runner_resources
+        SET status = ?, cleanup_error = ?, updated_at = ?
+        WHERE id = ?
+      `).run(status, cleanupError ?? null, new Date().toISOString(), id);
+      const eventType = status === "active"
+        ? "worktree.created"
+        : status === "finalized"
+          ? "worktree.finalized"
+          : status === "cleanup_failed"
+            ? "worktree.cleanup_failed"
+            : undefined;
+      if (eventType) {
+        const task = this.getTask(resource.task_id);
+        events.push(this.#appendEvent(
+          resource.task_id,
+          eventType,
+          { resourceId: id, status, ...(cleanupError ? { error: cleanupError } : {}) },
+          resource.run_id ?? task?.currentRunId,
+          task?.sessionId,
+        ));
+      }
+    });
   }
 
   listRunnerResources(
@@ -1047,7 +1171,14 @@ export class TaskStore {
   saveWorkerResult(taskId: string, runId: string, result: WorkerResult): WorkerResult {
     const task = this.#requireTask(taskId);
     const run = this.#requireRun(runId);
-    if (task.kind !== "worker" || run.taskId !== task.id || task.currentRunId !== run.id) {
+    if (
+      (
+        task.kind !== "worker"
+        && !(task.kind === "integration" && task.assignedProfile === "integrator")
+      )
+      || run.taskId !== task.id
+      || task.currentRunId !== run.id
+    ) {
       throw new Error("Worker Result 与当前 Worker Run 不匹配");
     }
     const parsed = workerResultSchema.parse(result);
@@ -1303,7 +1434,7 @@ export class TaskStore {
       SELECT t.* FROM tasks t
       JOIN worker_delegation_tasks dt ON dt.task_id = t.id
       WHERE dt.delegation_id = ?
-      ORDER BY t.created_at ASC
+      ORDER BY dt.rowid ASC
     `).all(delegation.id) as unknown as TaskRow[];
     const tasks = rows.map(rowToTask);
     if (tasks.some((task) => !isTerminalTaskStatus(task.status))) return undefined;
@@ -1582,7 +1713,10 @@ export class TaskStore {
       : undefined;
     if (
       executionTask
-      && ["running", "waiting_approval", "waiting_user", "waiting_workers"].includes(
+      && [
+        "running", "waiting_approval", "waiting_user", "waiting_workers",
+        "awaiting_apply",
+      ].includes(
         executionTask.status,
       )
     ) {
@@ -2566,6 +2700,19 @@ export class TaskStore {
         JSON.stringify(artifact.metadata),
         artifact.createdAt,
       );
+      if (artifact.uri) {
+        const sha256 = typeof artifact.metadata.sha256 === "string"
+          ? artifact.metadata.sha256
+          : null;
+        const size = typeof artifact.metadata.size === "number"
+          ? Math.max(0, Math.trunc(artifact.metadata.size))
+          : null;
+        this.#database.prepare(`
+          INSERT INTO artifact_files (
+            artifact_id, uri, sha256, size_bytes, created_at
+          ) VALUES (?, ?, ?, ?, ?)
+        `).run(artifact.id, artifact.uri, sha256, size, artifact.createdAt);
+      }
       events.push(this.#appendEvent(
         artifact.taskId,
         "artifact.created",
@@ -2581,6 +2728,27 @@ export class TaskStore {
       "SELECT * FROM artifacts WHERE id = ?",
     ).get(id) as unknown as ArtifactRow | undefined;
     return row ? rowToArtifact(row) : undefined;
+  }
+
+  getArtifactFile(id: string): {
+    uri: string;
+    sha256?: string;
+    size?: number;
+  } | undefined {
+    const row = this.#database.prepare(`
+      SELECT uri, sha256, size_bytes FROM artifact_files WHERE artifact_id = ?
+    `).get(id) as {
+      uri: string;
+      sha256: string | null;
+      size_bytes: number | null;
+    } | undefined;
+    return row
+      ? {
+          uri: row.uri,
+          ...(row.sha256 ? { sha256: row.sha256 } : {}),
+          ...(row.size_bytes === null ? {} : { size: row.size_bytes }),
+        }
+      : undefined;
   }
 
   listArtifactGitRefs(): Array<{ ref: string; workspacePath: string }> {
@@ -2677,7 +2845,7 @@ export class TaskStore {
       WHERE workspace_id = ? AND session_id = ?
         AND status IN (
           'queued', 'running', 'waiting_approval', 'waiting_user',
-          'waiting_workers', 'paused'
+          'waiting_workers', 'awaiting_apply', 'paused'
         )
       LIMIT 1
     `).get(workspaceId, sessionId) as { found: number } | undefined;
@@ -3266,6 +3434,17 @@ export class TaskStore {
           created_at TEXT NOT NULL,
           PRIMARY KEY(task_id, run_id)
         );
+        CREATE TABLE write_batches (
+          id TEXT PRIMARY KEY,
+          root_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          baseline_commit TEXT NOT NULL,
+          status TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE INDEX write_batches_root_idx
+          ON write_batches(root_task_id, created_at);
         CREATE TABLE integrations (
           id TEXT PRIMARY KEY,
           root_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -3276,7 +3455,7 @@ export class TaskStore {
           updated_at TEXT NOT NULL
         );
         CREATE INDEX integrations_root_idx ON integrations(root_task_id, created_at);
-        CREATE UNIQUE INDEX integrations_task_idx ON integrations(task_id);
+        CREATE INDEX integrations_task_idx ON integrations(task_id, created_at);
         CREATE TABLE runner_resources (
           id TEXT PRIMARY KEY,
           root_task_id TEXT NOT NULL,
@@ -3293,6 +3472,15 @@ export class TaskStore {
         );
         CREATE INDEX runner_resources_cleanup_idx
           ON runner_resources(status, updated_at);
+        CREATE TABLE artifact_files (
+          artifact_id TEXT PRIMARY KEY REFERENCES artifacts(id) ON DELETE CASCADE,
+          uri TEXT NOT NULL,
+          sha256 TEXT,
+          size_bytes INTEGER,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX artifact_files_uri_idx ON artifact_files(uri);
+        CREATE INDEX artifact_files_sha_idx ON artifact_files(sha256);
         PRAGMA user_version = 6;
         COMMIT;
       `);
@@ -3459,6 +3647,17 @@ export class TaskStore {
           created_at TEXT NOT NULL,
           PRIMARY KEY(task_id, run_id)
         );
+        CREATE TABLE write_batches (
+          id TEXT PRIMARY KEY,
+          root_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          baseline_commit TEXT NOT NULL,
+          status TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE INDEX write_batches_root_idx
+          ON write_batches(root_task_id, created_at);
         CREATE TABLE integrations (
           id TEXT PRIMARY KEY,
           root_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -3469,7 +3668,7 @@ export class TaskStore {
           updated_at TEXT NOT NULL
         );
         CREATE INDEX integrations_root_idx ON integrations(root_task_id, created_at);
-        CREATE UNIQUE INDEX integrations_task_idx ON integrations(task_id);
+        CREATE INDEX integrations_task_idx ON integrations(task_id, created_at);
         CREATE TABLE runner_resources (
           id TEXT PRIMARY KEY,
           root_task_id TEXT NOT NULL,
@@ -3486,9 +3685,28 @@ export class TaskStore {
         );
         CREATE INDEX runner_resources_cleanup_idx
           ON runner_resources(status, updated_at);
+        CREATE TABLE artifact_files (
+          artifact_id TEXT PRIMARY KEY REFERENCES artifacts(id) ON DELETE CASCADE,
+          uri TEXT NOT NULL,
+          sha256 TEXT,
+          size_bytes INTEGER,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX artifact_files_uri_idx ON artifact_files(uri);
+        CREATE INDEX artifact_files_sha_idx ON artifact_files(sha256);
         PRAGMA user_version = 6;
         COMMIT;
       `);
+      const artifactsTable = this.#database.prepare(`
+        SELECT 1 AS found FROM sqlite_master
+        WHERE type = 'table' AND name = 'artifacts'
+      `).get() as { found: number } | undefined;
+      if (artifactsTable) {
+        this.#database.exec(`
+          INSERT OR IGNORE INTO artifact_files (artifact_id, uri, created_at)
+          SELECT id, uri, created_at FROM artifacts WHERE uri IS NOT NULL
+        `);
+      }
     }
   }
 }
@@ -3665,6 +3883,115 @@ export class TaskOrchestrator {
     return promise;
   }
 
+  async executeIntegrationTask(input: {
+    parentTaskId: string;
+    sourceSessionId: string;
+    objective: string;
+    conflictFiles: string[];
+    worktreeContext: NonNullable<PromptExecutionInput["worktreeContext"]>;
+    budget: TaskBudget;
+    signal: AbortSignal;
+  }): Promise<WorkerResultEnvelope> {
+    if (this.#disposed) throw new Error("Task Orchestrator 已释放");
+    const parent = this.#store.getTask(input.parentTaskId);
+    if (!parent || parent.kind === "worker" || !parent.workspacePath) {
+      throw new Error("Integrator 只能由 Orchestrator 为项目根任务创建");
+    }
+    const taskId = randomUUID();
+    const workerContext = workerContextPackageSchema.parse({
+      rootTaskId: parent.rootTaskId,
+      parentTaskId: parent.id,
+      workerTaskId: taskId,
+      objective: input.objective,
+      successCriteria: [
+        input.conflictFiles.length > 0
+          ? "仅解决声明的普通文本冲突并移除全部冲突标记"
+          : "审查真实重叠结果，不修改任何文件",
+        "提交结构化解决说明、风险和未决项",
+      ],
+      constraints: [
+        "不得修改声明冲突路径之外的文件",
+        "不得扩展功能范围",
+        "不得执行 Git 写操作",
+      ],
+      knownFacts: input.conflictFiles.map((path) => `允许处理的冲突路径：${path}`),
+      fileHints: input.conflictFiles,
+      symbolHints: [],
+      budget: input.budget,
+    });
+    const execution = promptExecutionInputSchema.parse({
+      type: "agent-prompt",
+      sourceSessionId: input.sourceSessionId,
+      preferFork: true,
+      interactionMode: "worker",
+      workerProfile: "integrator",
+      workerContext,
+      worktreeContext: input.worktreeContext,
+      deliveryMode: "background",
+    });
+    const task = this.#store.createTask({
+      id: taskId,
+      workspaceId: parent.workspaceId,
+      workspacePath: parent.workspacePath,
+      kind: "integration",
+      title: `Integrator：${input.objective.slice(0, 120)}`,
+      goal: input.objective,
+      parentTaskId: parent.id,
+      assignedProfile: "integrator",
+      systemCreated: true,
+      execution,
+      priority: parent.priority,
+    });
+    const run = this.#store.createRun(task.id, "worktree-integrator");
+    let handle: TaskExecutionHandle | undefined;
+    const abort = () => {
+      void handle?.cancel().catch(() => undefined);
+    };
+    input.signal.addEventListener("abort", abort, { once: true });
+    try {
+      handle = await this.#executor({
+        task,
+        run,
+        execution,
+        signal: input.signal,
+      });
+      this.#store.bindRun(task.id, run.id, {
+        sessionId: handle.sessionId,
+        ...(handle.modelProvider ? { modelProvider: handle.modelProvider } : {}),
+        ...(handle.modelId ? { modelId: handle.modelId } : {}),
+      });
+      if (input.signal.aborted) await handle.cancel().catch(() => undefined);
+      await handle.completion;
+      if (handle.captureContext) {
+        this.#store.updateExecution(task.id, handle.captureContext());
+      }
+      const result = this.#store.getWorkerResult(task.id, run.id);
+      if (!result) throw new Error("Integrator 未提交结构化解决说明");
+      this.#store.finishRun(
+        task.id,
+        run.id,
+        input.signal.aborted ? "cancelled" : "succeeded",
+        undefined,
+        summarize(result.summary),
+      );
+      return {
+        task: this.#store.getTask(task.id)!,
+        status: input.signal.aborted ? "cancelled" : "succeeded",
+        result,
+      };
+    } catch (error) {
+      this.#store.finishRun(
+        task.id,
+        run.id,
+        input.signal.aborted ? "cancelled" : "failed",
+        input.signal.aborted ? undefined : formatError(error),
+      );
+      throw error;
+    } finally {
+      input.signal.removeEventListener("abort", abort);
+    }
+  }
+
   saveWorkerResult(
     taskId: string,
     runId: string,
@@ -3760,7 +4087,10 @@ export class TaskOrchestrator {
     const sessionId = maybeSessionId ?? workspaceIdOrSessionId;
     if (!workspaceId) return undefined;
     return this.#store.listTasks(workspaceId, {
-      statuses: ["running", "waiting_approval", "waiting_user", "waiting_workers"],
+      statuses: [
+        "running", "waiting_approval", "waiting_user", "waiting_workers",
+        "awaiting_apply",
+      ],
       limit: 500,
     }).find((task) => task.sessionId === sessionId);
   }
@@ -3773,6 +4103,24 @@ export class TaskOrchestrator {
     const task = this.#store.getTask(taskId);
     if (!task) return false;
     if (isTerminalTaskStatus(task.status)) return true;
+    if (task.status === "awaiting_apply") {
+      const detail = this.#store.getTaskDetail(taskId);
+      const request = detail?.requests.find((candidate) =>
+        candidate.kind === "integration_approval" && candidate.status === "pending");
+      const runId = task.currentRunId;
+      if (!detail || !request || !runId) return false;
+      const waiter = this.#integrationWaiters.get(request.id);
+      if (waiter) {
+        this.#integrationWaiters.delete(request.id);
+        waiter.resolve("cancel");
+        return true;
+      }
+      if (detail.integration) {
+        this.#store.updateIntegration(detail.integration.id, { status: "cancelled" });
+      }
+      this.#store.finishIntegrationDecision(task.id, runId, "cancel", request.id);
+      return true;
+    }
     const descendants = this.#store.listDescendantTasks(taskId)
       .filter((candidate) => !isTerminalTaskStatus(candidate.status));
     await Promise.allSettled(descendants.map((candidate) =>
@@ -3834,7 +4182,10 @@ export class TaskOrchestrator {
     const executionTask = detail.executionTask;
     if (
       executionTask
-      && ["running", "waiting_approval", "waiting_user", "waiting_workers"].includes(
+      && [
+        "running", "waiting_approval", "waiting_user", "waiting_workers",
+        "awaiting_apply",
+      ].includes(
         executionTask.status,
       )
     ) {

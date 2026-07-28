@@ -1,7 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
+import { isUtf8 } from "node:buffer";
 import {
   access,
+  cp,
   lstat,
   mkdir,
   mkdtemp,
@@ -66,6 +68,32 @@ export interface CherryPickResult {
   conflictKinds: Record<string, string>;
 }
 
+export interface ConflictStage {
+  stage: "base" | "ours" | "theirs";
+  mode: string;
+  objectId: string;
+}
+
+export interface ConflictFileInspection {
+  path: string;
+  workspacePath: string;
+  kind: string;
+  safeForIntegrator: boolean;
+  reasons: string[];
+  size?: number;
+  stages: ConflictStage[];
+}
+
+export interface ConflictInspection {
+  safeForIntegrator: boolean;
+  files: ConflictFileInspection[];
+}
+
+export interface IntegratorGuard {
+  allowedFiles: string[];
+  protectedStateSha256: string;
+}
+
 export interface ArtifactFile {
   uri: string;
   sha256: string;
@@ -93,7 +121,7 @@ export class ArtifactStore {
     rootTaskId: string,
     artifactId: string,
     extension: string,
-    content: string,
+    content: string | Uint8Array,
   ): Promise<ArtifactFile> {
     for (const value of [workspaceId, rootTaskId, artifactId]) validateId(value);
     if (!/^[A-Za-z0-9]{1,12}$/u.test(extension)) throw new Error("Artifact 扩展名无效");
@@ -101,9 +129,9 @@ export class ArtifactStore {
     await mkdir(directory, { recursive: true });
     const uri = join(directory, `${artifactId}.${extension}`);
     const temporary = `${uri}.${randomUUID()}.tmp`;
-    await writeFile(temporary, content, { encoding: "utf8", mode: 0o600 });
+    await writeFile(temporary, content, { mode: 0o600 });
     await rename(temporary, uri);
-    const bytes = Buffer.byteLength(content);
+    const bytes = typeof content === "string" ? Buffer.byteLength(content) : content.byteLength;
     return {
       uri,
       sha256: createHash("sha256").update(content).digest("hex"),
@@ -120,16 +148,22 @@ export class ArtifactStore {
     assertInside(this.#root, path);
     const info = await stat(path);
     const start = Math.min(info.size, Math.max(0, Math.trunc(offset)));
-    const end = Math.min(info.size, start + Math.max(1, Math.min(256 * 1024, limit)));
+    const requested = Math.max(1, Math.min(256 * 1024, limit));
+    const end = Math.min(info.size, start + requested + 3);
     const handle = await import("node:fs/promises").then(({ open }) => open(path, "r"));
     try {
       const buffer = Buffer.alloc(end - start);
       await handle.read(buffer, 0, buffer.length, start);
+      const consumed = safeUtf8ChunkLength(
+        buffer,
+        Math.min(requested, buffer.length),
+        end >= info.size,
+      );
       return {
-        content: buffer.toString("utf8"),
-        nextOffset: end,
+        content: buffer.subarray(0, consumed).toString("utf8"),
+        nextOffset: start + consumed,
         totalBytes: info.size,
-        done: end >= info.size,
+        done: start + consumed >= info.size,
       };
     } finally {
       await handle.close();
@@ -160,11 +194,14 @@ export class WorktreeRunner {
   }
 
   async inspectRepository(): Promise<RepositoryDescriptor> {
-    const repositoryRoot = (await git(
+    const rootResult = await git(
       this.#workspace,
       ["rev-parse", "--show-toplevel"],
       this.#timeoutMs,
-    )).stdout.trim();
+      undefined,
+      true,
+    );
+    const repositoryRoot = rootResult.stdout.trim();
     if (!repositoryRoot) throw new Error("隔离写入只支持 Git 工作区");
     const resolvedRoot = await realpath(repositoryRoot);
     const resolvedWorkspace = await realpath(this.#workspace);
@@ -182,19 +219,65 @@ export class WorktreeRunner {
     };
   }
 
-  async createBaseline(message: string): Promise<{
+  async createBaseline(
+    message: string,
+    onCreated?: (baseline: {
+      artifactId: string;
+      commit: string;
+      ref: string;
+      repository: RepositoryDescriptor;
+    }) => void | Promise<void>,
+  ): Promise<{
+    artifactId: string;
     commit: string;
     ref: string;
     repository: RepositoryDescriptor;
   }> {
     const repository = await this.inspectRepository();
     await assertRepositoryIdle(repository.commonDirectory);
+    const workspaceGitDirectory = resolve(
+      repository.repositoryRoot,
+      (await git(
+        this.#workspace,
+        ["rev-parse", "--git-dir"],
+        this.#timeoutMs,
+      )).stdout.trim(),
+    );
+    if (workspaceGitDirectory !== repository.commonDirectory) {
+      await assertRepositoryIdle(workspaceGitDirectory);
+    }
     const checkpoint = await new GitCheckpointManager(this.#workspace).create(message);
-    return {
+    const artifactId = randomUUID();
+    const ref = `refs/deki/artifacts/${artifactId}`;
+    await git(
+      repository.repositoryRoot,
+      ["update-ref", ref, checkpoint.commit],
+      this.#timeoutMs,
+    );
+    const baseline = {
+      artifactId,
       commit: checkpoint.commit,
-      ref: checkpoint.ref,
+      ref,
       repository,
     };
+    try {
+      await onCreated?.(baseline);
+      await git(
+        repository.repositoryRoot,
+        ["update-ref", "-d", checkpoint.ref, checkpoint.commit],
+        this.#timeoutMs,
+      );
+      return baseline;
+    } catch (error) {
+      await git(
+        repository.repositoryRoot,
+        ["update-ref", "-d", ref, checkpoint.commit],
+        this.#timeoutMs,
+        undefined,
+        true,
+      );
+      throw error;
+    }
   }
 
   async createWorktree(input: {
@@ -203,6 +286,7 @@ export class WorktreeRunner {
     kind: "worker" | "integration";
     baseCommit: string;
     repository?: RepositoryDescriptor;
+    onAllocated?: (resource: WorktreeResource) => void | Promise<void>;
   }): Promise<WorktreeResource> {
     validateId(input.rootTaskId);
     validateId(input.resourceId);
@@ -213,6 +297,19 @@ export class WorktreeRunner {
     const branchRef = `refs/heads/${branch}`;
     const path = join(this.#worktreesRoot, input.rootTaskId, input.resourceId);
     assertInside(this.#worktreesRoot, path);
+    const resource: WorktreeResource = {
+      id: input.resourceId,
+      kind: input.kind,
+      path,
+      cwd: repository.workspaceRelativePath
+        ? join(path, repository.workspaceRelativePath)
+        : path,
+      branch,
+      branchRef,
+      baseCommit: input.baseCommit,
+      repository,
+    };
+    await input.onAllocated?.(resource);
     await mkdir(dirname(path), { recursive: true });
     await git(repository.repositoryRoot, [
       "worktree",
@@ -228,18 +325,7 @@ export class WorktreeRunner {
       input.baseCommit,
     ], this.#timeoutMs);
     await git(path, ["switch", branch], this.#timeoutMs);
-    return {
-      id: input.resourceId,
-      kind: input.kind,
-      path,
-      cwd: repository.workspaceRelativePath
-        ? join(path, repository.workspaceRelativePath)
-        : path,
-      branch,
-      branchRef,
-      baseCommit: input.baseCommit,
-      repository,
-    };
+    return resource;
   }
 
   async finalizeImplementer(input: {
@@ -248,6 +334,20 @@ export class WorktreeRunner {
     validationTargets: ValidationTarget[];
     signal?: AbortSignal;
   }): Promise<FinalizedWorktree> {
+    await assertWriteSetOutsideSubmodules(
+      input.resource.path,
+      input.writeSet,
+      this.#timeoutMs,
+      input.signal,
+    );
+    // Intent-to-add makes non-ignored untracked files visible to diff without
+    // staging their content or creating a commit.
+    await git(
+      input.resource.path,
+      ["add", "-N", "--", "."],
+      this.#timeoutMs,
+      input.signal,
+    );
     const patch = (await git(input.resource.path, [
       "diff",
       "--binary",
@@ -367,11 +467,125 @@ export class WorktreeRunner {
     return { ok: false, conflictFiles, conflictKinds };
   }
 
-  async continueCherryPick(
+  async inspectConflicts(
+    integration: WorktreeResource,
+    picked: CherryPickResult,
+    writeSet: WorkerWriteSetEntry[],
+    signal?: AbortSignal,
+  ): Promise<ConflictInspection> {
+    const normalizedWriteSet = validateWriteSet(writeSet);
+    const files: ConflictFileInspection[] = [];
+    for (const path of picked.conflictFiles) {
+      const workspacePath = toWorkspacePath(
+        path,
+        integration.repository.workspaceRelativePath,
+      );
+      const stages = await conflictStages(
+        integration.path,
+        path,
+        this.#timeoutMs,
+        signal,
+      );
+      const reasons: string[] = [];
+      const kind = picked.conflictKinds[path] ?? "unknown";
+      if (kind !== "UU") reasons.push(`不支持的冲突类型：${kind}`);
+      if (workspacePath.startsWith("../") || workspacePath === ".") {
+        reasons.push("冲突路径位于声明工作区之外");
+      }
+      if (normalizedWriteSet.some((entry) =>
+        (entry.exclusive || isImplicitExclusive(entry.path))
+        && pathMatchesWriteSet(workspacePath, entry))) {
+        reasons.push("冲突路径属于 exclusive 写入范围");
+      }
+      if (stages.some((stage) => stage.mode === "160000")) {
+        reasons.push("冲突包含 Git submodule");
+      }
+      let size: number | undefined;
+      try {
+        const info = await lstat(join(integration.path, path));
+        size = info.size;
+        if (!info.isFile() || info.isSymbolicLink()) {
+          reasons.push("冲突路径不是普通文件");
+        } else if (info.size > 1024 * 1024) {
+          reasons.push("冲突文件超过 1 MiB");
+        } else {
+          const content = await readFile(join(integration.path, path));
+          if (!isUtf8(content)) reasons.push("冲突文件不是 UTF-8 文本");
+        }
+      } catch {
+        reasons.push("冲突路径无法作为普通文件读取");
+      }
+      files.push({
+        path,
+        workspacePath,
+        kind,
+        safeForIntegrator: reasons.length === 0,
+        reasons,
+        ...(size === undefined ? {} : { size }),
+        stages,
+      });
+    }
+    return {
+      safeForIntegrator: files.length > 0
+        && files.every((file) => file.safeForIntegrator),
+      files,
+    };
+  }
+
+  async readConflictStage(
+    integration: WorktreeResource,
+    stage: ConflictStage,
+    signal?: AbortSignal,
+  ): Promise<Buffer> {
+    if (!gitHash.test(stage.objectId)) throw new Error("冲突 Git 对象无效");
+    return gitObject(
+      integration.path,
+      stage.objectId,
+      this.#timeoutMs,
+      signal,
+    );
+  }
+
+  async captureIntegratorGuard(
     integration: WorktreeResource,
     allowedFiles: string[],
     signal?: AbortSignal,
+  ): Promise<IntegratorGuard> {
+    const normalized = [...new Set(allowedFiles.map(normalizeRelativePath))];
+    return {
+      allowedFiles: normalized,
+      protectedStateSha256: await protectedStateSha256(
+        integration.path,
+        normalized,
+        this.#timeoutMs,
+        signal,
+      ),
+    };
+  }
+
+  async continueCherryPick(
+    integration: WorktreeResource,
+    guard: IntegratorGuard,
+    signal?: AbortSignal,
   ): Promise<string> {
+    await this.assertIntegratorGuard(integration, guard, signal);
+    for (const path of guard.allowedFiles) {
+      try {
+        const content = await readFile(join(integration.path, path), "utf8");
+        if (/^(?:<<<<<<<|=======|>>>>>>>)(?: .*)?$/mu.test(content)) {
+          throw new Error(`Integrator 未清理冲突标记：${path}`);
+        }
+      } catch (error) {
+        if (error instanceof Error && error.message.includes("冲突标记")) throw error;
+        // A deletion can be an explicit conflict resolution.
+      }
+    }
+    await git(
+      integration.path,
+      ["add", "-A", "--", ...guard.allowedFiles],
+      this.#timeoutMs,
+      signal,
+    );
     const unresolved = splitZero((await git(
       integration.path,
       ["diff", "--name-only", "--diff-filter=U", "-z"],
@@ -380,16 +594,35 @@ export class WorktreeRunner {
       true,
     )).stdout);
     if (unresolved.length > 0) throw new Error(`仍有未解决冲突：${unresolved.join(", ")}`);
-    const changed = await listChangedFiles(
+    await git(
       integration.path,
-      integration.baseCommit,
+      ["diff", "--cached", "--check"],
       this.#timeoutMs,
       signal,
     );
-    const unexpected = changed.filter((path) => !allowedFiles.includes(path));
-    if (unexpected.length > 0) throw new Error(`Integrator 修改了冲突范围外文件：${unexpected.join(", ")}`);
-    await git(integration.path, ["cherry-pick", "--continue"], this.#timeoutMs, signal);
+    await git(
+      integration.path,
+      ["-c", "core.editor=true", "cherry-pick", "--continue"],
+      this.#timeoutMs,
+      signal,
+    );
     return (await git(integration.path, ["rev-parse", "HEAD"], this.#timeoutMs)).stdout.trim();
+  }
+
+  async assertIntegratorGuard(
+    integration: WorktreeResource,
+    guard: IntegratorGuard,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const currentGuard = await protectedStateSha256(
+      integration.path,
+      guard.allowedFiles,
+      this.#timeoutMs,
+      signal,
+    );
+    if (currentGuard !== guard.protectedStateSha256) {
+      throw new Error("Integrator 修改了冲突范围外文件");
+    }
   }
 
   async validateIntegration(
@@ -420,6 +653,42 @@ export class WorktreeRunner {
       ], this.#timeoutMs)).stdout,
       changedFiles: await listChangedFiles(resource.path, baselineCommit, this.#timeoutMs),
     };
+  }
+
+  async rescuePatch(
+    resource: WorktreeResource,
+  ): Promise<{ patch: string; changedFiles: string[] } | undefined> {
+    try {
+      await access(resource.path);
+      await git(
+        resource.path,
+        ["add", "-N", "--", "."],
+        this.#timeoutMs,
+        undefined,
+        true,
+      );
+      const patch = (await git(
+        resource.path,
+        [
+          "diff", "--binary", "--full-index", "--no-ext-diff",
+          resource.baseCommit, "--", ".",
+        ],
+        this.#timeoutMs,
+        undefined,
+        true,
+      )).stdout;
+      if (!patch.trim()) return undefined;
+      return {
+        patch,
+        changedFiles: await listChangedFiles(
+          resource.path,
+          resource.baseCommit,
+          this.#timeoutMs,
+        ),
+      };
+    } catch {
+      return undefined;
+    }
   }
 
   async createArtifactRef(artifactId: string, commit: string): Promise<string> {
@@ -493,46 +762,58 @@ export class WorktreeRunner {
     }
     const temporary = await mkdtemp(join(tmpdir(), "deki-integration-apply-"));
     const patchFile = join(temporary, "integration.patch");
-    await writeFile(patchFile, input.patch, "utf8");
-    const backups = join(temporary, "backup");
-    await mkdir(backups, { recursive: true });
-    const existing = new Set<string>();
-    for (const path of changes.flatMap((change) => change.paths)) {
-      const source = join(repository.repositoryRoot, path);
-      try {
-        const info = await lstat(source);
-        if (info.isFile() || info.isSymbolicLink()) {
-          existing.add(path);
-          const destination = join(backups, path);
-          await mkdir(dirname(destination), { recursive: true });
-          if (info.isSymbolicLink()) {
-            const target = await readFile(source, "utf8").catch(() => "");
-            await writeFile(destination, target, "utf8");
-          } else {
-            await writeFile(destination, await readFile(source));
-          }
-        }
-      } catch {
-        // Missing paths need no backup.
-      }
-    }
-    await new GitCheckpointManager(this.#workspace).create(
-      `Safety checkpoint before applying integration ${input.integrationCommit.slice(0, 12)}`,
-    );
-    await git(repository.repositoryRoot, ["apply", "--check", "--binary", patchFile], this.#timeoutMs);
     try {
-      await git(repository.repositoryRoot, ["apply", "--binary", patchFile], this.#timeoutMs);
-    } catch (error) {
+      await writeFile(patchFile, input.patch, "utf8");
+      const backups = join(temporary, "backup");
+      await mkdir(backups, { recursive: true });
+      const existing = new Set<string>();
       for (const path of changes.flatMap((change) => change.paths)) {
-        const destination = join(repository.repositoryRoot, path);
-        if (!existing.has(path)) {
-          await rm(destination, { recursive: true, force: true });
-          continue;
+        const source = join(repository.repositoryRoot, path);
+        try {
+          const info = await lstat(source);
+          if (info.isFile() || info.isSymbolicLink()) {
+            existing.add(path);
+            const destination = join(backups, path);
+            await mkdir(dirname(destination), { recursive: true });
+            await cp(source, destination, {
+              recursive: true,
+              force: true,
+              dereference: false,
+              preserveTimestamps: true,
+            });
+          }
+        } catch {
+          // Missing paths need no backup.
         }
-        await mkdir(dirname(destination), { recursive: true });
-        await writeFile(destination, await readFile(join(backups, path)));
       }
-      throw error;
+      await new GitCheckpointManager(this.#workspace).create(
+        `Safety checkpoint before applying integration ${input.integrationCommit.slice(0, 12)}`,
+      );
+      await git(
+        repository.repositoryRoot,
+        ["apply", "--check", "--binary", patchFile],
+        this.#timeoutMs,
+      );
+      try {
+        await git(repository.repositoryRoot, ["apply", "--binary", patchFile], this.#timeoutMs);
+      } catch (error) {
+        for (const path of changes.flatMap((change) => change.paths)) {
+          const destination = join(repository.repositoryRoot, path);
+          if (!existing.has(path)) {
+            await rm(destination, { recursive: true, force: true });
+            continue;
+          }
+          await mkdir(dirname(destination), { recursive: true });
+          await rm(destination, { recursive: true, force: true });
+          await cp(join(backups, path), destination, {
+            recursive: true,
+            force: true,
+            dereference: false,
+            preserveTimestamps: true,
+          });
+        }
+        throw error;
+      }
     } finally {
       await rm(temporary, { recursive: true, force: true });
     }
@@ -663,6 +944,32 @@ async function assertRepositoryIdle(commonDirectory: string): Promise<void> {
   }
 }
 
+async function assertWriteSetOutsideSubmodules(
+  cwd: string,
+  writeSet: WorkerWriteSetEntry[],
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  const result = await git(
+    cwd,
+    ["config", "--file", ".gitmodules", "--get-regexp", "path"],
+    timeoutMs,
+    signal,
+    true,
+  );
+  if (result.code !== 0) return;
+  const submodules = result.stdout.split("\n").flatMap((line) => {
+    const match = line.trim().match(/^\S+\s+(.+)$/u);
+    return match?.[1] ? [normalizeRelativePath(match[1])] : [];
+  });
+  for (const entry of writeSet) {
+    const path = normalizeRelativePath(entry.path);
+    const submodule = submodules.find((candidate) =>
+      isPathPrefix(candidate, path) || isPathPrefix(path, candidate));
+    if (submodule) throw new Error(`M5 不允许修改 Git submodule 路径：${submodule}`);
+  }
+}
+
 async function listChangedFiles(
   cwd: string,
   base: string,
@@ -691,6 +998,62 @@ async function nameStatus(
     result.push({ status, paths: records.slice(index, index += count) });
   }
   return result;
+}
+
+async function conflictStages(
+  cwd: string,
+  path: string,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<ConflictStage[]> {
+  const output = (await git(
+    cwd,
+    ["ls-files", "-u", "-z", "--", path],
+    timeoutMs,
+    signal,
+    true,
+  )).stdout;
+  const names = { 1: "base", 2: "ours", 3: "theirs" } as const;
+  return splitZero(output).flatMap((record) => {
+    const match = record.match(/^(\d{6}) ([0-9a-f]{40,64}) ([123])\t/u);
+    if (!match?.[1] || !match[2] || !match[3]) return [];
+    const stageNumber = Number(match[3]) as 1 | 2 | 3;
+    return [{
+      stage: names[stageNumber],
+      mode: match[1],
+      objectId: match[2],
+    }];
+  });
+}
+
+async function protectedStateSha256(
+  cwd: string,
+  allowedFiles: string[],
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<string> {
+  const exclusions = allowedFiles.map((path) => `:(exclude,literal)${path}`);
+  const [diff, untracked] = await Promise.all([
+    git(
+      cwd,
+      ["diff", "--binary", "--full-index", "HEAD", "--", ".", ...exclusions],
+      timeoutMs,
+      signal,
+      true,
+    ),
+    git(
+      cwd,
+      ["ls-files", "--others", "--exclude-standard", "-z", "--", ".", ...exclusions],
+      timeoutMs,
+      signal,
+      true,
+    ),
+  ]);
+  return createHash("sha256")
+    .update(diff.stdout)
+    .update("\0")
+    .update(untracked.stdout)
+    .digest("hex");
 }
 
 async function runValidation(
@@ -790,6 +1153,56 @@ async function git(
   return result;
 }
 
+async function gitObject(
+  cwd: string,
+  objectId: string,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<Buffer> {
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn("git", ["cat-file", "blob", objectId], {
+      cwd,
+      env: process.env,
+      shell: false,
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const stdout: Buffer[] = [];
+    let stderr = "";
+    let size = 0;
+    let timedOut = false;
+    child.stdout.on("data", (chunk: Buffer) => {
+      size += chunk.byteLength;
+      if (size > 64 * 1024 * 1024) {
+        child.kill("SIGTERM");
+        return;
+      }
+      stdout.push(chunk);
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr = `${stderr}${chunk.toString("utf8")}`.slice(-100_000);
+    });
+    const abort = () => child.kill("SIGTERM");
+    signal?.addEventListener("abort", abort, { once: true });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+    }, timeoutMs);
+    child.once("error", reject);
+    child.once("close", (code) => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      if (size > 64 * 1024 * 1024) {
+        reject(new Error("冲突 Artifact 单个 Git 对象超过 64 MiB"));
+      } else if (!timedOut && code === 0) {
+        resolvePromise(Buffer.concat(stdout));
+      } else {
+        reject(new Error(`读取冲突 Git 对象失败：${stderr.trim() || `exit ${code ?? -1}`}`));
+      }
+    });
+  });
+}
+
 interface ProcessResult {
   code: number;
   stdout: string;
@@ -844,6 +1257,34 @@ async function processRun(
 
 function splitZero(value: string): string[] {
   return value.split("\0").filter(Boolean);
+}
+
+function safeUtf8ChunkLength(
+  buffer: Buffer,
+  requested: number,
+  endOfFile: boolean,
+): number {
+  if (endOfFile && buffer.length <= requested) return buffer.length;
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  const valid = (length: number) => {
+    try {
+      decoder.decode(buffer.subarray(0, length));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  for (let length = requested; length > Math.max(0, requested - 4); length -= 1) {
+    if (length > 0 && valid(length)) return length;
+  }
+  for (
+    let length = requested + 1;
+    length <= Math.min(buffer.length, requested + 3);
+    length += 1
+  ) {
+    if (valid(length)) return length;
+  }
+  return Math.min(requested, buffer.length);
 }
 
 function validateId(value: string): void {

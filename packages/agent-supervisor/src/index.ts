@@ -57,8 +57,9 @@ export class AgentSupervisor {
       runId: run.id,
       sessionId: handle.sessionId,
       workspaceId: task.workspaceId,
-      role: task.kind === "worker" ? "worker" : "main",
-      ...(task.kind === "worker" && isWorkerProfile(task.assignedProfile)
+      role: task.kind === "worker" || task.kind === "integration" ? "worker" : "main",
+      ...((task.kind === "worker" || task.kind === "integration")
+        && isWorkerProfile(task.assignedProfile)
         ? { profile: task.assignedProfile }
         : {}),
       startedAt: new Date().toISOString(),

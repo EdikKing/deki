@@ -186,6 +186,7 @@ export function App() {
           "waiting_approval",
           "waiting_user",
           "waiting_workers",
+          "awaiting_apply",
           "queued",
           "paused",
           "interrupted",
@@ -197,6 +198,7 @@ export function App() {
         && (
           item.task.status === "waiting_approval"
           || item.task.status === "waiting_user"
+          || item.task.status === "awaiting_apply"
           || !item.runnable
         )
       ).length);

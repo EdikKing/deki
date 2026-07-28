@@ -1498,7 +1498,7 @@ export class DekiAgentRuntime {
         : this.#gateway.listTools().filter((tool) => tool.providerId === "interaction");
       const tools = workerProfile
         ? availableTools.filter((tool) =>
-          workerProfile === "implementer"
+          workerProfile === "implementer" || workerProfile === "integrator"
             ? (
               (
                 tool.providerId === "worker"

@@ -146,11 +146,13 @@ export function TaskCenter(props: TaskCenterProps) {
     const attention = rootTasks.filter((item) =>
       item.task.status === "waiting_approval"
       || item.task.status === "waiting_user"
+      || item.task.status === "awaiting_apply"
       || (
         !item.runnable
         && [
           "queued", "running", "waiting_approval", "waiting_user",
           "waiting_workers", "paused", "interrupted",
+          "awaiting_apply",
         ].includes(item.task.status)
       ));
     const attentionIds = new Set(attention.map((item) => item.task.id));
@@ -418,6 +420,8 @@ export function TaskCenter(props: TaskCenterProps) {
                     {" · "}
                     {detail.integration.workerTaskIds.length} Implementer
                     {" · "}
+                    {detail.integration.integratorTaskIds.length} Integrator
+                    {" · "}
                     {detail.integration.cleanupStatus}
                   </p>
                   {detail.integration.predictedOverlaps.length > 0 && (
@@ -429,9 +433,17 @@ export function TaskCenter(props: TaskCenterProps) {
                       {detail.integration.actualOverlaps.join("；")}</p>
                   )}
                   {detail.integration.conflictFiles.length > 0 && (
-                    <p className="error">{props.zh ? "冲突文件：" : "Conflicts: "}
+                    <p className={detail.integration.status === "conflicted" ? "error" : undefined}>
+                      {detail.integration.status === "conflicted"
+                        ? props.zh ? "未决冲突：" : "Unresolved conflicts: "
+                        : props.zh ? "已审查冲突：" : "Reviewed conflicts: "}
                       {detail.integration.conflictFiles.join("；")}</p>
                   )}
+                  {detail.integration.resolutionSummaries.map((summary, index) => (
+                    <p key={`${index}-${summary.slice(0, 20)}`}>
+                      {props.zh ? "Integrator 说明：" : "Integrator note: "}{summary}
+                    </p>
+                  ))}
                   {detail.integration.cleanupError && (
                     <p className="error">{detail.integration.cleanupError}</p>
                   )}
@@ -467,29 +479,38 @@ export function TaskCenter(props: TaskCenterProps) {
                 <section className="task-request" key={request.id}>
                   <span>{request.kind === "approval"
                     ? (props.zh ? "需要审批" : "Approval required")
-                    : (props.zh ? "需要输入" : "Input required")}</span>
+                    : request.kind === "integration_approval"
+                      ? (props.zh ? "需要应用决定" : "Apply decision required")
+                      : (props.zh ? "需要输入" : "Input required")}</span>
                   <h3>{request.title}</h3>
                   {request.description && <p>{request.description}</p>}
                   {request.kind === "integration_approval" ? (
-                    <div className="task-request-actions">
-                      <button onClick={() => void command(window.deki.respondToIntegration(
-                        detail.task.id,
-                        request.id,
-                        "cancel",
-                      ))}>{props.zh ? "取消集成" : "Cancel"}</button>
-                      <button onClick={() => void command(window.deki.respondToIntegration(
-                        detail.task.id,
-                        request.id,
-                        "artifact_only",
-                      ))}>{props.zh ? "仅保留产物" : "Keep artifacts"}</button>
-                      <button className="primary" onClick={() => void command(
-                        window.deki.respondToIntegration(
+                    <>
+                      <p>
+                        {props.zh
+                          ? "当前工作区尚未被修改；请先检查完整 Diff 与测试结果。"
+                          : "The current workspace is unchanged; review the full diff and test results first."}
+                      </p>
+                      <div className="task-request-actions">
+                        <button onClick={() => void command(window.deki.respondToIntegration(
                           detail.task.id,
                           request.id,
-                          "apply",
-                        ),
-                      )}>{props.zh ? "应用到工作区" : "Apply to workspace"}</button>
-                    </div>
+                          "cancel",
+                        ))}>{props.zh ? "取消集成" : "Cancel"}</button>
+                        <button onClick={() => void command(window.deki.respondToIntegration(
+                          detail.task.id,
+                          request.id,
+                          "artifact_only",
+                        ))}>{props.zh ? "仅保留产物" : "Keep artifacts"}</button>
+                        <button className="primary" onClick={() => void command(
+                          window.deki.respondToIntegration(
+                            detail.task.id,
+                            request.id,
+                            "apply",
+                          ),
+                        )}>{props.zh ? "应用到工作区" : "Apply to workspace"}</button>
+                      </div>
+                    </>
                   ) : request.kind === "approval" ? (
                     <>
                       <pre className="task-request-details">
@@ -738,6 +759,7 @@ function TaskActions(props: {
         "waiting_approval",
         "waiting_user",
         "waiting_workers",
+        "awaiting_apply",
         "paused",
       ].includes(task.status) && (
         <button className="danger-text" onClick={() => void props.onCommand(

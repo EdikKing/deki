@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -31,6 +31,9 @@ describe("WorktreeRunner", () => {
     const baseline = await runner.createBaseline("test baseline");
     const after = await snapshot(fixture.repo);
     expect(after).toEqual(before);
+    expect(baseline.ref).toBe(`refs/deki/artifacts/${baseline.artifactId}`);
+    expect((await git(fixture.repo, "for-each-ref", "--format=%(refname)",
+      "refs/deki/checkpoints/")).stdout).toBe("");
     expect((await git(fixture.repo, "show", `${baseline.commit}:tracked.txt`)).stdout)
       .toBe("dirty\n");
     expect((await git(fixture.repo, "show", `${baseline.commit}:untracked.txt`)).stdout)
@@ -61,6 +64,28 @@ describe("WorktreeRunner", () => {
     await runner.cleanup(resource);
     expect((await git(fixture.repo, "rev-parse", ref)).stdout.trim()).toBe(result.commit);
     expect(await readFile(join(fixture.repo, "tracked.txt"), "utf8")).toBe("base\n");
+  });
+
+  it("persists allocation intent before creating a worktree", async () => {
+    const fixture = await repository();
+    const runner = new WorktreeRunner(fixture.repo, { worktreesRoot: fixture.worktrees });
+    const baseline = await runner.createBaseline("test baseline");
+    let callbackObservedMissingPath = false;
+    const resource = await runner.createWorktree({
+      rootTaskId: "root-task",
+      resourceId: "allocation-task",
+      kind: "worker",
+      baseCommit: baseline.commit,
+      repository: baseline.repository,
+      onAllocated: async (allocated) => {
+        callbackObservedMissingPath = await access(allocated.path).then(
+          () => false,
+          () => true,
+        );
+      },
+    });
+    expect(callbackObservedMissingPath).toBe(true);
+    await runner.cleanup(resource);
   });
 
   it("rejects out-of-scope changes", async () => {
@@ -141,6 +166,140 @@ describe("WorktreeRunner", () => {
     expect((await git(fixture.repo, "diff", "--cached")).stdout).toBe(beforeIndex);
     await runner.cleanup(resource);
   });
+
+  it("allows a restricted Integrator to resolve a small UTF-8 both-modified conflict", async () => {
+    const fixture = await repository();
+    const runner = new WorktreeRunner(fixture.repo, { worktreesRoot: fixture.worktrees });
+    const baseline = await runner.createBaseline("conflict baseline");
+    const first = await runner.createWorktree({
+      rootTaskId: "root-task",
+      resourceId: "first-worker",
+      kind: "worker",
+      baseCommit: baseline.commit,
+      repository: baseline.repository,
+    });
+    const second = await runner.createWorktree({
+      rootTaskId: "root-task",
+      resourceId: "second-worker",
+      kind: "worker",
+      baseCommit: baseline.commit,
+      repository: baseline.repository,
+    });
+    const integration = await runner.createWorktree({
+      rootTaskId: "root-task",
+      resourceId: "conflict-integration",
+      kind: "integration",
+      baseCommit: baseline.commit,
+      repository: baseline.repository,
+    });
+    await writeFile(join(first.cwd, "tracked.txt"), "first\n");
+    await writeFile(join(second.cwd, "tracked.txt"), "second\n");
+    const writeSet = [{ path: "tracked.txt", kind: "file" as const, exclusive: false }];
+    const firstResult = await runner.finalizeImplementer({
+      resource: first,
+      writeSet,
+      validationTargets: [{ script: "test" }],
+    });
+    const secondResult = await runner.finalizeImplementer({
+      resource: second,
+      writeSet,
+      validationTargets: [{ script: "test" }],
+    });
+    expect((await runner.cherryPick(integration, firstResult.commit!)).ok).toBe(true);
+    const picked = await runner.cherryPick(integration, secondResult.commit!);
+    expect(picked.ok).toBe(false);
+    const inspection = await runner.inspectConflicts(integration, picked, writeSet);
+    expect(inspection).toMatchObject({
+      safeForIntegrator: true,
+      files: [{ path: "tracked.txt", kind: "UU", safeForIntegrator: true }],
+    });
+    expect(inspection.files[0]?.stages.map((stage) => stage.stage))
+      .toEqual(["base", "ours", "theirs"]);
+    expect((await runner.inspectConflicts(integration, picked, [{
+      ...writeSet[0]!,
+      exclusive: true,
+    }])).safeForIntegrator).toBe(false);
+    const guard = await runner.captureIntegratorGuard(integration, ["tracked.txt"]);
+    await writeFile(join(integration.cwd, "tracked.txt"), "first\nsecond\n");
+    await runner.continueCherryPick(integration, guard);
+    expect(await readFile(join(integration.cwd, "tracked.txt"), "utf8"))
+      .toBe("first\nsecond\n");
+    await runner.cleanup(first);
+    await runner.cleanup(second);
+    await runner.cleanup(integration);
+  });
+
+  it("rejects Integrator edits outside the conflict paths", async () => {
+    const fixture = await repository();
+    const runner = new WorktreeRunner(fixture.repo, { worktreesRoot: fixture.worktrees });
+    const baseline = await runner.createBaseline("guard baseline");
+    const integration = await runner.createWorktree({
+      rootTaskId: "root-task",
+      resourceId: "guard-integration",
+      kind: "integration",
+      baseCommit: baseline.commit,
+      repository: baseline.repository,
+    });
+    const guard = await runner.captureIntegratorGuard(integration, ["tracked.txt"]);
+    await writeFile(join(integration.cwd, "package.json"), JSON.stringify({
+      scripts: { test: "node -e \"process.exit(1)\"" },
+    }));
+    await expect(runner.assertIntegratorGuard(integration, guard))
+      .rejects.toThrow("冲突范围外");
+    await runner.cleanup(integration);
+  });
+
+  it("forces binary conflicts to pause instead of invoking Integrator", async () => {
+    const fixture = await repository();
+    await writeFile(join(fixture.repo, "binary.dat"), Buffer.from([0xff, 0x00, 0x01]));
+    await git(fixture.repo, "add", "binary.dat");
+    await git(fixture.repo, "-c", "user.name=Fixture", "-c",
+      "user.email=fixture@example.com", "commit", "-m", "binary base");
+    const runner = new WorktreeRunner(fixture.repo, { worktreesRoot: fixture.worktrees });
+    const baseline = await runner.createBaseline("binary conflict baseline");
+    const first = await runner.createWorktree({
+      rootTaskId: "root-task",
+      resourceId: "binary-first",
+      kind: "worker",
+      baseCommit: baseline.commit,
+      repository: baseline.repository,
+    });
+    const second = await runner.createWorktree({
+      rootTaskId: "root-task",
+      resourceId: "binary-second",
+      kind: "worker",
+      baseCommit: baseline.commit,
+      repository: baseline.repository,
+    });
+    const integration = await runner.createWorktree({
+      rootTaskId: "root-task",
+      resourceId: "binary-integration",
+      kind: "integration",
+      baseCommit: baseline.commit,
+      repository: baseline.repository,
+    });
+    await writeFile(join(first.cwd, "binary.dat"), Buffer.from([0xff, 0x10, 0x01]));
+    await writeFile(join(second.cwd, "binary.dat"), Buffer.from([0xff, 0x20, 0x01]));
+    const writeSet = [{ path: "binary.dat", kind: "file" as const, exclusive: false }];
+    const firstResult = await runner.finalizeImplementer({
+      resource: first,
+      writeSet,
+      validationTargets: [{ script: "test" }],
+    });
+    const secondResult = await runner.finalizeImplementer({
+      resource: second,
+      writeSet,
+      validationTargets: [{ script: "test" }],
+    });
+    await runner.cherryPick(integration, firstResult.commit!);
+    const picked = await runner.cherryPick(integration, secondResult.commit!);
+    const inspection = await runner.inspectConflicts(integration, picked, writeSet);
+    expect(inspection.safeForIntegrator).toBe(false);
+    expect(inspection.files[0]?.reasons).toContain("冲突文件不是 UTF-8 文本");
+    await runner.cleanup(first);
+    await runner.cleanup(second);
+    await runner.cleanup(integration);
+  });
 });
 
 describe("write scheduling", () => {
@@ -167,6 +326,17 @@ describe("ArtifactStore", () => {
       totalBytes: 6,
       done: false,
     });
+    const unicode = await store.write(
+      "workspace",
+      "root-task",
+      "unicode-artifact",
+      "diff",
+      "你a",
+    );
+    const first = await store.readChunk(unicode.uri, 0, 2);
+    expect(first).toMatchObject({ content: "你", nextOffset: 3, done: false });
+    expect(await store.readChunk(unicode.uri, first.nextOffset, 2))
+      .toMatchObject({ content: "a", nextOffset: 4, done: true });
   });
 });
 

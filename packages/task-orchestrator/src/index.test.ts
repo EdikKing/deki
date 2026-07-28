@@ -97,8 +97,13 @@ describe("TaskStore", () => {
       .toBe(6);
     const taskColumns = verified.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
     const planColumns = verified.prepare("PRAGMA table_info(plans)").all() as Array<{ name: string }>;
+    const tables = verified.prepare(`
+      SELECT name FROM sqlite_master WHERE type = 'table'
+    `).all() as Array<{ name: string }>;
     expect(taskColumns.map((column) => column.name)).toContain("delivery_mode");
     expect(planColumns.map((column) => column.name)).toContain("replan_reason");
+    expect(tables.map((table) => table.name)).toContain("artifact_files");
+    expect(tables.map((table) => table.name)).toContain("write_batches");
     verified.close();
   });
 
@@ -281,6 +286,33 @@ describe("TaskStore", () => {
     );
     expect(reopened.getTask(task.id)?.status).toBe("succeeded");
     reopened.close();
+  });
+
+  it("indexes file-backed Artifacts by URI, digest and size", async () => {
+    const store = await createStore();
+    const task = store.createTask({
+      workspaceId: "workspace-a",
+      kind: "background",
+      title: "artifact index",
+      goal: "index",
+      execution: promptExecution(),
+    });
+    const run = store.createRun(task.id);
+    store.bindRun(task.id, run.id, { sessionId: "session-a" });
+    const artifact = store.createArtifact({
+      taskId: task.id,
+      runId: run.id,
+      kind: "patch",
+      title: "patch",
+      uri: "/tmp/deki-artifacts/patch.bin",
+      metadata: { sha256: "a".repeat(64), size: 42 },
+    });
+    expect(store.getArtifactFile(artifact.id)).toEqual({
+      uri: "/tmp/deki-artifacts/patch.bin",
+      sha256: "a".repeat(64),
+      size: 42,
+    });
+    store.close();
   });
 
   it("rejects illegal transitions without appending an event", async () => {
@@ -736,6 +768,114 @@ describe("TaskStore", () => {
 });
 
 describe("TaskOrchestrator", () => {
+  it("cancels a persisted awaiting-apply task without a live Agent", async () => {
+    const store = await createStore();
+    const task = store.createTask({
+      workspaceId: "workspace-a",
+      workspacePath: "/tmp/workspace-a",
+      kind: "background",
+      title: "awaiting apply",
+      goal: "deliver",
+      execution: promptExecution(),
+    });
+    const run = store.createRun(task.id);
+    store.bindRun(task.id, run.id, { sessionId: "session-a" });
+    const integration = store.createIntegration({
+      rootTaskId: task.id,
+      taskId: task.id,
+      baselineCommit: "a".repeat(40),
+      workerTaskIds: [],
+    });
+    store.updateIntegration(integration.id, {
+      status: "awaiting_apply",
+      integrationCommit: "b".repeat(40),
+      cleanupStatus: "cleaned",
+    });
+    store.setIntegrationAwaitingApply(task.id, run.id, "persisted-approval", {});
+    const orchestrator = new TaskOrchestrator({
+      store,
+      concurrency: 1,
+      recoverOnStart: false,
+      executor: async () => {
+        throw new Error("executor must not run");
+      },
+    });
+    await expect(orchestrator.cancelTask(task.id)).resolves.toBe(true);
+    expect(store.getTaskDetail(task.id)).toMatchObject({
+      task: { status: "cancelled" },
+      integration: { status: "cancelled" },
+      requests: [{ id: "persisted-approval", status: "cancelled" }],
+    });
+    await orchestrator.dispose();
+  });
+
+  it("creates and completes a system-only Integration Task with an Integrator profile", async () => {
+    const store = await createStore();
+    const parent = store.createTask({
+      workspaceId: "workspace-a",
+      workspacePath: "/tmp/workspace-a",
+      kind: "background",
+      title: "parent",
+      goal: "integrate",
+      execution: promptExecution(),
+    });
+    const orchestrator = new TaskOrchestrator({
+      store,
+      concurrency: 1,
+      recoverOnStart: false,
+      executor: async ({ task, run }) => ({
+        sessionId: "integrator-session",
+        completion: new Promise<void>((resolve) => {
+          setTimeout(() => {
+            store.saveWorkerResult(task.id, run.id, workerResult("resolved safely"));
+            resolve();
+          }, 0);
+        }),
+        cancel: vi.fn(async () => undefined),
+      }),
+    });
+    const result = await orchestrator.executeIntegrationTask({
+      parentTaskId: parent.id,
+      sourceSessionId: "source-session",
+      objective: "resolve tracked.txt",
+      conflictFiles: ["tracked.txt"],
+      worktreeContext: {
+        baselineCommit: "a".repeat(40),
+        baseCommit: "b".repeat(40),
+        baselineRef: "refs/deki/artifacts/baseline",
+        repositoryRoot: "/tmp/repository",
+        commonDirectory: "/tmp/repository/.git",
+        workspaceRelativePath: "",
+        writeSet: [{ path: "tracked.txt", kind: "file", exclusive: false }],
+        validationTargets: [{ script: "test" }],
+        wave: 0,
+        integratorMode: "resolve",
+        integrationResource: {
+          id: "integration-resource",
+          path: "/tmp/worktree",
+          cwd: "/tmp/worktree",
+          branch: "deki/integration/test",
+          branchRef: "refs/heads/deki/integration/test",
+          baseCommit: "a".repeat(40),
+        },
+      },
+      budget: workerBudget(),
+      signal: new AbortController().signal,
+    });
+    expect(result).toMatchObject({
+      status: "succeeded",
+      task: {
+        kind: "integration",
+        assignedProfile: "integrator",
+        parentTaskId: parent.id,
+      },
+      result: { summary: "resolved safely" },
+    });
+    expect(store.getTaskDetail(result.task.id)?.workerResult?.summary)
+      .toBe("resolved safely");
+    await orchestrator.dispose();
+  });
+
   it("keeps unavailable workspace tasks queued and exposes an attention reason", async () => {
     const store = await createStore();
     const executor = vi.fn(async () => deferredHandle("unused"));

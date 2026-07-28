@@ -184,6 +184,17 @@ function migrateToV6(database) {
       created_at TEXT NOT NULL,
       PRIMARY KEY(task_id, run_id)
     );
+    CREATE TABLE write_batches (
+      id TEXT PRIMARY KEY,
+      root_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      baseline_commit TEXT NOT NULL,
+      status TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX write_batches_root_idx
+      ON write_batches(root_task_id, created_at);
     CREATE TABLE integrations (
       id TEXT PRIMARY KEY,
       root_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -194,7 +205,7 @@ function migrateToV6(database) {
       updated_at TEXT NOT NULL
     );
     CREATE INDEX integrations_root_idx ON integrations(root_task_id, created_at);
-    CREATE UNIQUE INDEX integrations_task_idx ON integrations(task_id);
+    CREATE INDEX integrations_task_idx ON integrations(task_id, created_at);
     CREATE TABLE runner_resources (
       id TEXT PRIMARY KEY,
       root_task_id TEXT NOT NULL,
@@ -211,6 +222,17 @@ function migrateToV6(database) {
     );
     CREATE INDEX runner_resources_cleanup_idx
       ON runner_resources(status, updated_at);
+    CREATE TABLE artifact_files (
+      artifact_id TEXT PRIMARY KEY REFERENCES artifacts(id) ON DELETE CASCADE,
+      uri TEXT NOT NULL,
+      sha256 TEXT,
+      size_bytes INTEGER,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX artifact_files_uri_idx ON artifact_files(uri);
+    CREATE INDEX artifact_files_sha_idx ON artifact_files(sha256);
+    INSERT INTO artifact_files (artifact_id, uri, created_at)
+    SELECT id, uri, created_at FROM artifacts WHERE uri IS NOT NULL;
   `);
 }
 

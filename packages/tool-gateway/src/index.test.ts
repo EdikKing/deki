@@ -209,31 +209,33 @@ describe("ToolGateway", () => {
     }
   });
 
-  it("allows isolated Implementer shell but hard-denies Git mutations", async () => {
+  it("allows isolated writer shell but hard-denies Git mutations", async () => {
     const gateway = new ToolGateway();
     const provider = new ShellProvider();
     await gateway.register(provider);
-    await expect(gateway.call(
-      "workspace__bash",
-      { command: "pnpm test" },
-      {
-        callId: "implementer-test",
-        workspace: "/tmp/worktree",
-        interactionMode: "worker",
-        workerProfile: "implementer",
-      },
-    )).resolves.toBeTruthy();
-    await expect(gateway.call(
-      "workspace__bash",
-      { command: "git add -A && git commit -m owned" },
-      {
-        callId: "implementer-git",
-        workspace: "/tmp/worktree",
-        interactionMode: "worker",
-        workerProfile: "implementer",
-      },
-    )).rejects.toMatchObject({ code: "WORKER_MODE_READ_ONLY" });
-    expect(provider.call).toHaveBeenCalledTimes(1);
+    for (const workerProfile of ["implementer", "integrator"] as const) {
+      await expect(gateway.call(
+        "workspace__bash",
+        { command: "pnpm test" },
+        {
+          callId: `${workerProfile}-test`,
+          workspace: "/tmp/worktree",
+          interactionMode: "worker",
+          workerProfile,
+        },
+      )).resolves.toBeTruthy();
+      await expect(gateway.call(
+        "workspace__bash",
+        { command: "/usr/bin/git -C . add -A && git commit -m owned" },
+        {
+          callId: `${workerProfile}-git`,
+          workspace: "/tmp/worktree",
+          interactionMode: "worker",
+          workerProfile,
+        },
+      )).rejects.toMatchObject({ code: "WORKER_MODE_READ_ONLY" });
+    }
+    expect(provider.call).toHaveBeenCalledTimes(2);
     await gateway.dispose();
   });
 

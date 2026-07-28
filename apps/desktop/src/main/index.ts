@@ -230,6 +230,7 @@ class DesktopController {
       resumeLatest?: boolean;
       tasks?: TaskOrchestrator;
       trustedEphemeral?: boolean;
+      inheritedSettings?: SettingsPatch;
     } = {},
   ): Promise<DesktopController> {
     const paths = getDekiPaths();
@@ -245,7 +246,10 @@ class DesktopController {
         ? { projectLocalFile: join(paths.projectsRoot, scopeId, "settings.json") }
         : {}),
     });
-    const settingsSnapshot = await settings.initialize();
+    let settingsSnapshot = await settings.initialize();
+    if (options.inheritedSettings) {
+      settingsSnapshot = settings.setSessionOverrides(options.inheritedSettings);
+    }
     memory.governMemories(
       settingsSnapshot.effective.memory.lowConfidenceArchiveThreshold,
     );
@@ -672,7 +676,8 @@ class DesktopController {
       ? renderPlanExecutionPrompt(taskStore?.getPlan(input.task.planId), input.task.goal)
       : input.execution.interactionMode === "plan"
         ? renderPlanningPrompt(input.task.goal, input.execution.planId, taskStore)
-        : input.task.kind === "worker" && input.execution.workerContext
+        : (input.task.kind === "worker" || input.task.kind === "integration")
+          && input.execution.workerContext
           ? renderWorkerPrompt(
             input.execution.workerProfile!,
             input.execution.workerContext,
@@ -1820,9 +1825,25 @@ class DesktopController {
     })));
     let baseline;
     let integrationResource: WorktreeResource;
+    let allocatedIntegration: WorktreeResource | undefined;
     try {
       baseline = await runner.createBaseline(
         `Deki write batch ${context.taskId}`,
+        (created) => {
+          taskStore!.createArtifact({
+            id: created.artifactId,
+            taskId: context.taskId!,
+            runId: context.runId!,
+            kind: "commit",
+            title: `Synthetic Baseline ${created.commit.slice(0, 12)}`,
+            content: created.commit,
+            metadata: {
+              ref: created.ref,
+              commit: created.commit,
+              syntheticBaseline: true,
+            },
+          });
+        },
       );
       integrationResource = await runner.createWorktree({
         rootTaskId: taskStore!.getTask(context.taskId)!.rootTaskId,
@@ -1830,22 +1851,38 @@ class DesktopController {
         kind: "integration",
         baseCommit: baseline.commit,
         repository: baseline.repository,
+        onAllocated: (resource) => {
+          allocatedIntegration = resource;
+          taskStore!.saveRunnerResource({
+            id: resource.id,
+            rootTaskId: taskStore!.getTask(context.taskId!)!.rootTaskId,
+            taskId: context.taskId!,
+            runId: context.runId!,
+            kind: "integration",
+            path: resource.path,
+            branchRef: resource.branchRef,
+            baseCommit: resource.baseCommit,
+            status: "allocating",
+          });
+        },
       });
+      taskStore!.updateRunnerResource(integrationResource.id, "active");
     } catch (error) {
+      if (allocatedIntegration) {
+        try {
+          await runner.cleanup(allocatedIntegration);
+          taskStore!.updateRunnerResource(allocatedIntegration.id, "cleaned");
+        } catch (cleanupError) {
+          taskStore!.updateRunnerResource(
+            allocatedIntegration.id,
+            "cleanup_failed",
+            formatError(cleanupError),
+          );
+        }
+      }
       releaseRepository();
       throw error;
     }
-    taskStore!.saveRunnerResource({
-      id: integrationResource.id,
-      rootTaskId: taskStore!.getTask(context.taskId)!.rootTaskId,
-      taskId: context.taskId,
-      runId: context.runId,
-      kind: "integration",
-      path: integrationResource.path,
-      branchRef: integrationResource.branchRef,
-      baseCommit: integrationResource.baseCommit,
-      status: "active",
-    });
     const integration = taskStore!.createIntegration({
       rootTaskId: taskStore!.getTask(context.taskId)!.rootTaskId,
       taskId: context.taskId,
@@ -1854,10 +1891,25 @@ class DesktopController {
       workerTaskIds: [],
     });
     const settings = this.#settings.snapshot().effective.agent;
+    const hasHighRiskStep = requests.some((request) => {
+      if (!request.plan?.stepId) return false;
+      const detail = taskStore!.getPlan(request.plan.planId);
+      const revision = detail?.revisions.find(
+        (candidate) => candidate.revision === request.plan!.revision,
+      );
+      return revision?.steps.find((step) => step.id === request.plan!.stepId)?.risk === "high";
+    });
     const allResults: import("@deki-ai/shared").WorkerResultEnvelope[] = [];
     const workerTaskIds: string[] = [];
     const actualFileOwners = new Map<string, string>();
     const actualOverlaps = new Set<string>();
+    const resolvedConflictPaths = new Set<string>();
+    const integratorTaskIds: string[] = [];
+    const conflictArtifactIds: string[] = [];
+    const resolutionSummaries: string[] = [];
+    const artifactStore = new ArtifactStore(this.#paths.artifactsRoot);
+    const validationTargets = requests.flatMap((request) => request.validationTargets);
+    const batchSignal = context.signal ?? new AbortController().signal;
     let currentBase = baseline.commit;
     let cleaned = false;
     try {
@@ -1911,33 +1963,195 @@ class DesktopController {
             implementation.commit,
           );
           if (!picked.ok) {
-            const conflictText = [
-              "Integration cherry-pick conflict",
-              ...picked.conflictFiles.map((path) =>
-                `${picked.conflictKinds[path] ?? "UU"} ${path}`),
-            ].join("\n");
-            const artifact = taskStore!.createArtifact({
+            const inspected = await runner.inspectConflicts(
+              integrationResource,
+              picked,
+              requests.flatMap((request) => request.writeSet),
+              batchSignal,
+            );
+            const inspection = hasHighRiskStep
+              ? {
+                  safeForIntegrator: false,
+                  files: inspected.files.map((file) => ({
+                    ...file,
+                    safeForIntegrator: false,
+                    reasons: [...file.reasons, "冲突属于高风险计划步骤"],
+                  })),
+                }
+              : inspected;
+            for (const file of inspection.files) {
+              actualOverlaps.add(file.workspacePath);
+              for (const stage of file.stages) {
+                const id = randomUUID();
+                try {
+                  const content = await runner.readConflictStage(
+                    integrationResource,
+                    stage,
+                    batchSignal,
+                  );
+                  const stored = await artifactStore.write(
+                    this.#scopeId,
+                    taskStore!.getTask(context.taskId)!.rootTaskId,
+                    id,
+                    "bin",
+                    content,
+                  );
+                  taskStore!.createArtifact({
+                    id,
+                    taskId: context.taskId,
+                    runId: context.runId,
+                    kind: "evidence",
+                    title: `${file.path} (${stage.stage})`,
+                    uri: stored.uri,
+                    metadata: {
+                      sha256: stored.sha256,
+                      size: stored.size,
+                      path: file.path,
+                      stage: stage.stage,
+                      mode: stage.mode,
+                      objectId: stage.objectId,
+                    },
+                  });
+                } catch (error) {
+                  taskStore!.createArtifact({
+                    id,
+                    taskId: context.taskId,
+                    runId: context.runId,
+                    kind: "evidence",
+                    title: `${file.path} (${stage.stage})`,
+                    content: stage.objectId,
+                    metadata: {
+                      path: file.path,
+                      stage: stage.stage,
+                      mode: stage.mode,
+                      objectId: stage.objectId,
+                      extractionError: formatError(error),
+                    },
+                  });
+                }
+                conflictArtifactIds.push(id);
+              }
+            }
+            const evidenceId = randomUUID();
+            const evidenceFile = await artifactStore.write(
+              this.#scopeId,
+              taskStore!.getTask(context.taskId)!.rootTaskId,
+              evidenceId,
+              "json",
+              JSON.stringify(inspection, null, 2),
+            );
+            taskStore!.createArtifact({
+              id: evidenceId,
               taskId: context.taskId,
               runId: context.runId,
               kind: "evidence",
               title: "Integration Conflict",
-              content: conflictText,
+              uri: evidenceFile.uri,
               metadata: {
+                sha256: evidenceFile.sha256,
+                size: evidenceFile.size,
                 conflictFiles: picked.conflictFiles,
                 conflictKinds: picked.conflictKinds,
-                automaticResolution: false,
+                automaticResolution: inspection.safeForIntegrator,
               },
             });
+            conflictArtifactIds.push(evidenceId);
             taskStore!.updateIntegration(integration.id, {
               status: "conflicted",
               conflictFiles: picked.conflictFiles,
               actualOverlaps: [...actualOverlaps],
               workerTaskIds,
-              diffArtifactId: artifact.id,
+              integratorTaskIds,
+              conflictArtifactIds,
+              resolutionSummaries,
             });
-            throw new Error(
-              `集成冲突需要用户决定，未静默覆盖：${picked.conflictFiles.join(", ")}`,
+            if (!inspection.safeForIntegrator) {
+              const head = await runner.integrationPatch(
+                integrationResource,
+                baseline.commit,
+              );
+              const headArtifactId = randomUUID();
+              const headRef = await runner.createArtifactRef(headArtifactId, head.commit);
+              taskStore!.createArtifact({
+                id: headArtifactId,
+                taskId: context.taskId,
+                runId: context.runId,
+                kind: "commit",
+                title: `Conflict Ours ${head.commit.slice(0, 12)}`,
+                content: head.commit,
+                metadata: { ref: headRef, commit: head.commit },
+              });
+              conflictArtifactIds.push(headArtifactId);
+              throw new Error(
+                `重大集成冲突已暂停：${inspection.files
+                  .map((file) => `${file.path} (${file.reasons.join("；")})`)
+                  .join(", ")}`,
+              );
+            }
+            const guard = await runner.captureIntegratorGuard(
+              integrationResource,
+              picked.conflictFiles,
+              batchSignal,
             );
+            const integrator = await this.#tasks.executeIntegrationTask({
+              parentTaskId: context.taskId,
+              sourceSessionId: context.sessionId,
+              objective: `仅解决普通文本冲突：${picked.conflictFiles.join(", ")}`,
+              conflictFiles: inspection.files.map((file) => file.workspacePath),
+              worktreeContext: {
+                baselineCommit: baseline.commit,
+                baseCommit: currentBase,
+                baselineRef: baseline.ref,
+                repositoryRoot: baseline.repository.repositoryRoot,
+                commonDirectory: baseline.repository.commonDirectory,
+                workspaceRelativePath: baseline.repository.workspaceRelativePath,
+                writeSet: inspection.files.map((file) => ({
+                  path: file.workspacePath,
+                  kind: "file" as const,
+                  exclusive: false,
+                })),
+                validationTargets,
+                wave: waveIndex,
+                integratorMode: "resolve",
+                integrationResource: {
+                  id: integrationResource.id,
+                  path: integrationResource.path,
+                  cwd: integrationResource.cwd,
+                  branch: integrationResource.branch,
+                  branchRef: integrationResource.branchRef,
+                  baseCommit: integrationResource.baseCommit,
+                },
+              },
+              budget: {
+                maxWorkers: settings.workerMaxPerRoot,
+                maxDurationMs: settings.workerTimeoutMs,
+                maxInputTokens: settings.workerMaxInputTokens,
+                maxOutputTokens: settings.workerMaxOutputTokens,
+                maxToolCalls: settings.workerMaxToolCalls,
+              },
+              signal: batchSignal,
+            });
+            integratorTaskIds.push(integrator.task.id);
+            if (integrator.result?.summary) {
+              resolutionSummaries.push(integrator.result.summary);
+            }
+            await runner.continueCherryPick(
+              integrationResource,
+              guard,
+              batchSignal,
+            );
+            for (const file of inspection.files) {
+              resolvedConflictPaths.add(file.workspacePath);
+            }
+            taskStore!.updateIntegration(integration.id, {
+              status: "merging",
+              conflictFiles: picked.conflictFiles,
+              actualOverlaps: [...actualOverlaps],
+              workerTaskIds,
+              integratorTaskIds,
+              conflictArtifactIds,
+              resolutionSummaries,
+            });
           }
         }
         currentBase = (await runner.integrationPatch(
@@ -1946,17 +2160,76 @@ class DesktopController {
         )).commit;
       }
 
+      const cleanOverlapFiles = [...actualOverlaps].filter(
+        (path) => !resolvedConflictPaths.has(path),
+      );
+      if (cleanOverlapFiles.length > 0) {
+        const guard = await runner.captureIntegratorGuard(
+          integrationResource,
+          [],
+          batchSignal,
+        );
+        const integrator = await this.#tasks.executeIntegrationTask({
+          parentTaskId: context.taskId,
+          sourceSessionId: context.sessionId,
+          objective: `审查已 clean merge 的真实重叠：${cleanOverlapFiles.join(", ")}`,
+          conflictFiles: [],
+          worktreeContext: {
+            baselineCommit: baseline.commit,
+            baseCommit: currentBase,
+            baselineRef: baseline.ref,
+            repositoryRoot: baseline.repository.repositoryRoot,
+            commonDirectory: baseline.repository.commonDirectory,
+            workspaceRelativePath: baseline.repository.workspaceRelativePath,
+            writeSet: cleanOverlapFiles.map((path) => ({
+              path,
+              kind: "file" as const,
+              exclusive: false,
+            })),
+            validationTargets,
+            wave: waves.length,
+            integratorMode: "review",
+            integrationResource: {
+              id: integrationResource.id,
+              path: integrationResource.path,
+              cwd: integrationResource.cwd,
+              branch: integrationResource.branch,
+              branchRef: integrationResource.branchRef,
+              baseCommit: integrationResource.baseCommit,
+            },
+          },
+          budget: {
+            maxWorkers: settings.workerMaxPerRoot,
+            maxDurationMs: settings.workerTimeoutMs,
+            maxInputTokens: settings.workerMaxInputTokens,
+            maxOutputTokens: settings.workerMaxOutputTokens,
+            maxToolCalls: settings.workerMaxToolCalls,
+          },
+          signal: batchSignal,
+        });
+        await runner.assertIntegratorGuard(
+          integrationResource,
+          guard,
+          batchSignal,
+        );
+        integratorTaskIds.push(integrator.task.id);
+        if (integrator.result?.summary) {
+          resolutionSummaries.push(integrator.result.summary);
+        }
+      }
+
       taskStore!.updateIntegration(integration.id, {
         status: "testing",
         actualOverlaps: [...actualOverlaps],
         workerTaskIds,
+        integratorTaskIds,
+        conflictArtifactIds,
+        resolutionSummaries,
       });
-      const validationTargets = requests.flatMap((request) => request.validationTargets);
       const validationResults = await runner.validateIntegration(
         integrationResource,
         validationTargets,
       );
-      const artifactStore = new ArtifactStore(this.#paths.artifactsRoot);
       const validationArtifactIds: string[] = [];
       for (const validation of validationResults) {
         const id = randomUUID();
@@ -2069,6 +2342,7 @@ class DesktopController {
         diffArtifactId: diffId,
         cleanupStatus: "cleaned",
       });
+      releaseRepository();
 
       let requestId = randomUUID();
       for (;;) {
@@ -2107,11 +2381,18 @@ class DesktopController {
           return allResults;
         }
         try {
-          await runner.applyPatch({
-            baselineCommit: baseline.commit,
-            integrationCommit: finalized.commit,
-            patch: finalized.patch,
-          });
+          const releaseApply = await acquireRepositoryWriteLock(
+            baseline.repository.commonDirectory,
+          );
+          try {
+            await runner.applyPatch({
+              baselineCommit: baseline.commit,
+              integrationCommit: finalized.commit,
+              patch: finalized.patch,
+            });
+          } finally {
+            releaseApply();
+          }
           taskStore!.updateIntegration(integration.id, { status: "applied" });
           taskStore!.resumeAfterIntegrationDecision(
             context.taskId,
@@ -2134,9 +2415,20 @@ class DesktopController {
             content: error.message,
             metadata: { driftedFiles: error.paths },
           });
+          taskStore!.recordIntegrationApplicationConflict(
+            context.taskId,
+            context.runId,
+            error.paths,
+          );
           requestId = randomUUID();
         }
       }
+    } catch (error) {
+      const current = taskStore!.getIntegration(integration.id);
+      if (current && current.status !== "conflicted" && current.status !== "failed") {
+        taskStore!.updateIntegration(integration.id, { status: "failed" });
+      }
+      throw error;
     } finally {
       if (!cleaned) {
         try {
@@ -2663,24 +2955,20 @@ function registerIpcHandlers(): void {
     const artifact = taskStore?.getArtifact(input.artifactId);
     if (!artifact) throw new Error("未找到 Artifact");
     if (artifact.content !== undefined) {
-      const totalBytes = Buffer.byteLength(artifact.content);
-      const content = Buffer.from(artifact.content).subarray(
-        input.offset,
-        input.offset + input.limit,
-      ).toString("utf8");
-      const nextOffset = Math.min(totalBytes, input.offset + Buffer.byteLength(content));
+      const chunk = sliceUtf8Content(artifact.content, input.offset, input.limit);
       return artifactChunkSchema.parse({
         artifactId: artifact.id,
-        content,
         offset: input.offset,
-        nextOffset,
-        totalBytes,
-        done: nextOffset >= totalBytes,
+        ...chunk,
       });
     }
     if (!artifact.uri) throw new Error("Artifact 没有可读取内容");
+    const indexedFile = taskStore!.getArtifactFile(artifact.id);
+    if (!indexedFile || indexedFile.uri !== artifact.uri) {
+      throw new Error("Artifact 文件索引不一致");
+    }
     const chunk = await new ArtifactStore(getDekiPaths().artifactsRoot).readChunk(
-      artifact.uri,
+      indexedFile.uri,
       input.offset,
       input.limit,
     );
@@ -3269,7 +3557,7 @@ async function restoreQueuedWorkspaceHosts(): Promise<void> {
 }
 
 async function executeWorktreeTask(
-  _host: DesktopController,
+  host: DesktopController,
   input: {
     task: import("@deki-ai/shared").TaskRecord;
     run: import("@deki-ai/shared").RunRecord;
@@ -3279,39 +3567,106 @@ async function executeWorktreeTask(
 ) {
   const context = input.execution.worktreeContext;
   const workspace = input.task.workspacePath;
-  if (!context || !workspace || input.execution.workerProfile !== "implementer") {
-    throw new Error("Worktree Runner 只能执行具有完整上下文的 Implementer");
+  if (!context || !workspace) {
+    throw new Error("Worktree Runner 任务缺少完整上下文");
+  }
+  if (input.execution.workerProfile === "integrator") {
+    const descriptor = context.integrationResource;
+    const recorded = descriptor
+      ? taskStore!.listRunnerResources().find((resource) => resource.id === descriptor.id)
+      : undefined;
+    if (
+      !descriptor
+      || !recorded
+      || recorded.kind !== "integration"
+      || recorded.path !== descriptor.path
+      || recorded.branchRef !== descriptor.branchRef
+      || !["active", "finalized"].includes(recorded.status)
+    ) {
+      throw new Error("Integrator 只能附加到已记录的活动 Integration worktree");
+    }
+    const ephemeral = await DesktopController.create(descriptor.cwd, {
+      tasks: requireTaskOrchestrator(),
+      trustedEphemeral: true,
+      inheritedSettings: isolatedRuntimeSettings(host.getSettings()),
+    });
+    let handle;
+    try {
+      handle = await ephemeral.executeTask(input);
+    } catch (error) {
+      await ephemeral.dispose();
+      throw error;
+    }
+    const completion = handle.completion.finally(() => ephemeral.dispose());
+    return {
+      sessionId: handle.sessionId,
+      ...(handle.modelProvider ? { modelProvider: handle.modelProvider } : {}),
+      ...(handle.modelId ? { modelId: handle.modelId } : {}),
+      completion,
+      cancel: () => handle.cancel(),
+      captureContext: () => ({
+        ...handle.captureContext(),
+        worktreeContext: context,
+      }),
+      captureUsage: () => handle.captureUsage(),
+    };
+  }
+  if (input.execution.workerProfile !== "implementer") {
+    throw new Error("Worktree Runner 只执行 Implementer 或受限 Integrator");
   }
   const paths = getDekiPaths();
   const runner = new WorktreeRunner(workspace, {
     worktreesRoot: join(paths.worktreesRoot, input.task.workspaceId),
     timeoutMs: 600_000,
   });
-  const resource = await runner.createWorktree({
-    rootTaskId: input.task.rootTaskId,
-    resourceId: input.task.id,
-    kind: "worker",
-    baseCommit: context.baseCommit,
-    repository: {
-      repositoryRoot: context.repositoryRoot,
-      commonDirectory: context.commonDirectory,
-      workspaceRelativePath: context.workspaceRelativePath,
-    },
-  });
-  taskStore!.saveRunnerResource({
-    id: resource.id,
-    rootTaskId: input.task.rootTaskId,
-    taskId: input.task.id,
-    runId: input.run.id,
-    kind: "worker",
-    path: resource.path,
-    branchRef: resource.branchRef,
-    baseCommit: resource.baseCommit,
-    status: "active",
-  });
+  let allocatedResource: WorktreeResource | undefined;
+  let resource: WorktreeResource;
+  try {
+    resource = await runner.createWorktree({
+      rootTaskId: input.task.rootTaskId,
+      resourceId: input.task.id,
+      kind: "worker",
+      baseCommit: context.baseCommit,
+      repository: {
+        repositoryRoot: context.repositoryRoot,
+        commonDirectory: context.commonDirectory,
+        workspaceRelativePath: context.workspaceRelativePath,
+      },
+      onAllocated: (allocated) => {
+        allocatedResource = allocated;
+        taskStore!.saveRunnerResource({
+          id: allocated.id,
+          rootTaskId: input.task.rootTaskId,
+          taskId: input.task.id,
+          runId: input.run.id,
+          kind: "worker",
+          path: allocated.path,
+          branchRef: allocated.branchRef,
+          baseCommit: allocated.baseCommit,
+          status: "allocating",
+        });
+      },
+    });
+  } catch (error) {
+    if (allocatedResource) {
+      try {
+        await runner.cleanup(allocatedResource);
+        taskStore!.updateRunnerResource(allocatedResource.id, "cleaned");
+      } catch (cleanupError) {
+        taskStore!.updateRunnerResource(
+          allocatedResource.id,
+          "cleanup_failed",
+          formatError(cleanupError),
+        );
+      }
+    }
+    throw error;
+  }
+  taskStore!.updateRunnerResource(resource.id, "active");
   const ephemeral = await DesktopController.create(resource.cwd, {
     tasks: requireTaskOrchestrator(),
     trustedEphemeral: true,
+    inheritedSettings: isolatedRuntimeSettings(host.getSettings()),
   });
   let handle;
   try {
@@ -3454,6 +3809,16 @@ async function executeWorktreeTask(
   };
 }
 
+function isolatedRuntimeSettings(snapshot: SettingsSnapshot): SettingsPatch {
+  return {
+    models: structuredClone(snapshot.effective.models),
+    agent: structuredClone(snapshot.effective.agent),
+    permissions: structuredClone(snapshot.effective.permissions),
+    workspace: structuredClone(snapshot.effective.workspace),
+    advanced: structuredClone(snapshot.effective.advanced),
+  };
+}
+
 async function cleanupStaleRunnerResources(
   store: TaskStore,
   paths: DekiPaths,
@@ -3477,7 +3842,7 @@ async function cleanupStaleRunnerResources(
       });
       const repository = await runner.inspectRepository();
       const branch = record.branchRef.replace(/^refs\/heads\//u, "");
-      await runner.cleanup({
+      const resource: WorktreeResource = {
         id: record.id,
         kind: record.kind,
         path: record.path,
@@ -3488,7 +3853,35 @@ async function cleanupStaleRunnerResources(
         branchRef: record.branchRef,
         baseCommit: record.baseCommit,
         repository,
-      });
+      };
+      const rescued = await runner.rescuePatch(resource);
+      const recoveryRunId = record.runId ?? task.currentRunId;
+      if (rescued && recoveryRunId) {
+        const id = randomUUID();
+        const file = await new ArtifactStore(paths.artifactsRoot).write(
+          task.workspaceId,
+          record.rootTaskId,
+          id,
+          "patch",
+          rescued.patch,
+        );
+        store.createArtifact({
+          id,
+          taskId: task.id,
+          runId: recoveryRunId,
+          kind: "patch",
+          title: `Recovered ${record.kind} Patch`,
+          uri: file.uri,
+          metadata: {
+            sha256: file.sha256,
+            size: file.size,
+            resourceId: record.id,
+            changedFiles: rescued.changedFiles,
+            recoveredAtStartup: true,
+          },
+        });
+      }
+      await runner.cleanup(resource);
       store.updateRunnerResource(record.id, "cleaned");
     } catch (error) {
       store.updateRunnerResource(record.id, "cleanup_failed", formatError(error));
@@ -3541,14 +3934,40 @@ async function respondToPersistedIntegration(input: {
         throw new Error("集成 Patch Artifact 已丢失");
       }
       const patch = artifact.content ?? await readFile(artifact.uri!, "utf8");
-      await new WorktreeRunner(detail.task.workspacePath, {
+      const runner = new WorktreeRunner(detail.task.workspacePath, {
         worktreesRoot: join(getDekiPaths().worktreesRoot, detail.task.workspaceId),
         timeoutMs: 600_000,
-      }).applyPatch({
-        baselineCommit: integration.baselineCommit,
-        integrationCommit: integration.integrationCommit,
-        patch,
       });
+      const repository = await runner.inspectRepository();
+      const release = await acquireRepositoryWriteLock(repository.commonDirectory);
+      try {
+        try {
+          await runner.applyPatch({
+            baselineCommit: integration.baselineCommit,
+            integrationCommit: integration.integrationCommit,
+            patch,
+          });
+        } catch (error) {
+          if (error instanceof WorkspaceDriftError) {
+            taskStore!.createArtifact({
+              taskId: input.taskId,
+              runId,
+              kind: "evidence",
+              title: "Application Conflict",
+              content: error.message,
+              metadata: { driftedFiles: error.paths },
+            });
+            taskStore!.recordIntegrationApplicationConflict(
+              input.taskId,
+              runId,
+              error.paths,
+            );
+          }
+          throw error;
+        }
+      } finally {
+        release();
+      }
       taskStore!.updateIntegration(integration.id, { status: "applied" });
     } else {
       taskStore!.updateIntegration(integration.id, {
@@ -3576,6 +3995,33 @@ async function runTaskCommand(
   } catch (reason) {
     return { ok: false, error: formatError(reason) };
   }
+}
+
+function sliceUtf8Content(
+  content: string,
+  offset: number,
+  limit: number,
+): {
+  content: string;
+  nextOffset: number;
+  totalBytes: number;
+  done: boolean;
+} {
+  const bytes = Buffer.from(content);
+  const start = Math.min(bytes.length, Math.max(0, Math.trunc(offset)));
+  const requested = Math.max(1, Math.min(256 * 1024, Math.trunc(limit)));
+  let end = Math.min(bytes.length, start + requested);
+  while (end > start && end < bytes.length && (bytes[end]! & 0xc0) === 0x80) end -= 1;
+  if (end === start && end < bytes.length) {
+    end = Math.min(bytes.length, start + requested + 3);
+    while (end < bytes.length && (bytes[end]! & 0xc0) === 0x80) end += 1;
+  }
+  return {
+    content: bytes.subarray(start, end).toString("utf8"),
+    nextOffset: end,
+    totalBytes: bytes.length,
+    done: end >= bytes.length,
+  };
 }
 
 function runTaskCommandSync(
@@ -3794,6 +4240,20 @@ function renderWorkerPrompt(
       "真实用户工作区不会被你的中间状态修改。只能修改上下文包和 Worktree Context 声明的 writeSet；不得修改范围外文件。",
       "不得执行 git add、commit、reset、branch、worktree、push 等 Git 写操作，提交和清理由 Runner 负责。",
       "可以使用工作区编辑工具和受控验证工具。完成后必须调用 worker__submit_result 提交结构化总结；不要创建其他 Worker。",
+      `上下文包：${JSON.stringify(context)}`,
+      `Worktree Context：${JSON.stringify(worktreeContext)}`,
+    ].join("\n\n");
+  }
+  if (profile === "integrator") {
+    const allowed = worktreeContext?.writeSet.map((entry) => entry.path) ?? [];
+    return [
+      `你是 ${role}。`,
+      "你由 Orchestrator 创建，不能派发 Worker，也不能扩展功能范围。",
+      worktreeContext?.integratorMode === "resolve" && allowed.length > 0
+        ? `只允许编辑这些冲突路径：${allowed.join(", ")}。如果任务是 clean overlap 审查，则不得编辑任何文件。`
+        : "这是 clean overlap 审查，不得编辑任何文件。",
+      "不得执行 git add、commit、reset、branch、worktree、push 等 Git 写操作；Runner 会验证范围并完成 cherry-pick。",
+      "完成后必须调用 worker__submit_result，说明解决依据、风险和未决项。",
       `上下文包：${JSON.stringify(context)}`,
       `Worktree Context：${JSON.stringify(worktreeContext)}`,
     ].join("\n\n");

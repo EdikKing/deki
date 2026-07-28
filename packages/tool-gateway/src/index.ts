@@ -295,7 +295,10 @@ function assertToolAllowed(
       && context.workerProfile === "tester"
       && tool.effect === "read"
     ) return;
-    if (context.workerProfile === "implementer") {
+    if (
+      context.workerProfile === "implementer"
+      || context.workerProfile === "integrator"
+    ) {
       if (tool.providerId === "worker") {
         throw new WorkerModePolicyError(tool.modelName);
       }
@@ -349,7 +352,8 @@ function containsGitMutation(input: unknown): boolean {
   if (!input || typeof input !== "object") return false;
   const command = (input as { command?: unknown }).command;
   if (typeof command !== "string") return false;
-  return /(?:^|[;&|]\s*|\s)git\s+(?:add|am|apply|branch|checkout|cherry-pick|clean|commit|merge|mv|pull|push|rebase|reset|restore|revert|rm|stash|switch|tag|update-ref|worktree)\b/iu
+  if (!/(?:^|[^\p{L}\p{N}_-])git(?:\s|$)/iu.test(command)) return false;
+  return /\b(?:add|am|apply|branch|checkout|cherry-pick|clean|commit|commit-tree|hash-object|merge|mktree|mv|pull|push|read-tree|rebase|reset|restore|revert|rm|stash|switch|symbolic-ref|tag|update-index|update-ref|worktree|write-tree)\b/iu
     .test(command);
 }
 

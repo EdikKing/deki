@@ -7,6 +7,7 @@ describe("AgentSupervisor", () => {
     supervisor.registerWorkspace("workspace-a");
     const mainCompletion = deferred();
     const workerCompletion = deferred();
+    const integratorCompletion = deferred();
     supervisor.track(task("background"), run("run-main"), {
       sessionId: "session-main",
       completion: mainCompletion.promise,
@@ -17,6 +18,11 @@ describe("AgentSupervisor", () => {
       completion: workerCompletion.promise,
       cancel: vi.fn(async () => undefined),
     });
+    supervisor.track(task("integration", "integrator"), run("run-integration"), {
+      sessionId: "session-integration",
+      completion: integratorCompletion.promise,
+      cancel: vi.fn(async () => undefined),
+    });
 
     expect(supervisor.list()).toEqual(expect.arrayContaining([
       expect.objectContaining({ role: "main", sessionId: "session-main" }),
@@ -25,12 +31,18 @@ describe("AgentSupervisor", () => {
         profile: "reviewer",
         sessionId: "session-worker",
       }),
+      expect.objectContaining({
+        role: "worker",
+        profile: "integrator",
+        sessionId: "session-integration",
+      }),
     ]));
     expect(supervisor.listWorkspaces()).toEqual(["workspace-a"]);
     workerCompletion.resolve();
     await Promise.resolve();
     await Promise.resolve();
-    expect(supervisor.list()).toHaveLength(1);
+    expect(supervisor.list()).toHaveLength(2);
+    integratorCompletion.resolve();
     mainCompletion.resolve();
     await supervisor.dispose();
     expect(supervisor.list()).toEqual([]);
@@ -60,21 +72,30 @@ function deferred() {
 }
 
 function task(
-  kind: "background" | "worker",
-  profile?: "explorer" | "tester" | "reviewer",
+  kind: "background" | "worker" | "integration",
+  profile?: "explorer" | "tester" | "reviewer" | "integrator",
 ) {
   const now = new Date().toISOString();
+  const child = kind === "worker" || kind === "integration";
   return {
-    id: kind === "worker" ? "task-worker" : "task-main",
+    id: kind === "worker"
+      ? "task-worker"
+      : kind === "integration"
+        ? "task-integration"
+        : "task-main",
     workspaceId: "workspace-a",
-    rootTaskId: kind === "worker" ? "task-main" : "task-main",
-    ...(kind === "worker" ? { parentTaskId: "task-main" } : {}),
+    rootTaskId: "task-main",
+    ...(child ? { parentTaskId: "task-main" } : {}),
     kind,
     title: kind,
     goal: kind,
     status: "running" as const,
     priority: 0,
-    currentRunId: kind === "worker" ? "run-worker" : "run-main",
+    currentRunId: kind === "worker"
+      ? "run-worker"
+      : kind === "integration"
+        ? "run-integration"
+        : "run-main",
     ...(profile ? { assignedProfile: profile } : {}),
     createdAt: now,
     updatedAt: now,
@@ -84,10 +105,18 @@ function task(
 function run(id: string) {
   return {
     id,
-    taskId: id === "run-worker" ? "task-worker" : "task-main",
+    taskId: id === "run-worker"
+      ? "task-worker"
+      : id === "run-integration"
+        ? "task-integration"
+        : "task-main",
     attempt: 1,
     status: "running" as const,
-    sessionId: id === "run-worker" ? "session-worker" : "session-main",
+    sessionId: id === "run-worker"
+      ? "session-worker"
+      : id === "run-integration"
+        ? "session-integration"
+        : "session-main",
     runnerId: "local",
     startedAt: new Date().toISOString(),
     inputTokens: 0,

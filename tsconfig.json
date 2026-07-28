@@ -25,6 +25,7 @@
       "@deki-ai/permission-engine": ["./packages/permission-engine/src/index.ts"],
       "@deki-ai/agent-runtime": ["./packages/agent-runtime/src/index.ts"],
       "@deki-ai/task-orchestrator": ["./packages/task-orchestrator/src/index.ts"]
+      ,"@deki-ai/runner": ["./packages/runner/src/index.ts"]
     }
   },
   "include": [

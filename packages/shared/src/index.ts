@@ -297,6 +297,7 @@ export const taskStatusSchema = z.enum([
   "waiting_approval",
   "waiting_user",
   "waiting_workers",
+  "awaiting_apply",
   "paused",
   "succeeded",
   "failed",
@@ -311,6 +312,7 @@ export const taskKindSchema = z.enum([
   "planning",
   "worker",
   "plan-execution",
+  "integration",
 ]);
 export type TaskKind = z.infer<typeof taskKindSchema>;
 
@@ -444,7 +446,11 @@ export const taskRecordSchema = z.object({
 }).strict();
 export type TaskRecord = z.infer<typeof taskRecordSchema>;
 
-export const taskRequestKindSchema = z.enum(["approval", "user_input"]);
+export const taskRequestKindSchema = z.enum([
+  "approval",
+  "user_input",
+  "integration_approval",
+]);
 export type TaskRequestKind = z.infer<typeof taskRequestKindSchema>;
 
 export const taskRequestStatusSchema = z.enum([
@@ -477,6 +483,7 @@ export const runStatusSchema = z.enum([
   "waiting_approval",
   "waiting_user",
   "waiting_workers",
+  "awaiting_apply",
   "succeeded",
   "failed",
   "cancelled",
@@ -527,8 +534,27 @@ export const artifactRecordSchema = z.object({
 }).strict();
 export type ArtifactRecord = z.infer<typeof artifactRecordSchema>;
 
-export const workerProfileIdSchema = z.enum(["explorer", "tester", "reviewer"]);
+export const workerProfileIdSchema = z.enum([
+  "explorer",
+  "tester",
+  "reviewer",
+  "implementer",
+  "integrator",
+]);
 export type WorkerProfileId = z.infer<typeof workerProfileIdSchema>;
+
+export const workerWriteSetEntrySchema = z.object({
+  path: z.string().trim().min(1).max(2_000),
+  kind: z.enum(["file", "directory"]),
+  exclusive: z.boolean().default(false),
+}).strict();
+export type WorkerWriteSetEntry = z.infer<typeof workerWriteSetEntrySchema>;
+
+export const validationTargetSchema = z.object({
+  cwd: z.string().trim().min(1).max(2_000).optional(),
+  script: z.string().regex(/^(?:test(?::[A-Za-z0-9_.-]+)?|lint|typecheck)$/),
+}).strict();
+export type ValidationTarget = z.infer<typeof validationTargetSchema>;
 
 export const taskBudgetSchema = z.object({
   maxWorkers: z.number().int().min(1).max(4),
@@ -613,8 +639,7 @@ export const workerContextPackageSchema = z.object({
 }).strict();
 export type WorkerContextPackage = z.infer<typeof workerContextPackageSchema>;
 
-export const workerRequestSchema = z.object({
-  profile: workerProfileIdSchema,
+const workerRequestBaseShape = {
   objective: z.string().min(1).max(100_000),
   successCriteria: z.array(z.string().min(1).max(5_000)).min(1).max(30),
   constraints: z.array(z.string().max(5_000)).max(100).default([]),
@@ -626,8 +651,69 @@ export const workerRequestSchema = z.object({
     revision: z.number().int().positive(),
     stepId: z.string().min(1).max(100).optional(),
   }).strict().optional(),
-}).strict();
+};
+
+export const workerRequestSchema = z.discriminatedUnion("profile", [
+  z.object({
+    profile: z.enum(["explorer", "tester", "reviewer"]),
+    ...workerRequestBaseShape,
+  }).strict(),
+  z.object({
+    profile: z.literal("implementer"),
+    ...workerRequestBaseShape,
+    writeSet: z.array(workerWriteSetEntrySchema).min(1).max(100),
+    validationTargets: z.array(validationTargetSchema).min(1).max(30),
+  }).strict(),
+]);
 export type WorkerRequest = z.infer<typeof workerRequestSchema>;
+
+export const implementationResultSchema = z.object({
+  taskId: z.string().uuid(),
+  runId: z.string().uuid(),
+  baselineCommit: z.string().regex(/^[0-9a-f]{40,64}$/i),
+  commit: z.string().regex(/^[0-9a-f]{40,64}$/i).optional(),
+  changedFiles: z.array(z.string().min(1).max(2_000)).max(2_000),
+  patchArtifactId: z.string().uuid().optional(),
+  commitArtifactId: z.string().uuid().optional(),
+  validationArtifactIds: z.array(z.string().uuid()).max(100),
+  scopeViolation: z.boolean().default(false),
+  createdAt: z.string().datetime(),
+}).strict();
+export type ImplementationResult = z.infer<typeof implementationResultSchema>;
+
+export const integrationStatusSchema = z.enum([
+  "preparing",
+  "merging",
+  "conflicted",
+  "testing",
+  "awaiting_apply",
+  "applied",
+  "artifact_only",
+  "failed",
+  "cancelled",
+]);
+export type IntegrationStatus = z.infer<typeof integrationStatusSchema>;
+
+export const integrationRecordSchema = z.object({
+  id: z.string().uuid(),
+  rootTaskId: z.string().uuid(),
+  taskId: z.string().uuid(),
+  baselineCommit: z.string().regex(/^[0-9a-f]{40,64}$/i),
+  integrationCommit: z.string().regex(/^[0-9a-f]{40,64}$/i).optional(),
+  status: integrationStatusSchema,
+  predictedOverlaps: z.array(z.string().max(2_000)).max(2_000),
+  actualOverlaps: z.array(z.string().max(2_000)).max(2_000),
+  conflictFiles: z.array(z.string().max(2_000)).max(2_000),
+  workerTaskIds: z.array(z.string().uuid()).max(100),
+  validationArtifactIds: z.array(z.string().uuid()).max(100),
+  diffArtifactId: z.string().uuid().optional(),
+  patchArtifactId: z.string().uuid().optional(),
+  cleanupStatus: z.enum(["pending", "cleaned", "failed"]),
+  cleanupError: z.string().max(10_000).optional(),
+  createdAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+}).strict();
+export type IntegrationRecord = z.infer<typeof integrationRecordSchema>;
 
 export const workerResultEnvelopeSchema = z.object({
   task: taskRecordSchema,
@@ -664,6 +750,18 @@ export const taskEventTypeSchema = z.enum([
   "user_input.resolved",
   "worker.delegated",
   "worker.result_received",
+  "worktree.created",
+  "worktree.finalized",
+  "worktree.cleanup_failed",
+  "worker.scope_violation",
+  "integration.created",
+  "integration.overlap_detected",
+  "integration.conflict_detected",
+  "integration.testing",
+  "integration.awaiting_apply",
+  "integration.applied",
+  "integration.artifact_only",
+  "integration.failed",
   "budget.warning",
   "budget.exceeded",
 ]);
@@ -722,6 +820,8 @@ export const taskDetailSchema = z.object({
   planContext: taskPlanContextSchema.optional(),
   children: z.array(taskSummarySchema).default([]),
   workerResult: workerResultSchema.optional(),
+  implementationResult: implementationResultSchema.optional(),
+  integration: integrationRecordSchema.optional(),
   budget: taskBudgetSchema.optional(),
   budgetUsage: taskBudgetUsageSchema.optional(),
 }).strict();
@@ -932,6 +1032,17 @@ export const sendPromptInputSchema = z.object({
   mode: z.enum(["foreground", "background"]).default("foreground"),
   interactionMode: interactionModeSchema.default("act"),
 }).strict();
+
+export const optimizePromptInputSchema = z.object({
+  prompt: z.string().trim().min(1).max(100_000),
+}).strict();
+
+export const optimizePromptResultSchema = z.object({
+  ok: z.boolean(),
+  prompt: z.string().trim().min(1).max(100_000).optional(),
+  error: z.string().optional(),
+}).strict();
+export type OptimizePromptResult = z.infer<typeof optimizePromptResultSchema>;
 
 export const rememberInputSchema = z.object({
   content: z.string().trim().min(1).max(10_000),
@@ -1173,6 +1284,29 @@ export const taskApprovalDecisionInputSchema = approvalDecisionInputSchema.exten
   taskId: z.string().uuid().optional(),
 }).strict();
 
+export const integrationDecisionSchema = z.enum(["apply", "artifact_only", "cancel"]);
+export type IntegrationDecision = z.infer<typeof integrationDecisionSchema>;
+export const integrationDecisionInputSchema = z.object({
+  taskId: z.string().uuid(),
+  requestId: z.string().min(1),
+  decision: integrationDecisionSchema,
+}).strict();
+
+export const artifactChunkInputSchema = z.object({
+  artifactId: z.string().uuid(),
+  offset: z.number().int().nonnegative().default(0),
+  limit: z.number().int().min(1).max(256 * 1024).default(64 * 1024),
+}).strict();
+export const artifactChunkSchema = z.object({
+  artifactId: z.string().uuid(),
+  content: z.string(),
+  offset: z.number().int().nonnegative(),
+  nextOffset: z.number().int().nonnegative(),
+  totalBytes: z.number().int().nonnegative(),
+  done: z.boolean(),
+}).strict();
+export type ArtifactChunk = z.infer<typeof artifactChunkSchema>;
+
 export const IPC_CHANNELS = {
   getBootstrapState: "deki:get-bootstrap-state",
   chooseWorkspace: "deki:choose-workspace",
@@ -1180,6 +1314,7 @@ export const IPC_CHANNELS = {
   openGeneralChat: "deki:open-general-chat",
   trustWorkspace: "deki:trust-workspace",
   sendPrompt: "deki:send-prompt",
+  optimizePrompt: "deki:optimize-prompt",
   abortRun: "deki:abort-run",
   listTasks: "deki:list-tasks",
   getTask: "deki:get-task",
@@ -1190,6 +1325,8 @@ export const IPC_CHANNELS = {
   promoteTask: "deki:promote-task",
   openTaskSession: "deki:open-task-session",
   respondToTaskInput: "deki:respond-to-task-input",
+  respondToIntegration: "deki:respond-to-integration",
+  readArtifactChunk: "deki:read-artifact-chunk",
   listPlans: "deki:list-plans",
   getPlan: "deki:get-plan",
   approvePlan: "deki:approve-plan",
@@ -1268,6 +1405,7 @@ export interface DekiDesktopApi {
     prompt: string,
     options?: Partial<PromptSubmissionOptions>,
   ): Promise<TaskSubmissionResult>;
+  optimizePrompt(prompt: string): Promise<OptimizePromptResult>;
   abortRun(): Promise<CommandResult>;
   listTasks(input?: Partial<TaskListInput>): Promise<TaskSummary[]>;
   getTask(taskId: string): Promise<TaskDetail | null>;
@@ -1282,6 +1420,16 @@ export interface DekiDesktopApi {
     requestId: string,
     value: string,
   ): Promise<CommandResult>;
+  respondToIntegration(
+    taskId: string,
+    requestId: string,
+    decision: IntegrationDecision,
+  ): Promise<CommandResult>;
+  readArtifactChunk(
+    artifactId: string,
+    offset?: number,
+    limit?: number,
+  ): Promise<ArtifactChunk>;
   listPlans(input?: Partial<PlanListInput>): Promise<PlanSummary[]>;
   getPlan(planId: string): Promise<PlanDetail | null>;
   approvePlan(planId: string, revision: number): Promise<CommandResult>;

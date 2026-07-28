@@ -18,6 +18,8 @@ import {
   mcpToolSummarySchema,
   modelProviderInputSchema,
   modelProviderCatalogResultSchema,
+  optimizePromptInputSchema,
+  optimizePromptResultSchema,
   redactedModelProviderSchema,
   conversationMessageSchema,
   forkSessionInputSchema,
@@ -44,6 +46,9 @@ import {
   revisePlanInputSchema,
   replanInputSchema,
   taskInputResponseSchema,
+  integrationDecisionInputSchema,
+  artifactChunkInputSchema,
+  artifactChunkSchema,
   settingsPatchSchema,
   settingsScopeSchema,
   settingsSnapshotSchema,
@@ -85,6 +90,12 @@ const api: DekiDesktopApi = {
         mode: parsedOptions.mode,
         interactionMode: parsedOptions.interactionMode,
       }),
+    );
+  },
+  async optimizePrompt(prompt) {
+    const input = optimizePromptInputSchema.parse({ prompt });
+    return optimizePromptResultSchema.parse(
+      await ipcRenderer.invoke(IPC_CHANNELS.optimizePrompt, input),
     );
   },
   async abortRun() {
@@ -161,6 +172,22 @@ const api: DekiDesktopApi = {
       await ipcRenderer.invoke(
         IPC_CHANNELS.respondToTaskInput,
         taskInputResponseSchema.parse({ taskId, requestId, value }),
+      ),
+    );
+  },
+  async respondToIntegration(taskId, requestId, decision) {
+    return commandResultSchema.parse(
+      await ipcRenderer.invoke(
+        IPC_CHANNELS.respondToIntegration,
+        integrationDecisionInputSchema.parse({ taskId, requestId, decision }),
+      ),
+    );
+  },
+  async readArtifactChunk(artifactId, offset, limit) {
+    return artifactChunkSchema.parse(
+      await ipcRenderer.invoke(
+        IPC_CHANNELS.readArtifactChunk,
+        artifactChunkInputSchema.parse({ artifactId, offset, limit }),
       ),
     );
   },

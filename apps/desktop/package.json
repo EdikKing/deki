@@ -18,6 +18,7 @@
   },
   "dependencies": {
     "@deki-ai/agent-supervisor": "workspace:*",
+    "@deki-ai/runner": "workspace:*",
     "@deki-ai/agent-runtime": "workspace:*",
     "@deki-ai/config": "workspace:*",
     "@deki-ai/git-checkpoint": "workspace:*",

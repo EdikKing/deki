@@ -352,6 +352,104 @@ test("runs two real read-only Workers and renders their Agent Tree", async ({}) 
 
 // Playwright requires an object-destructured fixtures parameter.
 // eslint-disable-next-line no-empty-pattern
+test("runs two isolated Implementers and applies only after final approval", async ({}) => {
+  test.setTimeout(60_000);
+  const temporaryHome = await mkdtemp(resolve(tmpdir(), "deki-electron-implementer-flow-"));
+  const workspace = await mkdtemp(resolve(tmpdir(), "deki-electron-implementer-workspace-"));
+  const modelServer = await startFixtureModelServer();
+  await seedChineseSettings(temporaryHome, { agent: { maxConcurrentRuns: 2 } });
+  await seedFixtureModel(temporaryHome, modelServer.baseUrl);
+  await writeFile(join(workspace, "package.json"), JSON.stringify({
+    name: "implementer-fixture",
+    private: true,
+    scripts: { test: "node -e \"process.exit(0)\"" },
+  }));
+  await writeFile(join(workspace, "base.txt"), "base\n");
+  await execFileAsync("git", ["init"], { cwd: workspace });
+  await execFileAsync("git", ["add", "-A"], { cwd: workspace });
+  await execFileAsync("git", [
+    "-c", "user.name=Deki Test",
+    "-c", "user.email=deki@example.com",
+    "commit", "-m", "fixture",
+  ], { cwd: workspace });
+  await writeFile(join(workspace, "dirty.txt"), "user dirty baseline\n");
+  await execFileAsync("git", ["add", "dirty.txt"], { cwd: workspace });
+  const before = await gitWorkspaceSnapshot(workspace);
+  const beforeHead = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: workspace })).stdout;
+  const electronApp = await electron.launch({
+    executablePath: electronPath,
+    args: createElectronArguments(temporaryHome, "--workspace", workspace),
+    env: createTestEnvironment(temporaryHome),
+  });
+
+  try {
+    const window = await electronApp.firstWindow();
+    await window.getByRole("button", { name: /信任并继续|Trust and continue/ }).click();
+    await expect(
+      window.locator(".composer-card").getByRole("button", { name: "选择模型" }),
+    ).toContainText("Fixture Model");
+    const submission = await window.evaluate(
+      () => (globalThis as unknown as { deki: DekiDesktopApi }).deki.sendPrompt(
+        "测试隔离 Implementer 最终审批",
+        { mode: "background", interactionMode: "act" },
+      ),
+    );
+    expect(submission.ok, JSON.stringify(submission)).toBe(true);
+    await window.getByTestId("open-task-center").click();
+    const row = window.locator(".task-row").filter({ hasText: "测试隔离 Implementer 最终审批" });
+    await expect.poll(async () => window.evaluate(async () => {
+      const api = (globalThis as unknown as { deki: DekiDesktopApi }).deki;
+      const summary = (await api.listTasks({
+        query: "测试隔离 Implementer 最终审批",
+        limit: 10,
+      })).find((candidate) => candidate.task.kind === "background");
+      const detail = summary ? await api.getTask(summary.task.id) : null;
+      const value = {
+        status: summary?.task.status,
+        error: summary?.error,
+        children: await Promise.all((detail?.children ?? []).map(async (child) => {
+          const childDetail = await api.getTask(child.task.id);
+          return {
+            status: child.task.status,
+            error: child.error,
+            artifacts: childDetail?.artifacts.map((artifact) => ({
+              kind: artifact.kind,
+              metadata: artifact.metadata,
+            })),
+            events: childDetail?.events.map((event) => event.type),
+          };
+        })),
+      };
+      return value.status === "awaiting_apply" ? "awaiting_apply" : JSON.stringify(value);
+    }), { timeout: 30_000 }).toBe("awaiting_apply");
+    await expect(readFile(join(workspace, "alpha.txt"), "utf8")).rejects.toThrow();
+    await expect(readFile(join(workspace, "beta.txt"), "utf8")).rejects.toThrow();
+    expect(await gitWorkspaceSnapshot(workspace)).toEqual(before);
+    await row.click();
+    await expect(window.getByText("集成状态")).toBeVisible();
+    await expect(window.getByText(/awaiting_apply/)).toBeVisible();
+    await window.getByRole("button", { name: "应用到工作区" }).click();
+    await expect(window.locator(".task-status-pill")).toHaveText("已完成", {
+      timeout: 20_000,
+    });
+    expect(await readFile(join(workspace, "alpha.txt"), "utf8").then((value) => value.trim()))
+      .toBe("alpha implemented");
+    expect(await readFile(join(workspace, "beta.txt"), "utf8").then((value) => value.trim()))
+      .toBe("beta implemented");
+    const after = await gitWorkspaceSnapshot(workspace);
+    expect(after.staged).toBe(before.staged);
+    expect((await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: workspace })).stdout)
+      .toBe(beforeHead);
+  } finally {
+    await electronApp.close();
+    await modelServer.close();
+    await rm(temporaryHome, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+// Playwright requires an object-destructured fixtures parameter.
+// eslint-disable-next-line no-empty-pattern
 test("runs Tester only in a temporary snapshot and persists its log Artifact", async ({}) => {
   const temporaryHome = await mkdtemp(resolve(tmpdir(), "deki-electron-tester-flow-"));
   const workspace = await mkdtemp(resolve(tmpdir(), "deki-electron-tester-workspace-"));
@@ -1136,6 +1234,66 @@ function fixtureCompletion(
   text: string;
   tool?: { name: string; arguments: Record<string, unknown> };
 } {
+  if (prompt.includes("测试隔离 Implementer 最终审批")) {
+    if (calledTools.includes("worker__delegate")) {
+      return { text: "Isolated implementation integrated after user delivery decision." };
+    }
+    return {
+      text: "",
+      tool: {
+        name: "worker__delegate",
+        arguments: {
+          requests: [{
+            profile: "implementer",
+            objective: "创建 alpha.txt",
+            successCriteria: ["alpha.txt 内容正确且测试通过"],
+            constraints: ["只修改 alpha.txt"],
+            knownFacts: [],
+            fileHints: ["alpha.txt"],
+            symbolHints: [],
+            writeSet: [{ path: "alpha.txt", kind: "file" }],
+            validationTargets: [{ script: "test" }],
+          }, {
+            profile: "implementer",
+            objective: "创建 beta.txt",
+            successCriteria: ["beta.txt 内容正确且测试通过"],
+            constraints: ["只修改 beta.txt"],
+            knownFacts: [],
+            fileHints: ["beta.txt"],
+            symbolHints: [],
+            writeSet: [{ path: "beta.txt", kind: "file" }],
+            validationTargets: [{ script: "test" }],
+          }],
+        },
+      },
+    };
+  }
+  if (prompt.includes("你是 Implementer")) {
+    const alpha = prompt.includes("\"path\":\"alpha.txt\"");
+    const target = alpha ? "alpha.txt" : "beta.txt";
+    if (!calledTools.includes("workspace__write")) {
+      return {
+        text: "",
+        tool: {
+          name: "workspace__write",
+          arguments: {
+            path: target,
+            content: `${alpha ? "alpha" : "beta"} implemented\n`,
+          },
+        },
+      };
+    }
+    if (!calledTools.includes("worker__submit_result")) {
+      return {
+        text: "",
+        tool: {
+          name: "worker__submit_result",
+          arguments: fixtureWorkerResult(`Implemented ${target}`),
+        },
+      };
+    }
+    return { text: `Implemented ${target}.` };
+  }
   if (prompt.includes("测试多 Agent 只读调查")) {
     if (calledTools.includes("worker__delegate")) {
       return { text: "Worker findings synthesized." };

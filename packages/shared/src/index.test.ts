@@ -3,6 +3,8 @@ import {
   agentEventSchema,
   bootstrapStateSchema,
   memoryListInputSchema,
+  optimizePromptInputSchema,
+  optimizePromptResultSchema,
   rememberInputSchema,
   sendPromptInputSchema,
   taskEventSchema,
@@ -13,6 +15,7 @@ import {
   taskInputResponseSchema,
   taskSubmissionResultSchema,
   updateSessionConfigurationInputSchema,
+  workerRequestSchema,
 } from "./index";
 
 describe("shared IPC schemas", () => {
@@ -46,6 +49,19 @@ describe("shared IPC schemas", () => {
       prompt: "分析项目",
       mode: "background",
     }).mode).toBe("background");
+  });
+
+  it("validates prompt optimization requests and results", () => {
+    expect(optimizePromptInputSchema.parse({ prompt: "  做一个登录页  " }))
+      .toEqual({ prompt: "做一个登录页" });
+    expect(() => optimizePromptInputSchema.parse({ prompt: "   " })).toThrow();
+    expect(optimizePromptResultSchema.parse({
+      ok: true,
+      prompt: "目标：实现登录页",
+    })).toEqual({
+      ok: true,
+      prompt: "目标：实现登录页",
+    });
   });
 
   it("validates task records, events, and submission results", () => {
@@ -92,6 +108,26 @@ describe("shared IPC schemas", () => {
       value: "A",
     }).value).toBe("A");
     expect(() => taskListInputSchema.parse({ limit: 501 })).toThrow();
+  });
+
+  it("requires an explicit write scope and validation targets for Implementers", () => {
+    expect(workerRequestSchema.parse({
+      profile: "implementer",
+      objective: "修改模块",
+      successCriteria: ["测试通过"],
+      writeSet: [{ path: "src/module.ts", kind: "file" }],
+      validationTargets: [{ script: "test" }],
+    })).toMatchObject({ profile: "implementer" });
+    expect(() => workerRequestSchema.parse({
+      profile: "implementer",
+      objective: "修改模块",
+      successCriteria: ["测试通过"],
+    })).toThrow();
+    expect(() => workerRequestSchema.parse({
+      profile: "integrator",
+      objective: "直接派发 Integrator",
+      successCriteria: ["完成"],
+    })).toThrow();
   });
 
   it("validates task-scoped memory commands and indexed queries", () => {

@@ -98,5 +98,9 @@ export class AgentSupervisor {
 }
 
 function isWorkerProfile(value: string | undefined): value is WorkerProfileId {
-  return value === "explorer" || value === "tester" || value === "reviewer";
+  return value === "explorer"
+    || value === "tester"
+    || value === "reviewer"
+    || value === "implementer"
+    || value === "integrator";
 }

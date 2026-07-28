@@ -21,6 +21,7 @@ const statusCopy: Record<TaskStatus, { zh: string; en: string }> = {
   waiting_approval: { zh: "等待审批", en: "Needs approval" },
   waiting_user: { zh: "等待输入", en: "Needs input" },
   waiting_workers: { zh: "等待 Worker", en: "Waiting for workers" },
+  awaiting_apply: { zh: "等待应用", en: "Ready to apply" },
   paused: { zh: "已暂停", en: "Paused" },
   succeeded: { zh: "已完成", en: "Completed" },
   failed: { zh: "失败", en: "Failed" },
@@ -39,8 +40,42 @@ export function TaskCenter(props: TaskCenterProps) {
   const [error, setError] = useState<string>();
   const [inputValues, setInputValues] = useState<Record<string, string>>({});
   const [previewArtifact, setPreviewArtifact] = useState<ArtifactRecord>();
+  const [previewContent, setPreviewContent] = useState("");
   const taskRefreshSequence = useRef(0);
   const detailRefreshSequence = useRef(0);
+
+  useEffect(() => {
+    if (!previewArtifact) {
+      setPreviewContent("");
+      return;
+    }
+    if (previewArtifact.content !== undefined) {
+      setPreviewContent(previewArtifact.content);
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      let offset = 0;
+      let content = "";
+      for (;;) {
+        const chunk = await window.deki.readArtifactChunk(
+          previewArtifact.id,
+          offset,
+          64 * 1024,
+        );
+        if (cancelled) return;
+        content += chunk.content;
+        setPreviewContent(content);
+        if (chunk.done || content.length >= 2_000_000) return;
+        offset = chunk.nextOffset;
+      }
+    })().catch((reason) => {
+      if (!cancelled) setPreviewContent(String(reason));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [previewArtifact]);
 
   async function refreshTasks() {
     const sequence = taskRefreshSequence.current + 1;
@@ -357,6 +392,52 @@ export function TaskCenter(props: TaskCenterProps) {
                 </section>
               )}
 
+              {detail.implementationResult && (
+                <section className="task-detail-section">
+                  <h3>{props.zh ? "实现产物" : "Implementation"}</h3>
+                  <p>
+                    {detail.implementationResult.commit?.slice(0, 12) ?? "no commit"}
+                    {" · "}
+                    {detail.implementationResult.changedFiles.length} files
+                    {" · "}
+                    {detail.implementationResult.validationArtifactIds.length} validations
+                  </p>
+                  {detail.implementationResult.scopeViolation && (
+                    <p className="error">
+                      {props.zh ? "修改超出声明写入范围，未进入集成。" : "Write scope violation; not integrated."}
+                    </p>
+                  )}
+                </section>
+              )}
+
+              {detail.integration && (
+                <section className="task-detail-section">
+                  <h3>{props.zh ? "集成状态" : "Integration"}</h3>
+                  <p>
+                    {detail.integration.status}
+                    {" · "}
+                    {detail.integration.workerTaskIds.length} Implementer
+                    {" · "}
+                    {detail.integration.cleanupStatus}
+                  </p>
+                  {detail.integration.predictedOverlaps.length > 0 && (
+                    <p>{props.zh ? "预测重叠：" : "Predicted overlaps: "}
+                      {detail.integration.predictedOverlaps.join("；")}</p>
+                  )}
+                  {detail.integration.actualOverlaps.length > 0 && (
+                    <p>{props.zh ? "实际重叠：" : "Actual overlaps: "}
+                      {detail.integration.actualOverlaps.join("；")}</p>
+                  )}
+                  {detail.integration.conflictFiles.length > 0 && (
+                    <p className="error">{props.zh ? "冲突文件：" : "Conflicts: "}
+                      {detail.integration.conflictFiles.join("；")}</p>
+                  )}
+                  {detail.integration.cleanupError && (
+                    <p className="error">{detail.integration.cleanupError}</p>
+                  )}
+                </section>
+              )}
+
               {detail.planContext && (
                 <section className="task-detail-section task-plan-context">
                   <h3>{props.zh ? "计划进度" : "Plan progress"}</h3>
@@ -389,7 +470,27 @@ export function TaskCenter(props: TaskCenterProps) {
                     : (props.zh ? "需要输入" : "Input required")}</span>
                   <h3>{request.title}</h3>
                   {request.description && <p>{request.description}</p>}
-                  {request.kind === "approval" ? (
+                  {request.kind === "integration_approval" ? (
+                    <div className="task-request-actions">
+                      <button onClick={() => void command(window.deki.respondToIntegration(
+                        detail.task.id,
+                        request.id,
+                        "cancel",
+                      ))}>{props.zh ? "取消集成" : "Cancel"}</button>
+                      <button onClick={() => void command(window.deki.respondToIntegration(
+                        detail.task.id,
+                        request.id,
+                        "artifact_only",
+                      ))}>{props.zh ? "仅保留产物" : "Keep artifacts"}</button>
+                      <button className="primary" onClick={() => void command(
+                        window.deki.respondToIntegration(
+                          detail.task.id,
+                          request.id,
+                          "apply",
+                        ),
+                      )}>{props.zh ? "应用到工作区" : "Apply to workspace"}</button>
+                    </div>
+                  ) : request.kind === "approval" ? (
                     <>
                       <pre className="task-request-details">
                         {JSON.stringify(request.payload, null, 2)}
@@ -538,8 +639,8 @@ export function TaskCenter(props: TaskCenterProps) {
                 onClick={() => setPreviewArtifact(undefined)}
               >×</button>
             </header>
-            {previewArtifact.content ? (
-              <pre>{previewArtifact.content}</pre>
+            {previewContent ? (
+              <pre>{previewContent}</pre>
             ) : (
               <p>
                 {props.zh
@@ -654,6 +755,7 @@ function taskKindLabel(kind: TaskDetail["task"]["kind"], zh: boolean): string {
     worker: zh ? "Worker" : "Worker",
     planning: zh ? "规划" : "Planning",
     "plan-execution": zh ? "计划执行" : "Plan execution",
+    integration: zh ? "集成" : "Integration",
   };
   return labels[kind];
 }

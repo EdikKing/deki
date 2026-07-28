@@ -60,6 +60,7 @@ export function App() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [events, setEvents] = useState<AgentEvent[]>([]);
   const [prompt, setPrompt] = useState("");
+  const [optimizingPrompt, setOptimizingPrompt] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
   const [settings, setSettings] = useState<SettingsSnapshot>();
@@ -425,7 +426,7 @@ export function App() {
 
   async function submit(mode: "foreground" | "background" = "foreground") {
     const value = prompt.trim();
-    if (!value || (mode === "foreground" && busy)) return;
+    if (!value || optimizingPrompt || (mode === "foreground" && busy)) return;
     const sessionCommand = value.startsWith("/");
     if (mode === "background" && sessionCommand) {
       setError(zh ? "会话命令不能在后台运行" : "Session commands cannot run in background");
@@ -457,6 +458,26 @@ export function App() {
       setForegroundTaskId(result.task.id);
     }
     await refresh();
+  }
+
+  async function optimizeCurrentPrompt() {
+    const sourcePrompt = prompt;
+    const value = sourcePrompt.trim();
+    if (!value || optimizingPrompt || isSessionCommand || !state?.ready) return;
+    setOptimizingPrompt(true);
+    setError(undefined);
+    try {
+      const result = await window.deki.optimizePrompt(value);
+      if (!result.ok || !result.prompt) {
+        setError(result.error ?? (zh ? "输入优化失败" : "Unable to optimize the prompt"));
+        return;
+      }
+      setPrompt((current) => current === sourcePrompt ? result.prompt! : current);
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setOptimizingPrompt(false);
+    }
   }
 
   async function switchProjectContext(workspace?: string) {
@@ -811,6 +832,7 @@ export function App() {
                 <textarea
                   className="composer-input"
                   value={prompt}
+                  readOnly={optimizingPrompt}
                   placeholder={state.ready
                     ? interactionMode === "plan"
                       ? (zh
@@ -826,6 +848,7 @@ export function App() {
                   onKeyDown={(event) => {
                     if (event.key === "Enter" && !event.shiftKey) {
                       event.preventDefault();
+                      if (optimizingPrompt) return;
                       void submit();
                     }
                   }}
@@ -911,10 +934,22 @@ export function App() {
                   </div>
                   <div className="composer-actions">
                     <button
+                      className={`composer-tool prompt-optimizer${optimizingPrompt ? " optimizing" : ""}`}
+                      aria-label={zh ? "优化输入" : "Optimize prompt"}
+                      aria-busy={optimizingPrompt}
+                      title={optimizingPrompt
+                        ? (zh ? "正在分析意图并规划步骤…" : "Analyzing intent and planning steps…")
+                        : (zh ? "优化输入：明确意图并规划工作步骤" : "Optimize prompt: clarify intent and plan the work")}
+                      disabled={!prompt.trim() || busy || optimizingPrompt || isSessionCommand || !state.ready}
+                      onClick={() => void optimizeCurrentPrompt()}
+                    >
+                      <span className="prompt-optimizer-icon" aria-hidden="true">✦</span>
+                    </button>
+                    <button
                       className="composer-tool"
                       aria-label={zh ? "保存记忆" : "Save memory"}
                       title={zh ? "插入 /remember" : "Insert /remember"}
-                      disabled={busy || !canRemember}
+                      disabled={busy || optimizingPrompt || !canRemember}
                       onClick={() => setPrompt((current) => (
                         current ? `${current}\n/remember ` : "/remember "
                       ))}
@@ -939,7 +974,7 @@ export function App() {
                       title={interactionMode === "plan"
                         ? (zh ? "在后台生成计划" : "Generate plan in background")
                         : (zh ? "在独立会话中后台运行" : "Run in a separate background session")}
-                      disabled={!prompt.trim() || isSessionCommand || !state.ready}
+                      disabled={!prompt.trim() || optimizingPrompt || isSessionCommand || !state.ready}
                       onClick={() => void submit("background")}
                     >
                       <span aria-hidden="true">↗</span>
@@ -978,7 +1013,7 @@ export function App() {
                         title={interactionMode === "plan"
                           ? (zh ? "生成计划" : "Generate plan")
                           : (zh ? "发送" : "Send")}
-                        disabled={!state.ready && !isSessionCommand}
+                        disabled={optimizingPrompt || (!state.ready && !isSessionCommand)}
                         onClick={() => void submit("foreground")}
                       >
                         <span aria-hidden="true">↑</span>

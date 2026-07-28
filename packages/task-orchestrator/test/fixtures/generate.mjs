@@ -11,7 +11,7 @@ const createdAt = "2026-01-01T00:00:00.000Z";
 
 mkdirSync(root, { recursive: true });
 
-for (const version of [1, 2, 3, 4, 5]) {
+for (const version of [1, 2, 3, 4, 5, 6]) {
   const path = join(root, `tasks-v${version}.db`);
   rmSync(path, { force: true });
   const database = new DatabaseSync(path);
@@ -21,6 +21,7 @@ for (const version of [1, 2, 3, 4, 5]) {
   if (version >= 3) migrateToV3(database);
   if (version >= 4) migrateToV4(database);
   if (version >= 5) migrateToV5(database);
+  if (version >= 6) migrateToV6(database);
   seedVersionData(database, version);
   database.exec(`PRAGMA user_version = ${version}`);
   database.close();
@@ -171,6 +172,45 @@ function migrateToV5(database) {
     );
     CREATE INDEX worker_delegations_parent_idx
       ON worker_delegations(parent_task_id, status, created_at);
+  `);
+}
+
+function migrateToV6(database) {
+  database.exec(`
+    CREATE TABLE implementation_results (
+      task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+      result_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY(task_id, run_id)
+    );
+    CREATE TABLE integrations (
+      id TEXT PRIMARY KEY,
+      root_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      record_json TEXT NOT NULL,
+      status TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX integrations_root_idx ON integrations(root_task_id, created_at);
+    CREATE UNIQUE INDEX integrations_task_idx ON integrations(task_id);
+    CREATE TABLE runner_resources (
+      id TEXT PRIMARY KEY,
+      root_task_id TEXT NOT NULL,
+      task_id TEXT NOT NULL,
+      run_id TEXT,
+      kind TEXT NOT NULL,
+      path TEXT NOT NULL,
+      branch_ref TEXT NOT NULL,
+      base_commit TEXT NOT NULL,
+      status TEXT NOT NULL,
+      cleanup_error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX runner_resources_cleanup_idx
+      ON runner_resources(status, updated_at);
   `);
 }
 

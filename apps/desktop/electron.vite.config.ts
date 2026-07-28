@@ -20,6 +20,7 @@ export default defineConfig({
           "@deki-ai/agent-runtime",
           "@deki-ai/agent-supervisor",
           "@deki-ai/task-orchestrator",
+          "@deki-ai/runner",
         ],
       }),
     ],

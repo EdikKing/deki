@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import {
   appendFile,
@@ -33,6 +34,15 @@ import electronUpdater from "electron-updater";
 import { DekiAgentRuntime } from "@deki-ai/agent-runtime";
 import { AgentSupervisor } from "@deki-ai/agent-supervisor";
 import { GitCheckpointManager } from "@deki-ai/git-checkpoint";
+import {
+  ArtifactStore,
+  WorktreeRunner,
+  WorkspaceDriftError,
+  scheduleWriteWaves,
+  validateWriteSet,
+  writeSetsOverlap,
+  type WorktreeResource,
+} from "@deki-ai/runner";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import {
   ensureDekiDirectories,
@@ -85,6 +95,8 @@ import {
   memoryListInputSchema,
   memoryMoveInputSchema,
   openWorkspaceInputSchema,
+  optimizePromptInputSchema,
+  optimizePromptResultSchema,
   approvePlanInputSchema,
   planDetailSchema,
   planEventSchema,
@@ -112,6 +124,9 @@ import {
   taskSummarySchema,
   taskInputResponseSchema,
   taskApprovalDecisionInputSchema,
+  integrationDecisionInputSchema,
+  artifactChunkInputSchema,
+  artifactChunkSchema,
   taskSubmissionResultSchema,
   rememberInputSchema,
   removeModelProviderInputSchema,
@@ -126,6 +141,7 @@ import {
   type CommandResult,
   type McpServerEditor,
   type MemoryScope,
+  type OptimizePromptResult,
   type PlanDetail,
   type PlanEvent,
   type PlanListInput,
@@ -133,6 +149,7 @@ import {
   type TaskListInput,
   type TaskSubmissionResult,
   type UpdateSessionConfigurationInput,
+  type WorkerRequest,
   workerRequestSchema,
   workerResultSchema,
 } from "@deki-ai/shared";
@@ -155,6 +172,7 @@ let quitting = false;
 let shutdownComplete = false;
 let updateCheckTimer: NodeJS.Timeout | undefined;
 let appliedUpdateConfiguration = "";
+const repositoryWriteLocks = new Map<string, Promise<void>>();
 const { autoUpdater } = electronUpdater;
 
 class DesktopController {
@@ -211,6 +229,7 @@ class DesktopController {
     options: {
       resumeLatest?: boolean;
       tasks?: TaskOrchestrator;
+      trustedEphemeral?: boolean;
     } = {},
   ): Promise<DesktopController> {
     const paths = getDekiPaths();
@@ -252,7 +271,8 @@ class DesktopController {
       options.resumeLatest === true,
     );
     instance.#trusted = workspace
-      ? await isWorkspaceTrusted(paths.configFile, workspace)
+      ? options.trustedEphemeral === true
+        || await isWorkspaceTrusted(paths.configFile, workspace)
       : true;
     if (instance.#trusted) {
       await instance.#startRuntime();
@@ -395,6 +415,24 @@ class DesktopController {
         },
       });
       return { ok: true, task };
+    } catch (error) {
+      return { ok: false, error: formatError(error) };
+    }
+  }
+
+  async optimizePrompt(prompt: string): Promise<OptimizePromptResult> {
+    if (!this.#trusted) {
+      return { ok: false, error: "请先信任当前工作区" };
+    }
+    const runtime = this.#runtime;
+    if (!runtime) {
+      return { ok: false, error: "Agent Runtime 尚未就绪" };
+    }
+    try {
+      return {
+        ok: true,
+        prompt: await runtime.optimizePrompt(prompt),
+      };
     } catch (error) {
       return { ok: false, error: formatError(error) };
     }
@@ -638,6 +676,7 @@ class DesktopController {
           ? renderWorkerPrompt(
             input.execution.workerProfile!,
             input.execution.workerContext,
+            input.execution.worktreeContext,
           )
         : input.execution.continuation
           ? renderTaskContinuation(input.task, taskStore)
@@ -1625,6 +1664,15 @@ class DesktopController {
               throw new Error("只有主 Agent 可以派发 Worker");
             }
             const parsed = workerRequestSchema.array().min(1).max(2).parse(requests);
+            if (parsed.some((request) => request.profile === "implementer")) {
+              if (parsed.some((request) => request.profile !== "implementer")) {
+                throw new Error("同一批次不能混合 Implementer 与只读 Worker");
+              }
+              return this.#delegateImplementers(
+                parsed as Extract<WorkerRequest, { profile: "implementer" }>[],
+                context,
+              );
+            }
             const settings = this.#settings.snapshot().effective.agent;
             return this.#tasks.delegateWorkers({
               parentTaskId: context.taskId,
@@ -1729,6 +1777,386 @@ class DesktopController {
       await this.#starting;
     } finally {
       this.#starting = undefined;
+    }
+  }
+
+  async #delegateImplementers(
+    requests: Extract<WorkerRequest, { profile: "implementer" }>[],
+    context: import("@deki-ai/shared").ToolCallContext,
+  ) {
+    if (
+      !this.#workspace
+      || !context.taskId
+      || !context.runId
+      || !context.sessionId
+    ) throw new Error("Implementer 只能从受信任 Git 项目任务派发");
+    const runner = new WorktreeRunner(this.#workspace, {
+      worktreesRoot: join(this.#paths.worktreesRoot, this.#scopeId),
+      timeoutMs: 600_000,
+    });
+    const repository = await runner.inspectRepository();
+    const releaseRepository = await acquireRepositoryWriteLock(
+      repository.commonDirectory,
+    );
+    const normalized = requests.map((request, index) => ({
+      request: {
+        ...request,
+        writeSet: validateWriteSet(request.writeSet),
+      },
+      index,
+    }));
+    const predictedOverlaps: string[] = [];
+    for (let left = 0; left < normalized.length; left += 1) {
+      for (let right = left + 1; right < normalized.length; right += 1) {
+        predictedOverlaps.push(...writeSetsOverlap(
+          normalized[left]!.request.writeSet,
+          normalized[right]!.request.writeSet,
+        ));
+      }
+    }
+    const waves = scheduleWriteWaves(normalized.map((entry) => ({
+      ...entry,
+      writeSet: entry.request.writeSet,
+    })));
+    let baseline;
+    let integrationResource: WorktreeResource;
+    try {
+      baseline = await runner.createBaseline(
+        `Deki write batch ${context.taskId}`,
+      );
+      integrationResource = await runner.createWorktree({
+        rootTaskId: taskStore!.getTask(context.taskId)!.rootTaskId,
+        resourceId: randomUUID(),
+        kind: "integration",
+        baseCommit: baseline.commit,
+        repository: baseline.repository,
+      });
+    } catch (error) {
+      releaseRepository();
+      throw error;
+    }
+    taskStore!.saveRunnerResource({
+      id: integrationResource.id,
+      rootTaskId: taskStore!.getTask(context.taskId)!.rootTaskId,
+      taskId: context.taskId,
+      runId: context.runId,
+      kind: "integration",
+      path: integrationResource.path,
+      branchRef: integrationResource.branchRef,
+      baseCommit: integrationResource.baseCommit,
+      status: "active",
+    });
+    const integration = taskStore!.createIntegration({
+      rootTaskId: taskStore!.getTask(context.taskId)!.rootTaskId,
+      taskId: context.taskId,
+      baselineCommit: baseline.commit,
+      predictedOverlaps: [...new Set(predictedOverlaps)],
+      workerTaskIds: [],
+    });
+    const settings = this.#settings.snapshot().effective.agent;
+    const allResults: import("@deki-ai/shared").WorkerResultEnvelope[] = [];
+    const workerTaskIds: string[] = [];
+    const actualFileOwners = new Map<string, string>();
+    const actualOverlaps = new Set<string>();
+    let currentBase = baseline.commit;
+    let cleaned = false;
+    try {
+      taskStore!.updateIntegration(integration.id, { status: "merging" });
+      for (const [waveIndex, wave] of waves.entries()) {
+        const waveRequests = wave.map((entry) => entry.request);
+        const worktreeContexts = wave.map((entry) => ({
+          baselineCommit: baseline.commit,
+          baseCommit: currentBase,
+          baselineRef: baseline.ref,
+          repositoryRoot: baseline.repository.repositoryRoot,
+          commonDirectory: baseline.repository.commonDirectory,
+          workspaceRelativePath: baseline.repository.workspaceRelativePath,
+          writeSet: entry.request.writeSet,
+          validationTargets: entry.request.validationTargets,
+          wave: waveIndex,
+        }));
+        const results = await this.#tasks.delegateWorkers({
+          parentTaskId: context.taskId,
+          parentRunId: context.runId,
+          toolCallId: `${context.callId}-wave-${waveIndex}`,
+          requests: waveRequests,
+          worktreeContexts,
+          sourceSessionId: context.sessionId,
+          deliveryMode: taskStore?.getDeliveryMode(context.taskId) ?? "background",
+          budget: {
+            maxWorkers: settings.workerMaxPerRoot,
+            maxDurationMs: settings.workerTimeoutMs,
+            maxInputTokens: settings.workerMaxInputTokens,
+            maxOutputTokens: settings.workerMaxOutputTokens,
+            maxToolCalls: settings.workerMaxToolCalls,
+          },
+        });
+        allResults.push(...results);
+        for (const result of results) {
+          workerTaskIds.push(result.task.id);
+          if (result.status !== "succeeded") {
+            throw new Error(`Implementer 未成功：${result.task.title}`);
+          }
+          const implementation = taskStore!.getImplementationResult(result.task.id);
+          if (!implementation?.commit || implementation.scopeViolation) {
+            throw new Error(`Implementer 缺少可集成提交：${result.task.title}`);
+          }
+          for (const path of implementation.changedFiles) {
+            const owner = actualFileOwners.get(path);
+            if (owner && owner !== result.task.id) actualOverlaps.add(path);
+            actualFileOwners.set(path, result.task.id);
+          }
+          const picked = await runner.cherryPick(
+            integrationResource,
+            implementation.commit,
+          );
+          if (!picked.ok) {
+            const conflictText = [
+              "Integration cherry-pick conflict",
+              ...picked.conflictFiles.map((path) =>
+                `${picked.conflictKinds[path] ?? "UU"} ${path}`),
+            ].join("\n");
+            const artifact = taskStore!.createArtifact({
+              taskId: context.taskId,
+              runId: context.runId,
+              kind: "evidence",
+              title: "Integration Conflict",
+              content: conflictText,
+              metadata: {
+                conflictFiles: picked.conflictFiles,
+                conflictKinds: picked.conflictKinds,
+                automaticResolution: false,
+              },
+            });
+            taskStore!.updateIntegration(integration.id, {
+              status: "conflicted",
+              conflictFiles: picked.conflictFiles,
+              actualOverlaps: [...actualOverlaps],
+              workerTaskIds,
+              diffArtifactId: artifact.id,
+            });
+            throw new Error(
+              `集成冲突需要用户决定，未静默覆盖：${picked.conflictFiles.join(", ")}`,
+            );
+          }
+        }
+        currentBase = (await runner.integrationPatch(
+          integrationResource,
+          baseline.commit,
+        )).commit;
+      }
+
+      taskStore!.updateIntegration(integration.id, {
+        status: "testing",
+        actualOverlaps: [...actualOverlaps],
+        workerTaskIds,
+      });
+      const validationTargets = requests.flatMap((request) => request.validationTargets);
+      const validationResults = await runner.validateIntegration(
+        integrationResource,
+        validationTargets,
+      );
+      const artifactStore = new ArtifactStore(this.#paths.artifactsRoot);
+      const validationArtifactIds: string[] = [];
+      for (const validation of validationResults) {
+        const id = randomUUID();
+        const file = await artifactStore.write(
+          this.#scopeId,
+          taskStore!.getTask(context.taskId)!.rootTaskId,
+          id,
+          "log",
+          validation.output,
+        );
+        taskStore!.createArtifact({
+          id,
+          taskId: context.taskId,
+          runId: context.runId,
+          kind: "test-result",
+          title: `Integration ${validation.target.cwd ?? "."}: ${validation.target.script}`,
+          uri: file.uri,
+          metadata: {
+            sha256: file.sha256,
+            size: file.size,
+            target: validation.target,
+            exitCode: validation.exitCode,
+            durationMs: validation.durationMs,
+            timedOut: validation.timedOut,
+          },
+        });
+        validationArtifactIds.push(id);
+      }
+      if (validationResults.some((result) => result.exitCode !== 0)) {
+        taskStore!.updateIntegration(integration.id, {
+          status: "failed",
+          validationArtifactIds,
+          workerTaskIds,
+        });
+        throw new Error("集成验证失败，结果未应用到用户工作区");
+      }
+      const finalized = await runner.integrationPatch(
+        integrationResource,
+        baseline.commit,
+      );
+      const patchId = randomUUID();
+      const patchFile = await artifactStore.write(
+        this.#scopeId,
+        taskStore!.getTask(context.taskId)!.rootTaskId,
+        patchId,
+        "patch",
+        finalized.patch,
+      );
+      taskStore!.createArtifact({
+        id: patchId,
+        taskId: context.taskId,
+        runId: context.runId,
+        kind: "patch",
+        title: "Final Integration Patch",
+        uri: patchFile.uri,
+        metadata: {
+          sha256: patchFile.sha256,
+          size: patchFile.size,
+          baselineCommit: baseline.commit,
+          integrationCommit: finalized.commit,
+          changedFiles: finalized.changedFiles,
+        },
+      });
+      const diffId = randomUUID();
+      const diffFile = await artifactStore.write(
+        this.#scopeId,
+        taskStore!.getTask(context.taskId)!.rootTaskId,
+        diffId,
+        "diff",
+        finalized.patch,
+      );
+      taskStore!.createArtifact({
+        id: diffId,
+        taskId: context.taskId,
+        runId: context.runId,
+        kind: "diff",
+        title: "Final Integration Diff",
+        uri: diffFile.uri,
+        metadata: {
+          sha256: diffFile.sha256,
+          size: diffFile.size,
+          complete: true,
+        },
+      });
+      const integrationCommitArtifactId = randomUUID();
+      const integrationRef = await runner.createArtifactRef(
+        integrationCommitArtifactId,
+        finalized.commit,
+      );
+      taskStore!.createArtifact({
+        id: integrationCommitArtifactId,
+        taskId: context.taskId,
+        runId: context.runId,
+        kind: "commit",
+        title: `Integration Commit ${finalized.commit.slice(0, 12)}`,
+        content: finalized.commit,
+        metadata: { ref: integrationRef, commit: finalized.commit },
+      });
+      taskStore!.updateRunnerResource(integrationResource.id, "cleanup_pending");
+      await runner.cleanup(integrationResource);
+      cleaned = true;
+      taskStore!.updateRunnerResource(integrationResource.id, "cleaned");
+      taskStore!.updateIntegration(integration.id, {
+        status: "awaiting_apply",
+        integrationCommit: finalized.commit,
+        actualOverlaps: [...actualOverlaps],
+        workerTaskIds,
+        validationArtifactIds,
+        patchArtifactId: patchId,
+        diffArtifactId: diffId,
+        cleanupStatus: "cleaned",
+      });
+
+      let requestId = randomUUID();
+      for (;;) {
+        const decision = await this.#tasks.awaitIntegrationDecision({
+          taskId: context.taskId,
+          runId: context.runId,
+          requestId,
+          payload: {
+            integrationId: integration.id,
+            patchArtifactId: patchId,
+            diffArtifactId: diffId,
+            validationArtifactIds,
+            changedFiles: finalized.changedFiles,
+            baselineCommit: baseline.commit,
+            integrationCommit: finalized.commit,
+          },
+        });
+        if (decision === "cancel") {
+          taskStore!.updateIntegration(integration.id, { status: "cancelled" });
+          taskStore!.finishIntegrationDecision(
+            context.taskId,
+            context.runId,
+            decision,
+            requestId,
+          );
+          return allResults;
+        }
+        if (decision === "artifact_only") {
+          taskStore!.updateIntegration(integration.id, { status: "artifact_only" });
+          taskStore!.resumeAfterIntegrationDecision(
+            context.taskId,
+            context.runId,
+            decision,
+            requestId,
+          );
+          return allResults;
+        }
+        try {
+          await runner.applyPatch({
+            baselineCommit: baseline.commit,
+            integrationCommit: finalized.commit,
+            patch: finalized.patch,
+          });
+          taskStore!.updateIntegration(integration.id, { status: "applied" });
+          taskStore!.resumeAfterIntegrationDecision(
+            context.taskId,
+            context.runId,
+            decision,
+            requestId,
+          );
+          return allResults;
+        } catch (error) {
+          if (!(error instanceof WorkspaceDriftError)) throw error;
+          taskStore!.resolveRequest(requestId, {
+            decision,
+            error: error.message,
+          });
+          taskStore!.createArtifact({
+            taskId: context.taskId,
+            runId: context.runId,
+            kind: "evidence",
+            title: "Application Conflict",
+            content: error.message,
+            metadata: { driftedFiles: error.paths },
+          });
+          requestId = randomUUID();
+        }
+      }
+    } finally {
+      if (!cleaned) {
+        try {
+          taskStore!.updateRunnerResource(integrationResource.id, "cleanup_pending");
+          await runner.cleanup(integrationResource);
+          taskStore!.updateRunnerResource(integrationResource.id, "cleaned");
+          taskStore!.updateIntegration(integration.id, { cleanupStatus: "cleaned" });
+        } catch (error) {
+          taskStore!.updateRunnerResource(
+            integrationResource.id,
+            "cleanup_failed",
+            formatError(error),
+          );
+          taskStore!.updateIntegration(integration.id, {
+            cleanupStatus: "failed",
+            cleanupError: formatError(error),
+          });
+        }
+      }
+      releaseRepository();
     }
   }
 
@@ -1899,6 +2327,7 @@ async function initializeDesktopState(
   const paths = getDekiPaths();
   await ensureDekiDirectories(paths);
   taskStore = new TaskStore(paths.tasksDatabase);
+  await cleanupStaleRunnerResources(taskStore, paths);
   taskStore.recoverInterrupted();
   taskStore.subscribePlans((event) => {
     broadcastPlanEvent(event);
@@ -1930,6 +2359,16 @@ async function initializeDesktopState(
     executor: async (input) => {
       const host = workspaceControllers.get(input.task.workspaceId);
       if (!host) throw new Error("任务所属工作区尚未加载");
+      if (input.execution.worktreeContext) {
+        return agentSupervisor!.track(
+          input.task,
+          input.run,
+          await executeWorktreeTask(host, {
+            ...input,
+            execution: input.execution as PromptExecutionInput,
+          }),
+        );
+      }
       const handle = await host.executeTask({
         ...input,
         execution: input.execution as PromptExecutionInput,
@@ -2105,6 +2544,14 @@ function registerIpcHandlers(): void {
       await controller?.sendPrompt(prompt, mode, interactionMode),
     );
   });
+  ipcMain.handle(IPC_CHANNELS.optimizePrompt, async (event, raw) => {
+    assertTrustedSender(event);
+    const { prompt } = optimizePromptInputSchema.parse(raw);
+    return optimizePromptResultSchema.parse(
+      await controller?.optimizePrompt(prompt)
+        ?? { ok: false, error: "Agent Runtime 尚未就绪" },
+    );
+  });
   ipcMain.handle(IPC_CHANNELS.abortRun, async (event) => {
     assertTrustedSender(event);
     return commandResultSchema.parse(await controller?.abort());
@@ -2199,6 +2646,49 @@ function registerIpcHandlers(): void {
       input.requestId,
       input.value,
     ));
+  });
+  ipcMain.handle(IPC_CHANNELS.respondToIntegration, async (event, raw) => {
+    assertTrustedSender(event);
+    const input = integrationDecisionInputSchema.parse(raw);
+    if (taskOrchestrator?.respondToIntegration(
+      input.taskId,
+      input.requestId,
+      input.decision,
+    )) return commandResultSchema.parse({ ok: true });
+    return commandResultSchema.parse(await respondToPersistedIntegration(input));
+  });
+  ipcMain.handle(IPC_CHANNELS.readArtifactChunk, async (event, raw) => {
+    assertTrustedSender(event);
+    const input = artifactChunkInputSchema.parse(raw);
+    const artifact = taskStore?.getArtifact(input.artifactId);
+    if (!artifact) throw new Error("未找到 Artifact");
+    if (artifact.content !== undefined) {
+      const totalBytes = Buffer.byteLength(artifact.content);
+      const content = Buffer.from(artifact.content).subarray(
+        input.offset,
+        input.offset + input.limit,
+      ).toString("utf8");
+      const nextOffset = Math.min(totalBytes, input.offset + Buffer.byteLength(content));
+      return artifactChunkSchema.parse({
+        artifactId: artifact.id,
+        content,
+        offset: input.offset,
+        nextOffset,
+        totalBytes,
+        done: nextOffset >= totalBytes,
+      });
+    }
+    if (!artifact.uri) throw new Error("Artifact 没有可读取内容");
+    const chunk = await new ArtifactStore(getDekiPaths().artifactsRoot).readChunk(
+      artifact.uri,
+      input.offset,
+      input.limit,
+    );
+    return artifactChunkSchema.parse({
+      artifactId: artifact.id,
+      offset: input.offset,
+      ...chunk,
+    });
   });
   ipcMain.handle(IPC_CHANNELS.listPlans, (event, raw) => {
     assertTrustedSender(event);
@@ -2666,8 +3156,20 @@ function registerIpcHandlers(): void {
         : category === "tasks"
           ? resolve(paths.tasksDatabase, "..")
           : paths.logsRoot;
+    if (category === "tasks" && taskStore) {
+      await cleanupStaleRunnerResources(taskStore, paths);
+      await Promise.allSettled(taskStore.listArtifactGitRefs().map(async ({ ref, workspacePath }) => {
+        await new WorktreeRunner(workspacePath, {
+          worktreesRoot: join(paths.worktreesRoot, workspaceId(workspacePath)),
+        }).removeArtifactRef(ref);
+      }));
+    }
     await shutdownDesktopState();
     await moveToTrashOrBackup(target);
+    if (category === "tasks") {
+      await moveToTrashOrBackup(paths.artifactsRoot);
+      await moveToTrashOrBackup(paths.worktreesRoot);
+    }
     await ensureDekiDirectories(paths);
     await initializeDesktopState(workspace);
     return commandResultSchema.parse({ ok: true });
@@ -2764,6 +3266,305 @@ async function restoreQueuedWorkspaceHosts(): Promise<void> {
       await getOrCreateController(workspace);
     }
   }));
+}
+
+async function executeWorktreeTask(
+  _host: DesktopController,
+  input: {
+    task: import("@deki-ai/shared").TaskRecord;
+    run: import("@deki-ai/shared").RunRecord;
+    execution: PromptExecutionInput;
+    signal: AbortSignal;
+  },
+) {
+  const context = input.execution.worktreeContext;
+  const workspace = input.task.workspacePath;
+  if (!context || !workspace || input.execution.workerProfile !== "implementer") {
+    throw new Error("Worktree Runner 只能执行具有完整上下文的 Implementer");
+  }
+  const paths = getDekiPaths();
+  const runner = new WorktreeRunner(workspace, {
+    worktreesRoot: join(paths.worktreesRoot, input.task.workspaceId),
+    timeoutMs: 600_000,
+  });
+  const resource = await runner.createWorktree({
+    rootTaskId: input.task.rootTaskId,
+    resourceId: input.task.id,
+    kind: "worker",
+    baseCommit: context.baseCommit,
+    repository: {
+      repositoryRoot: context.repositoryRoot,
+      commonDirectory: context.commonDirectory,
+      workspaceRelativePath: context.workspaceRelativePath,
+    },
+  });
+  taskStore!.saveRunnerResource({
+    id: resource.id,
+    rootTaskId: input.task.rootTaskId,
+    taskId: input.task.id,
+    runId: input.run.id,
+    kind: "worker",
+    path: resource.path,
+    branchRef: resource.branchRef,
+    baseCommit: resource.baseCommit,
+    status: "active",
+  });
+  const ephemeral = await DesktopController.create(resource.cwd, {
+    tasks: requireTaskOrchestrator(),
+    trustedEphemeral: true,
+  });
+  let handle;
+  try {
+    handle = await ephemeral.executeTask(input);
+  } catch (error) {
+    await runner.cleanup(resource).catch(() => undefined);
+    taskStore!.updateRunnerResource(resource.id, "cleaned");
+    await ephemeral.dispose();
+    throw error;
+  }
+  const completion = (async () => {
+    let agentError: unknown;
+    try {
+      await handle.completion;
+    } catch (error) {
+      agentError = error;
+    }
+    try {
+      const finalized = await runner.finalizeImplementer({
+        resource,
+        writeSet: validateWriteSet(context.writeSet),
+        validationTargets: context.validationTargets,
+        signal: input.signal,
+      });
+      const artifactStore = new ArtifactStore(paths.artifactsRoot);
+      const patchId = randomUUID();
+      const patchFile = await artifactStore.write(
+        input.task.workspaceId,
+        input.task.rootTaskId,
+        patchId,
+        "patch",
+        finalized.patch,
+      );
+      taskStore!.createArtifact({
+        id: patchId,
+        taskId: input.task.id,
+        runId: input.run.id,
+        kind: "patch",
+        title: "Implementer Patch",
+        uri: patchFile.uri,
+        metadata: {
+          sha256: patchFile.sha256,
+          size: patchFile.size,
+          baselineCommit: context.baseCommit,
+          changedFiles: finalized.changedFiles,
+          outOfScopeFiles: finalized.outOfScopeFiles,
+        },
+      });
+      const validationArtifactIds: string[] = [];
+      for (const validation of finalized.validations) {
+        const id = randomUUID();
+        const file = await artifactStore.write(
+          input.task.workspaceId,
+          input.task.rootTaskId,
+          id,
+          "log",
+          validation.output,
+        );
+        taskStore!.createArtifact({
+          id,
+          taskId: input.task.id,
+          runId: input.run.id,
+          kind: "test-result",
+          title: `${validation.target.cwd ?? "."}: ${validation.target.script}`,
+          uri: file.uri,
+          metadata: {
+            sha256: file.sha256,
+            size: file.size,
+            target: validation.target,
+            exitCode: validation.exitCode,
+            durationMs: validation.durationMs,
+            timedOut: validation.timedOut,
+            isolatedWorktree: true,
+          },
+        });
+        validationArtifactIds.push(id);
+      }
+      let commitArtifactId: string | undefined;
+      if (finalized.commit) {
+        commitArtifactId = randomUUID();
+        const ref = await runner.createArtifactRef(commitArtifactId, finalized.commit);
+        taskStore!.createArtifact({
+          id: commitArtifactId,
+          taskId: input.task.id,
+          runId: input.run.id,
+          kind: "commit",
+          title: `Implementer Commit ${finalized.commit.slice(0, 12)}`,
+          content: finalized.commit,
+          metadata: { ref, commit: finalized.commit },
+        });
+      }
+      taskStore!.saveImplementationResult({
+        taskId: input.task.id,
+        runId: input.run.id,
+        baselineCommit: context.baseCommit,
+        ...(finalized.commit ? { commit: finalized.commit } : {}),
+        changedFiles: finalized.changedFiles,
+        patchArtifactId: patchId,
+        ...(commitArtifactId ? { commitArtifactId } : {}),
+        validationArtifactIds,
+        scopeViolation: finalized.outOfScopeFiles.length > 0,
+        createdAt: new Date().toISOString(),
+      });
+      taskStore!.updateRunnerResource(resource.id, "finalized");
+      if (finalized.outOfScopeFiles.length > 0) {
+        throw new Error(`Implementer 修改超出声明范围：${finalized.outOfScopeFiles.join(", ")}`);
+      }
+      if (finalized.changedFiles.length === 0) throw new Error("Implementer 未产生修改");
+      if (finalized.validations.some((validation) => validation.exitCode !== 0)) {
+        throw new Error("Implementer 验证失败");
+      }
+      if (!finalized.commit) throw new Error("Runner 未生成 Implementer Commit");
+      if (agentError) throw agentError;
+    } finally {
+      try {
+        taskStore!.updateRunnerResource(resource.id, "cleanup_pending");
+        await runner.cleanup(resource);
+        taskStore!.updateRunnerResource(resource.id, "cleaned");
+      } catch (cleanupError) {
+        taskStore!.updateRunnerResource(
+          resource.id,
+          "cleanup_failed",
+          formatError(cleanupError),
+        );
+      }
+      await ephemeral.dispose();
+    }
+  })();
+  return {
+    sessionId: handle.sessionId,
+    ...(handle.modelProvider ? { modelProvider: handle.modelProvider } : {}),
+    ...(handle.modelId ? { modelId: handle.modelId } : {}),
+    completion,
+    cancel: () => handle.cancel(),
+    captureContext: () => ({
+      ...handle.captureContext(),
+      worktreeContext: context,
+    }),
+    captureUsage: () => handle.captureUsage(),
+  };
+}
+
+async function cleanupStaleRunnerResources(
+  store: TaskStore,
+  paths: DekiPaths,
+): Promise<void> {
+  for (const record of store.listRunnerResources([
+    "allocating",
+    "active",
+    "finalized",
+    "cleanup_pending",
+    "cleanup_failed",
+  ])) {
+    const task = store.getTask(record.taskId);
+    if (!task?.workspacePath) {
+      store.updateRunnerResource(record.id, "cleanup_failed", "任务工作区路径不可用");
+      continue;
+    }
+    try {
+      const runner = new WorktreeRunner(task.workspacePath, {
+        worktreesRoot: join(paths.worktreesRoot, task.workspaceId),
+        timeoutMs: 120_000,
+      });
+      const repository = await runner.inspectRepository();
+      const branch = record.branchRef.replace(/^refs\/heads\//u, "");
+      await runner.cleanup({
+        id: record.id,
+        kind: record.kind,
+        path: record.path,
+        cwd: repository.workspaceRelativePath
+          ? join(record.path, repository.workspaceRelativePath)
+          : record.path,
+        branch,
+        branchRef: record.branchRef,
+        baseCommit: record.baseCommit,
+        repository,
+      });
+      store.updateRunnerResource(record.id, "cleaned");
+    } catch (error) {
+      store.updateRunnerResource(record.id, "cleanup_failed", formatError(error));
+    }
+  }
+}
+
+async function acquireRepositoryWriteLock(key: string): Promise<() => void> {
+  const previous = repositoryWriteLocks.get(key) ?? Promise.resolve();
+  let releaseCurrent!: () => void;
+  const current = new Promise<void>((resolveLock) => {
+    releaseCurrent = resolveLock;
+  });
+  const tail = previous.then(() => current);
+  repositoryWriteLocks.set(key, tail);
+  await previous;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    releaseCurrent();
+    if (repositoryWriteLocks.get(key) === tail) repositoryWriteLocks.delete(key);
+  };
+}
+
+async function respondToPersistedIntegration(input: {
+  taskId: string;
+  requestId: string;
+  decision: "apply" | "artifact_only" | "cancel";
+}): Promise<CommandResult> {
+  try {
+    const detail = taskStore?.getTaskDetail(input.taskId);
+    const request = detail?.requests.find((candidate) =>
+      candidate.id === input.requestId
+      && candidate.kind === "integration_approval"
+      && candidate.status === "pending");
+    const integration = detail?.integration;
+    const runId = detail?.task.currentRunId;
+    if (!detail || !request || !integration || !runId) {
+      return { ok: false, error: "集成审批请求已失效" };
+    }
+    if (input.decision === "apply") {
+      if (
+        !detail.task.workspacePath
+        || !integration.integrationCommit
+        || !integration.patchArtifactId
+      ) throw new Error("集成记录缺少应用所需信息");
+      const artifact = taskStore!.getArtifact(integration.patchArtifactId);
+      if (!artifact?.uri && artifact?.content === undefined) {
+        throw new Error("集成 Patch Artifact 已丢失");
+      }
+      const patch = artifact.content ?? await readFile(artifact.uri!, "utf8");
+      await new WorktreeRunner(detail.task.workspacePath, {
+        worktreesRoot: join(getDekiPaths().worktreesRoot, detail.task.workspaceId),
+        timeoutMs: 600_000,
+      }).applyPatch({
+        baselineCommit: integration.baselineCommit,
+        integrationCommit: integration.integrationCommit,
+        patch,
+      });
+      taskStore!.updateIntegration(integration.id, { status: "applied" });
+    } else {
+      taskStore!.updateIntegration(integration.id, {
+        status: input.decision === "artifact_only" ? "artifact_only" : "cancelled",
+      });
+    }
+    taskStore!.finishIntegrationDecision(
+      input.taskId,
+      runId,
+      input.decision,
+      input.requestId,
+    );
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: formatError(error) };
+  }
 }
 
 async function runTaskCommand(
@@ -2976,12 +3777,27 @@ function renderPlanningPrompt(
 function renderWorkerPrompt(
   profile: import("@deki-ai/shared").WorkerProfileId,
   context: import("@deki-ai/shared").WorkerContextPackage,
+  worktreeContext?: PromptExecutionInput["worktreeContext"],
 ): string {
   const role = profile === "explorer"
     ? "Explorer：搜索代码并收集可验证证据"
     : profile === "tester"
       ? "Tester：分析测试，并仅通过受控测试工具在临时副本验证"
-      : "Reviewer：审查实现、安全和回归风险";
+      : profile === "reviewer"
+        ? "Reviewer：审查实现、安全和回归风险"
+        : profile === "implementer"
+          ? "Implementer：只在隔离 Git worktree 内完成声明范围的修改"
+          : "Integrator：只解决系统提供的受限集成冲突";
+  if (profile === "implementer") {
+    return [
+      `你是 ${role}。`,
+      "真实用户工作区不会被你的中间状态修改。只能修改上下文包和 Worktree Context 声明的 writeSet；不得修改范围外文件。",
+      "不得执行 git add、commit、reset、branch、worktree、push 等 Git 写操作，提交和清理由 Runner 负责。",
+      "可以使用工作区编辑工具和受控验证工具。完成后必须调用 worker__submit_result 提交结构化总结；不要创建其他 Worker。",
+      `上下文包：${JSON.stringify(context)}`,
+      `Worktree Context：${JSON.stringify(worktreeContext)}`,
+    ].join("\n\n");
+  }
   return [
     `你是只读 ${role}。`,
     "不得修改真实工作区，不得调用 Bash、写入、删除、安装依赖或 Git 写操作。",

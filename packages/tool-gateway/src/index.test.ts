@@ -209,6 +209,34 @@ describe("ToolGateway", () => {
     }
   });
 
+  it("allows isolated Implementer shell but hard-denies Git mutations", async () => {
+    const gateway = new ToolGateway();
+    const provider = new ShellProvider();
+    await gateway.register(provider);
+    await expect(gateway.call(
+      "workspace__bash",
+      { command: "pnpm test" },
+      {
+        callId: "implementer-test",
+        workspace: "/tmp/worktree",
+        interactionMode: "worker",
+        workerProfile: "implementer",
+      },
+    )).resolves.toBeTruthy();
+    await expect(gateway.call(
+      "workspace__bash",
+      { command: "git add -A && git commit -m owned" },
+      {
+        callId: "implementer-git",
+        workspace: "/tmp/worktree",
+        interactionMode: "worker",
+        workerProfile: "implementer",
+      },
+    )).rejects.toMatchObject({ code: "WORKER_MODE_READ_ONLY" });
+    expect(provider.call).toHaveBeenCalledTimes(1);
+    await gateway.dispose();
+  });
+
   it("redacts secrets from results, structured details, events and errors", async () => {
     const secret = "sk-abcdefghijklmnop";
     const provider = new ResultProvider({

@@ -87,6 +87,9 @@ importers:
       '@deki-ai/permission-engine':
         specifier: workspace:*
         version: link:../../packages/permission-engine
+      '@deki-ai/runner':
+        specifier: workspace:*
+        version: link:../../packages/runner
       '@deki-ai/settings':
         specifier: workspace:*
         version: link:../../packages/settings
@@ -234,6 +237,15 @@ importers:
       '@deki-ai/settings':
         specifier: workspace:*
         version: link:../settings
+      '@deki-ai/shared':
+        specifier: workspace:*
+        version: link:../shared
+
+  packages/runner:
+    dependencies:
+      '@deki-ai/git-checkpoint':
+        specifier: workspace:*
+        version: link:../git-checkpoint
       '@deki-ai/shared':
         specifier: workspace:*
         version: link:../shared

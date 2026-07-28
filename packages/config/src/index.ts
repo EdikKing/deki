@@ -47,6 +47,8 @@ export interface DekiPaths {
   memoryDatabase: string;
   tasksDatabase: string;
   logsRoot: string;
+  artifactsRoot: string;
+  worktreesRoot: string;
 }
 
 export function getDekiPaths(
@@ -62,6 +64,8 @@ export function getDekiPaths(
     memoryDatabase: join(root, "memory", "memory.db"),
     tasksDatabase: join(root, "tasks", "tasks.db"),
     logsRoot: join(root, "logs"),
+    artifactsRoot: join(root, "artifacts"),
+    worktreesRoot: join(root, "worktrees"),
   };
 }
 
@@ -73,6 +77,8 @@ export async function ensureDekiDirectories(paths: DekiPaths): Promise<void> {
     mkdir(resolve(paths.memoryDatabase, ".."), { recursive: true }),
     mkdir(resolve(paths.tasksDatabase, ".."), { recursive: true }),
     mkdir(paths.logsRoot, { recursive: true }),
+    mkdir(paths.artifactsRoot, { recursive: true }),
+    mkdir(paths.worktreesRoot, { recursive: true }),
   ]);
 }
 

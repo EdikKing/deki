@@ -295,6 +295,26 @@ function assertToolAllowed(
       && context.workerProfile === "tester"
       && tool.effect === "read"
     ) return;
+    if (context.workerProfile === "implementer") {
+      if (tool.providerId === "worker") {
+        throw new WorkerModePolicyError(tool.modelName);
+      }
+      if (
+        tool.providerId === "workspace"
+        && tool.providerToolName === "bash"
+        && containsGitMutation(_input)
+      ) {
+        throw new WorkerModePolicyError(tool.modelName);
+      }
+      if (
+        tool.providerId === "workspace"
+        || tool.providerId === "test"
+        || tool.effect === "read"
+        || tool.effect === "network-read"
+        || tool.readOnlyHint === true
+      ) return;
+      throw new WorkerModePolicyError(tool.modelName);
+    }
     if (tool.providerToolName === "bash" || tool.effect === "write") {
       throw new WorkerModePolicyError(tool.modelName);
     }
@@ -323,6 +343,14 @@ function assertToolAllowed(
     return;
   }
   throw new PlanModePolicyError(tool.modelName);
+}
+
+function containsGitMutation(input: unknown): boolean {
+  if (!input || typeof input !== "object") return false;
+  const command = (input as { command?: unknown }).command;
+  if (typeof command !== "string") return false;
+  return /(?:^|[;&|]\s*|\s)git\s+(?:add|am|apply|branch|checkout|cherry-pick|clean|commit|merge|mv|pull|push|rebase|reset|restore|revert|rm|stash|switch|tag|update-ref|worktree)\b/iu
+    .test(command);
 }
 
 function isSafeSegment(value: string): boolean {

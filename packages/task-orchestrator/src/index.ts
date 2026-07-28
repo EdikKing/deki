@@ -20,7 +20,11 @@ import {
   workerContextPackageSchema,
   workerProfileIdSchema,
   workerRequestSchema,
+  workerWriteSetEntrySchema,
+  validationTargetSchema,
   workerResultSchema,
+  implementationResultSchema,
+  integrationRecordSchema,
   type AgentEvent,
   type ArtifactKind,
   type ArtifactRecord,
@@ -52,6 +56,8 @@ import {
   type WorkerRequest,
   type WorkerResult,
   type WorkerResultEnvelope,
+  type ImplementationResult,
+  type IntegrationRecord,
 } from "@deki-ai/shared";
 import { z } from "zod";
 
@@ -68,6 +74,17 @@ export const promptExecutionInputSchema = z.object({
   deliveryMode: z.enum(["foreground", "background"]).optional(),
   workerProfile: workerProfileIdSchema.optional(),
   workerContext: workerContextPackageSchema.optional(),
+  worktreeContext: z.object({
+    baselineCommit: z.string().regex(/^[0-9a-f]{40,64}$/i),
+    baseCommit: z.string().regex(/^[0-9a-f]{40,64}$/i),
+    baselineRef: z.string().min(1),
+    repositoryRoot: z.string().min(1),
+    commonDirectory: z.string().min(1),
+    workspaceRelativePath: z.string(),
+    writeSet: z.array(workerWriteSetEntrySchema).min(1).max(100),
+    validationTargets: z.array(validationTargetSchema).min(1).max(30),
+    wave: z.number().int().nonnegative(),
+  }).strict().optional(),
 }).strict();
 export type PromptExecutionInput = z.infer<typeof promptExecutionInputSchema>;
 export type TaskExecutionInput = PromptExecutionInput;
@@ -98,6 +115,7 @@ export interface WorkerDelegationInput {
   budget: TaskBudget;
   sourceSessionId: string;
   deliveryMode?: "foreground" | "background";
+  worktreeContexts?: Array<NonNullable<PromptExecutionInput["worktreeContext"]>>;
 }
 
 export interface WorkerDelegation {
@@ -130,6 +148,21 @@ export interface TaskExecutionHandle {
     outputTokens: number;
     toolCallCount: number;
   };
+}
+
+export interface RunnerResourceRecord {
+  id: string;
+  rootTaskId: string;
+  taskId: string;
+  runId?: string;
+  kind: "worker" | "integration";
+  path: string;
+  branchRef: string;
+  baseCommit: string;
+  status: "allocating" | "active" | "finalized" | "cleanup_pending" | "cleaned" | "cleanup_failed";
+  cleanupError?: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export type TaskExecutor = (input: {
@@ -303,11 +336,12 @@ const taskTransitions: Record<TaskStatus, ReadonlySet<TaskStatus>> = {
   queued: new Set(["running", "paused", "cancelled"]),
   running: new Set([
     "waiting_approval", "waiting_user", "waiting_workers", "paused", "succeeded",
-    "failed", "cancelled", "interrupted",
+    "failed", "cancelled", "interrupted", "awaiting_apply",
   ]),
   waiting_workers: new Set(["running", "paused", "cancelled", "interrupted"]),
   waiting_approval: new Set(["running", "paused", "cancelled", "interrupted"]),
   waiting_user: new Set(["running", "paused", "cancelled", "interrupted"]),
+  awaiting_apply: new Set(["running", "succeeded", "failed", "cancelled"]),
   paused: new Set(["queued", "cancelled"]),
   succeeded: new Set(),
   failed: new Set(["queued"]),
@@ -320,11 +354,12 @@ const runTransitions: Record<RunStatus, ReadonlySet<RunStatus>> = {
   starting: new Set(["running", "failed", "cancelled", "interrupted"]),
   running: new Set([
     "waiting_approval", "waiting_user", "waiting_workers", "succeeded",
-    "failed", "cancelled", "interrupted",
+    "failed", "cancelled", "interrupted", "awaiting_apply",
   ]),
   waiting_workers: new Set(["running", "cancelled", "interrupted"]),
   waiting_approval: new Set(["running", "cancelled", "interrupted"]),
   waiting_user: new Set(["running", "cancelled", "interrupted"]),
+  awaiting_apply: new Set(["running", "succeeded", "failed", "cancelled", "interrupted"]),
   succeeded: new Set(),
   failed: new Set(),
   cancelled: new Set(),
@@ -457,6 +492,12 @@ export class TaskStore {
       ...(task.kind === "worker"
         ? { workerResult: this.getWorkerResult(task.id) }
         : {}),
+      ...(task.kind === "worker"
+        ? { implementationResult: this.getImplementationResult(task.id) }
+        : {}),
+      ...(this.getIntegrationForTask(task.id)
+        ? { integration: this.getIntegrationForTask(task.id) }
+        : {}),
       ...(budget ? { budget: budget.budget, budgetUsage: budget.usage } : {}),
       ...(task.planId ? { planContext: this.#planContextFor(task.planId) } : {}),
     });
@@ -566,6 +607,17 @@ export class TaskStore {
       throw new Error("每次必须派发 1～2 个 Worker");
     }
     const requests = input.requests.map((request) => workerRequestSchema.parse(request));
+    if (
+      input.worktreeContexts
+      && input.worktreeContexts.length !== requests.length
+    ) throw new Error("Implementer Worktree Context 数量不匹配");
+    const hasImplementers = requests.some((request) => request.profile === "implementer");
+    if (hasImplementers && requests.some((request) => request.profile !== "implementer")) {
+      throw new Error("同一批次不能混合 Implementer 与只读 Worker");
+    }
+    if (hasImplementers && !input.worktreeContexts) {
+      throw new Error("Implementer 缺少 Worktree Context");
+    }
     const budget = taskBudgetSchema.parse(input.budget);
     const existing = this.#database.prepare(`
       SELECT COUNT(*) AS count FROM tasks
@@ -605,7 +657,7 @@ export class TaskStore {
         ON CONFLICT(task_id) DO NOTHING
       `).run(parent.rootTaskId, JSON.stringify(budget));
 
-      for (const request of requests) {
+      for (const [requestIndex, request] of requests.entries()) {
         const workerTaskId = randomUUID();
         const workerPlanId = request.plan?.planId ?? parent.planId;
         const context: WorkerContextPackage = workerContextPackageSchema.parse({
@@ -640,6 +692,9 @@ export class TaskStore {
             interactionMode: "worker",
             workerProfile: request.profile,
             workerContext: context,
+            ...(input.worktreeContexts?.[requestIndex]
+              ? { worktreeContext: input.worktreeContexts[requestIndex] }
+              : {}),
             deliveryMode: input.deliveryMode ?? "background",
           },
         }, events);
@@ -704,6 +759,289 @@ export class TaskStore {
       | WorkerResultRow
       | undefined;
     return row ? workerResultSchema.parse(JSON.parse(row.result_json)) : undefined;
+  }
+
+  saveImplementationResult(result: ImplementationResult): ImplementationResult {
+    const parsed = implementationResultSchema.parse(result);
+    const task = this.#requireTask(parsed.taskId);
+    const run = this.#requireRun(parsed.runId);
+    if (
+      task.kind !== "worker"
+      || task.assignedProfile !== "implementer"
+      || run.taskId !== task.id
+    ) {
+      throw new Error("Implementation Result 只能属于 Implementer Worker");
+    }
+    this.#database.prepare(`
+      INSERT INTO implementation_results (
+        task_id, run_id, result_json, created_at
+      ) VALUES (?, ?, ?, ?)
+      ON CONFLICT(task_id, run_id) DO UPDATE SET
+        result_json = excluded.result_json,
+        created_at = excluded.created_at
+    `).run(parsed.taskId, parsed.runId, JSON.stringify(parsed), parsed.createdAt);
+    return parsed;
+  }
+
+  getImplementationResult(taskId: string, runId?: string): ImplementationResult | undefined {
+    const row = runId
+      ? this.#database.prepare(`
+          SELECT result_json FROM implementation_results
+          WHERE task_id = ? AND run_id = ?
+        `).get(taskId, runId)
+      : this.#database.prepare(`
+          SELECT result_json FROM implementation_results
+          WHERE task_id = ? ORDER BY created_at DESC LIMIT 1
+        `).get(taskId);
+    return row
+      ? implementationResultSchema.parse(JSON.parse((row as { result_json: string }).result_json))
+      : undefined;
+  }
+
+  createIntegration(input: {
+    rootTaskId: string;
+    taskId: string;
+    baselineCommit: string;
+    predictedOverlaps?: string[];
+    workerTaskIds: string[];
+  }): IntegrationRecord {
+    const now = new Date().toISOString();
+    const record = integrationRecordSchema.parse({
+      id: randomUUID(),
+      rootTaskId: input.rootTaskId,
+      taskId: input.taskId,
+      baselineCommit: input.baselineCommit,
+      status: "preparing",
+      predictedOverlaps: input.predictedOverlaps ?? [],
+      actualOverlaps: [],
+      conflictFiles: [],
+      workerTaskIds: input.workerTaskIds,
+      validationArtifactIds: [],
+      cleanupStatus: "pending",
+      createdAt: now,
+      updatedAt: now,
+    });
+    this.#database.prepare(`
+      INSERT INTO integrations (
+        id, root_task_id, task_id, record_json, status, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      record.id,
+      record.rootTaskId,
+      record.taskId,
+      JSON.stringify(record),
+      record.status,
+      record.createdAt,
+      record.updatedAt,
+    );
+    return record;
+  }
+
+  updateIntegration(
+    id: string,
+    patch: Partial<Omit<IntegrationRecord, "id" | "rootTaskId" | "taskId" | "createdAt">>,
+  ): IntegrationRecord {
+    const current = this.getIntegration(id);
+    if (!current) throw new Error("未找到 Integration Record");
+    const updated = integrationRecordSchema.parse({
+      ...current,
+      ...patch,
+      updatedAt: new Date().toISOString(),
+    });
+    this.#database.prepare(`
+      UPDATE integrations SET record_json = ?, status = ?, updated_at = ?
+      WHERE id = ?
+    `).run(JSON.stringify(updated), updated.status, updated.updatedAt, id);
+    return updated;
+  }
+
+  getIntegration(id: string): IntegrationRecord | undefined {
+    const row = this.#database.prepare(
+      "SELECT record_json FROM integrations WHERE id = ?",
+    ).get(id) as { record_json: string } | undefined;
+    return row ? integrationRecordSchema.parse(JSON.parse(row.record_json)) : undefined;
+  }
+
+  getIntegrationForTask(taskId: string): IntegrationRecord | undefined {
+    const row = this.#database.prepare(`
+      SELECT record_json FROM integrations WHERE task_id = ?
+      ORDER BY created_at DESC LIMIT 1
+    `).get(taskId) as { record_json: string } | undefined;
+    return row ? integrationRecordSchema.parse(JSON.parse(row.record_json)) : undefined;
+  }
+
+  setIntegrationAwaitingApply(
+    taskId: string,
+    runId: string,
+    requestId: string,
+    payload: Record<string, unknown>,
+  ): void {
+    const task = this.#requireTask(taskId);
+    const run = this.#requireRun(runId);
+    if (task.kind === "worker") throw new Error("Worker 不能直接等待集成应用");
+    this.#assertTaskTransition(task.status, "awaiting_apply");
+    this.#assertRunTransition(run.status, "awaiting_apply");
+    const now = new Date().toISOString();
+    this.#transaction((events) => {
+      this.#database.prepare(
+        "UPDATE tasks SET status = 'awaiting_apply', updated_at = ? WHERE id = ?",
+      ).run(now, taskId);
+      this.#database.prepare(
+        "UPDATE runs SET status = 'awaiting_apply' WHERE id = ?",
+      ).run(runId);
+      events.push(this.#appendEvent(
+        taskId,
+        "integration.awaiting_apply",
+        { requestId },
+        runId,
+      ));
+    });
+    this.createRequest({
+      id: requestId,
+      taskId,
+      runId,
+      kind: "integration_approval",
+      title: "集成结果已就绪",
+      description: "确认应用到当前工作区，或仅保留产物。",
+      payload,
+    });
+  }
+
+  finishIntegrationDecision(
+    taskId: string,
+    runId: string,
+    decision: "apply" | "artifact_only" | "cancel",
+    requestId: string,
+  ): void {
+    this.resolveRequest(requestId, { decision }, decision === "cancel" ? "cancelled" : "resolved");
+    const status = decision === "cancel" ? "cancelled" : "succeeded";
+    const task = this.#requireTask(taskId);
+    const run = this.#requireRun(runId);
+    this.#assertTaskTransition(task.status, status);
+    this.#assertRunTransition(run.status, status);
+    const now = new Date().toISOString();
+    this.#transaction((events) => {
+      this.#database.prepare(`
+        UPDATE tasks SET status = ?, updated_at = ?, completed_at = ? WHERE id = ?
+      `).run(status, now, now, taskId);
+      this.#database.prepare(`
+        UPDATE runs SET status = ?, finished_at = ?, result_summary = ? WHERE id = ?
+      `).run(status, now, decision, runId);
+      events.push(this.#appendEvent(
+        taskId,
+        decision === "apply"
+          ? "integration.applied"
+          : decision === "artifact_only"
+            ? "integration.artifact_only"
+            : "task.cancelled",
+        { decision },
+        runId,
+        task.sessionId,
+      ));
+    });
+  }
+
+  resumeAfterIntegrationDecision(
+    taskId: string,
+    runId: string,
+    decision: "apply" | "artifact_only",
+    requestId: string,
+  ): void {
+    const task = this.#requireTask(taskId);
+    const run = this.#requireRun(runId);
+    this.#assertTaskTransition(task.status, "running");
+    this.#assertRunTransition(run.status, "running");
+    this.resolveRequest(requestId, { decision });
+    const now = new Date().toISOString();
+    this.#transaction((events) => {
+      this.#database.prepare(
+        "UPDATE tasks SET status = 'running', updated_at = ? WHERE id = ?",
+      ).run(now, taskId);
+      this.#database.prepare(
+        "UPDATE runs SET status = 'running' WHERE id = ?",
+      ).run(runId);
+      events.push(this.#appendEvent(
+        taskId,
+        decision === "apply" ? "integration.applied" : "integration.artifact_only",
+        { decision },
+        runId,
+        task.sessionId,
+      ));
+    });
+  }
+
+  saveRunnerResource(
+    input: Omit<RunnerResourceRecord, "createdAt" | "updatedAt">,
+  ): RunnerResourceRecord {
+    const now = new Date().toISOString();
+    const record: RunnerResourceRecord = { ...input, createdAt: now, updatedAt: now };
+    this.#database.prepare(`
+      INSERT INTO runner_resources (
+        id, root_task_id, task_id, run_id, kind, path, branch_ref,
+        base_commit, status, cleanup_error, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        run_id = excluded.run_id,
+        path = excluded.path,
+        branch_ref = excluded.branch_ref,
+        status = excluded.status,
+        cleanup_error = excluded.cleanup_error,
+        updated_at = excluded.updated_at
+    `).run(
+      record.id,
+      record.rootTaskId,
+      record.taskId,
+      record.runId ?? null,
+      record.kind,
+      record.path,
+      record.branchRef,
+      record.baseCommit,
+      record.status,
+      record.cleanupError ?? null,
+      record.createdAt,
+      record.updatedAt,
+    );
+    return record;
+  }
+
+  updateRunnerResource(
+    id: string,
+    status: RunnerResourceRecord["status"],
+    cleanupError?: string,
+  ): void {
+    this.#database.prepare(`
+      UPDATE runner_resources
+      SET status = ?, cleanup_error = ?, updated_at = ?
+      WHERE id = ?
+    `).run(status, cleanupError ?? null, new Date().toISOString(), id);
+  }
+
+  listRunnerResources(
+    statuses?: RunnerResourceRecord["status"][],
+  ): RunnerResourceRecord[] {
+    const rows = statuses?.length
+      ? this.#database.prepare(`
+          SELECT * FROM runner_resources
+          WHERE status IN (${statuses.map(() => "?").join(", ")})
+          ORDER BY created_at ASC
+        `).all(...statuses)
+      : this.#database.prepare(
+          "SELECT * FROM runner_resources ORDER BY created_at ASC",
+        ).all();
+    return (rows as Array<Record<string, unknown>>).map((row) => ({
+      id: String(row.id),
+      rootTaskId: String(row.root_task_id),
+      taskId: String(row.task_id),
+      ...(row.run_id ? { runId: String(row.run_id) } : {}),
+      kind: row.kind === "integration" ? "integration" : "worker",
+      path: String(row.path),
+      branchRef: String(row.branch_ref),
+      baseCommit: String(row.base_commit),
+      status: row.status as RunnerResourceRecord["status"],
+      ...(row.cleanup_error ? { cleanupError: String(row.cleanup_error) } : {}),
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+    }));
   }
 
   saveWorkerResult(taskId: string, runId: string, result: WorkerResult): WorkerResult {
@@ -2190,6 +2528,7 @@ export class TaskStore {
   }
 
   createArtifact(input: {
+    id?: string;
     taskId: string;
     runId: string;
     kind: ArtifactKind;
@@ -2201,7 +2540,7 @@ export class TaskStore {
     this.#requireTask(input.taskId);
     this.#requireRun(input.runId);
     const artifact = artifactRecordSchema.parse({
-      id: randomUUID(),
+      id: input.id ?? randomUUID(),
       taskId: input.taskId,
       runId: input.runId,
       kind: input.kind,
@@ -2235,6 +2574,29 @@ export class TaskStore {
       ));
     });
     return artifact;
+  }
+
+  getArtifact(id: string): ArtifactRecord | undefined {
+    const row = this.#database.prepare(
+      "SELECT * FROM artifacts WHERE id = ?",
+    ).get(id) as unknown as ArtifactRow | undefined;
+    return row ? rowToArtifact(row) : undefined;
+  }
+
+  listArtifactGitRefs(): Array<{ ref: string; workspacePath: string }> {
+    const rows = this.#database.prepare(`
+      SELECT artifacts.metadata_json, tasks.workspace_path
+      FROM artifacts
+      JOIN tasks ON tasks.id = artifacts.task_id
+      WHERE artifacts.kind = 'commit' AND tasks.workspace_path IS NOT NULL
+    `).all() as Array<{ metadata_json: string; workspace_path: string }>;
+    return rows.flatMap((row) => {
+      const metadata = JSON.parse(row.metadata_json) as Record<string, unknown>;
+      return typeof metadata.ref === "string"
+        && metadata.ref.startsWith("refs/deki/artifacts/")
+        ? [{ ref: metadata.ref, workspacePath: row.workspace_path }]
+        : [];
+    });
   }
 
   recoverInterrupted(): number {
@@ -2897,7 +3259,41 @@ export class TaskStore {
           warning_emitted INTEGER NOT NULL DEFAULT 0,
           exceeded INTEGER NOT NULL DEFAULT 0
         );
-        PRAGMA user_version = 5;
+        CREATE TABLE implementation_results (
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+          result_json TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          PRIMARY KEY(task_id, run_id)
+        );
+        CREATE TABLE integrations (
+          id TEXT PRIMARY KEY,
+          root_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          record_json TEXT NOT NULL,
+          status TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE INDEX integrations_root_idx ON integrations(root_task_id, created_at);
+        CREATE UNIQUE INDEX integrations_task_idx ON integrations(task_id);
+        CREATE TABLE runner_resources (
+          id TEXT PRIMARY KEY,
+          root_task_id TEXT NOT NULL,
+          task_id TEXT NOT NULL,
+          run_id TEXT,
+          kind TEXT NOT NULL,
+          path TEXT NOT NULL,
+          branch_ref TEXT NOT NULL,
+          base_commit TEXT NOT NULL,
+          status TEXT NOT NULL,
+          cleanup_error TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE INDEX runner_resources_cleanup_idx
+          ON runner_resources(status, updated_at);
+        PRAGMA user_version = 6;
         COMMIT;
       `);
       return;
@@ -3053,6 +3449,47 @@ export class TaskStore {
         COMMIT;
       `);
     }
+    if (version >= 1 && version <= 5) {
+      this.#database.exec(`
+        BEGIN;
+        CREATE TABLE implementation_results (
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+          result_json TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          PRIMARY KEY(task_id, run_id)
+        );
+        CREATE TABLE integrations (
+          id TEXT PRIMARY KEY,
+          root_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          record_json TEXT NOT NULL,
+          status TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE INDEX integrations_root_idx ON integrations(root_task_id, created_at);
+        CREATE UNIQUE INDEX integrations_task_idx ON integrations(task_id);
+        CREATE TABLE runner_resources (
+          id TEXT PRIMARY KEY,
+          root_task_id TEXT NOT NULL,
+          task_id TEXT NOT NULL,
+          run_id TEXT,
+          kind TEXT NOT NULL,
+          path TEXT NOT NULL,
+          branch_ref TEXT NOT NULL,
+          base_commit TEXT NOT NULL,
+          status TEXT NOT NULL,
+          cleanup_error TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE INDEX runner_resources_cleanup_idx
+          ON runner_resources(status, updated_at);
+        PRAGMA user_version = 6;
+        COMMIT;
+      `);
+    }
   }
 }
 
@@ -3094,6 +3531,12 @@ interface WorkerCompletionWaiter {
   reject: (error: Error) => void;
 }
 
+interface IntegrationDecisionWaiter {
+  taskId: string;
+  runId: string;
+  resolve: (decision: "apply" | "artifact_only" | "cancel") => void;
+}
+
 export interface ResumeLease {
   commit(): void;
   release(): void;
@@ -3119,6 +3562,7 @@ export class TaskOrchestrator {
   readonly #resumeWaiters: ResumeWaiter[] = [];
   readonly #workerWaiters = new Map<string, WorkerCompletionWaiter>();
   readonly #workerReady: WorkerCompletionWaiter[] = [];
+  readonly #integrationWaiters = new Map<string, IntegrationDecisionWaiter>();
   #concurrency: number;
   #started = false;
   #paused = false;
@@ -3227,6 +3671,50 @@ export class TaskOrchestrator {
     result: WorkerResult,
   ): WorkerResult {
     return this.#store.saveWorkerResult(taskId, runId, result);
+  }
+
+  awaitIntegrationDecision(input: {
+    taskId: string;
+    runId: string;
+    requestId: string;
+    payload: Record<string, unknown>;
+  }): Promise<"apply" | "artifact_only" | "cancel"> {
+    const active = this.#active.get(input.taskId);
+    if (!active || active.runId !== input.runId) {
+      throw new Error("集成所属任务当前没有活动 Run");
+    }
+    this.#store.setIntegrationAwaitingApply(
+      input.taskId,
+      input.runId,
+      input.requestId,
+      input.payload,
+    );
+    return new Promise((resolve) => {
+      this.#integrationWaiters.set(input.requestId, {
+        taskId: input.taskId,
+        runId: input.runId,
+        resolve,
+      });
+    });
+  }
+
+  respondToIntegration(
+    taskId: string,
+    requestId: string,
+    decision: "apply" | "artifact_only" | "cancel",
+  ): boolean {
+    const request = this.#store.getRequest(requestId);
+    if (
+      !request
+      || request.taskId !== taskId
+      || request.kind !== "integration_approval"
+      || request.status !== "pending"
+    ) return false;
+    const waiter = this.#integrationWaiters.get(requestId);
+    if (!waiter) return false;
+    this.#integrationWaiters.delete(requestId);
+    waiter.resolve(decision);
+    return true;
   }
 
   listTaskSummaries(options: {
@@ -3589,6 +4077,8 @@ export class TaskOrchestrator {
     for (const waiter of this.#workerWaiters.values()) waiter.reject(workerError);
     for (const waiter of this.#workerReady.splice(0)) waiter.reject(workerError);
     this.#workerWaiters.clear();
+    for (const waiter of this.#integrationWaiters.values()) waiter.resolve("cancel");
+    this.#integrationWaiters.clear();
     this.#unsubscribe?.();
     this.#unsubscribe = undefined;
     if (options.closeStore !== false) this.#store.close();
@@ -4122,7 +4612,9 @@ function summarize(value: string): string | undefined {
 function workerProfileLabel(profile: WorkerProfileId): string {
   if (profile === "explorer") return "Explorer";
   if (profile === "tester") return "Tester";
-  return "Reviewer";
+  if (profile === "reviewer") return "Reviewer";
+  if (profile === "implementer") return "Implementer";
+  return "Integrator";
 }
 
 function formatError(error: unknown): string {

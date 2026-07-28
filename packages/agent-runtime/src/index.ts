@@ -495,6 +495,39 @@ export class DekiAgentRuntime {
     await handle.completion;
   }
 
+  async optimizePrompt(prompt: string): Promise<string> {
+    const modelRuntime = this.#modelRuntime;
+    const model = this.#selectedModel;
+    if (!modelRuntime || !model) {
+      throw new Error("Agent 尚未就绪，请先配置云模型环境变量");
+    }
+    const response = await modelRuntime.completeSimple(model, {
+      systemPrompt: [
+        "你是一名提示词优化专家，负责把用户的草稿改写成可直接交给 AI Agent 执行的高质量任务说明。",
+        "先理解用户真正想达成的结果，再补齐清晰的执行步骤、约束和验收标准。",
+        "必须遵守：",
+        "1. 保持用户原本的语言和核心意图，不改变授权范围。",
+        "2. 不编造用户没有提供的业务事实、技术选型、文件路径或截止时间。",
+        "3. 信息不足时，把关键未知项写成“待确认”，不要擅自决定。",
+        "4. 对简单请求保持简洁；只有复杂任务才展开多步计划。",
+        "5. 输出应以明确目标开头，并按需包含背景、要求、工作步骤、交付物和验收标准。",
+        "6. 只输出优化后的任务说明，不要解释改写过程，不要使用代码围栏。",
+      ].join("\n"),
+      messages: [{
+        role: "user",
+        timestamp: Date.now(),
+        content: prompt.trim(),
+      }],
+    }, {
+      maxTokens: Math.min(2_400, this.#options.settings.models.maxOutputTokens),
+      timeoutMs: this.#options.settings.models.timeoutMs,
+      maxRetries: this.#options.settings.models.maxRetries,
+    });
+    const optimized = unwrapPromptOptimization(extractMessageText(response.content));
+    if (!optimized) throw new Error("模型没有返回可用的优化结果");
+    return optimized;
+  }
+
   capturePromptContext(preferFork: boolean): AgentPromptContext {
     const session = this.#runtime?.session;
     if (!session) {
@@ -1465,6 +1498,19 @@ export class DekiAgentRuntime {
         : this.#gateway.listTools().filter((tool) => tool.providerId === "interaction");
       const tools = workerProfile
         ? availableTools.filter((tool) =>
+          workerProfile === "implementer"
+            ? (
+              (
+                tool.providerId === "worker"
+                && tool.providerToolName === "submit_result"
+              )
+              || tool.providerId === "workspace"
+              || tool.providerId === "test"
+              || tool.effect === "read"
+              || tool.effect === "network-read"
+              || tool.readOnlyHint === true
+            )
+            :
           (
             tool.providerId === "worker"
             && tool.providerToolName === "submit_result"
@@ -2412,7 +2458,10 @@ class WorkerToolsProvider implements CapabilityProvider {
     const requestSchema = {
       type: "object",
       properties: {
-        profile: { type: "string", enum: ["explorer", "tester", "reviewer"] },
+        profile: {
+          type: "string",
+          enum: ["explorer", "tester", "reviewer", "implementer"],
+        },
         objective: { type: "string", minLength: 1, maxLength: 100_000 },
         successCriteria: {
           type: "array",
@@ -2433,6 +2482,38 @@ class WorkerToolsProvider implements CapabilityProvider {
           },
           required: ["planId", "revision"],
           additionalProperties: false,
+        },
+        writeSet: {
+          type: "array",
+          minItems: 1,
+          maxItems: 100,
+          items: {
+            type: "object",
+            properties: {
+              path: { type: "string", minLength: 1, maxLength: 2_000 },
+              kind: { type: "string", enum: ["file", "directory"] },
+              exclusive: { type: "boolean" },
+            },
+            required: ["path", "kind"],
+            additionalProperties: false,
+          },
+        },
+        validationTargets: {
+          type: "array",
+          minItems: 1,
+          maxItems: 30,
+          items: {
+            type: "object",
+            properties: {
+              cwd: { type: "string", minLength: 1, maxLength: 2_000 },
+              script: {
+                type: "string",
+                pattern: "^(?:test(?::[A-Za-z0-9_.-]+)?|lint|typecheck)$",
+              },
+            },
+            required: ["script"],
+            additionalProperties: false,
+          },
         },
       },
       required: ["profile", "objective", "successCriteria"],
@@ -2488,7 +2569,7 @@ class WorkerToolsProvider implements CapabilityProvider {
     return [
       {
         name: "delegate",
-        description: "将两个以内互相独立的只读调查任务并行派发给 Worker。",
+        description: "派发两个以内同类型 Worker；Implementer 必须声明写入范围和验证目标，不能与只读 Worker 混合。",
         inputSchema: {
           type: "object",
           properties: {
@@ -2892,6 +2973,12 @@ function extractMessageText(content: unknown): string {
       ? [record.text]
       : [];
   }).join("");
+}
+
+function unwrapPromptOptimization(content: string): string {
+  const trimmed = content.trim();
+  const fenced = trimmed.match(/^```(?:markdown|md|text)?\s*\n([\s\S]*?)\n```\s*$/iu);
+  return (fenced?.[1] ?? trimmed).trim();
 }
 
 function extractMessageThinking(content: unknown): string {

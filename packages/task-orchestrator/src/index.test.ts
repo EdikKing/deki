@@ -18,7 +18,7 @@ afterEach(async () => {
 });
 
 describe("TaskStore", () => {
-  it.each([1, 2, 3, 4, 5])(
+  it.each([1, 2, 3, 4, 5, 6])(
     "opens and migrates the real v%s database fixture repeatedly",
     async (version) => {
       const databasePath = await createDatabasePath();
@@ -94,7 +94,7 @@ describe("TaskStore", () => {
 
     const verified = new DatabaseSync(databasePath);
     expect((verified.prepare("PRAGMA user_version").get() as { user_version: number }).user_version)
-      .toBe(5);
+      .toBe(6);
     const taskColumns = verified.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
     const planColumns = verified.prepare("PRAGMA table_info(plans)").all() as Array<{ name: string }>;
     expect(taskColumns.map((column) => column.name)).toContain("delivery_mode");
@@ -137,7 +137,7 @@ describe("TaskStore", () => {
 
     const verified = new DatabaseSync(databasePath);
     expect((verified.prepare("PRAGMA user_version").get() as { user_version: number }).user_version)
-      .toBe(5);
+      .toBe(6);
     expect(verified.prepare(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'plans'",
     ).get()).toBeTruthy();
@@ -234,6 +234,53 @@ describe("TaskStore", () => {
       "task.succeeded",
     ]);
     store.close();
+  });
+
+  it("persists integration approval across recovery without a live Agent process", async () => {
+    const databasePath = await createDatabasePath();
+    const store = new TaskStore(databasePath);
+    const task = store.createTask({
+      workspaceId: "workspace-a",
+      workspacePath: "/tmp/workspace-a",
+      kind: "background",
+      title: "isolated integration",
+      goal: "integrate",
+      execution: promptExecution(),
+    });
+    const run = store.createRun(task.id);
+    store.bindRun(task.id, run.id, { sessionId: "session-a" });
+    const integration = store.createIntegration({
+      rootTaskId: task.id,
+      taskId: task.id,
+      baselineCommit: "a".repeat(40),
+      workerTaskIds: [],
+    });
+    store.updateIntegration(integration.id, {
+      status: "awaiting_apply",
+      integrationCommit: "b".repeat(40),
+      cleanupStatus: "cleaned",
+    });
+    store.setIntegrationAwaitingApply(task.id, run.id, "integration-request", {
+      patchArtifactId: "25874e8e-00b8-4e39-9843-6ebda59f6ca7",
+    });
+    expect(store.getTask(task.id)?.status).toBe("awaiting_apply");
+    expect(store.recoverInterrupted()).toBe(0);
+    store.close();
+
+    const reopened = new TaskStore(databasePath);
+    expect(reopened.getTaskDetail(task.id)).toMatchObject({
+      task: { status: "awaiting_apply" },
+      integration: { status: "awaiting_apply", cleanupStatus: "cleaned" },
+      requests: [{ id: "integration-request", status: "pending" }],
+    });
+    reopened.finishIntegrationDecision(
+      task.id,
+      run.id,
+      "artifact_only",
+      "integration-request",
+    );
+    expect(reopened.getTask(task.id)?.status).toBe("succeeded");
+    reopened.close();
   });
 
   it("rejects illegal transitions without appending an event", async () => {

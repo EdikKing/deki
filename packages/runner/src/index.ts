@@ -443,7 +443,11 @@ export class WorktreeRunner {
     if (!gitHash.test(commit)) throw new Error("Worker commit 无效");
     const result = await git(
       integration.path,
-      ["cherry-pick", commit],
+      [
+        "-c", "user.name=Deki",
+        "-c", "user.email=agent@deki.local",
+        "cherry-pick", commit,
+      ],
       this.#timeoutMs,
       signal,
       true,
@@ -608,7 +612,12 @@ export class WorktreeRunner {
     );
     await git(
       integration.path,
-      ["-c", "core.editor=true", "cherry-pick", "--continue"],
+      [
+        "-c", "user.name=Deki",
+        "-c", "user.email=agent@deki.local",
+        "-c", "core.editor=true",
+        "cherry-pick", "--continue",
+      ],
       this.#timeoutMs,
       signal,
     );

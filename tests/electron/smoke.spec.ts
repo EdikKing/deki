@@ -89,6 +89,8 @@ test("starts a general chat without a workspace", async ({}, testInfo) => {
     await expect(generalPermissionMode).toBeDisabled();
     await expect(composer.getByRole("button", { name: "保存记忆" })).toBeVisible();
     await expect(composer.getByRole("button", { name: "选择项目" })).toBeVisible();
+    await expect(composer.getByRole("button", { name: "后台运行" })).toBeVisible();
+    await expect(composer.getByRole("button", { name: "后台运行" })).toBeDisabled();
     await expect(composer.getByRole("button", { name: "发送" })).toBeVisible();
     await expect(window.locator(".topbar").getByRole("combobox")).toHaveCount(0);
     const composerLayout = await window.evaluate(() => {
@@ -110,6 +112,16 @@ test("starts a general chat without a workspace", async ({}, testInfo) => {
     });
     expect(footerLayout.statusLeft).toBeLessThan(footerLayout.settingsLeft);
     expect(Math.abs(footerLayout.statusCenterY - footerLayout.settingsCenterY)).toBeLessThanOrEqual(1);
+    await window.getByTestId("open-task-center").click();
+    await expect(window.getByTestId("task-center")).toBeVisible();
+    await expect(window.getByRole("heading", { name: "后台任务" })).toBeVisible();
+    await expect(window.getByText("没有符合条件的任务")).toBeVisible();
+    await window.screenshot({
+      path: testInfo.outputPath("deki-task-center-empty.png"),
+      fullPage: true,
+    });
+    await defaultWorkspace.click();
+    await expect(window.getByTestId("task-center")).toHaveCount(0);
     await window.getByTestId("open-settings").click();
     await expect(window.getByTestId("settings-page")).toBeVisible();
     await expect(window.getByRole("heading", { name: /通用|General/ })).toBeVisible();

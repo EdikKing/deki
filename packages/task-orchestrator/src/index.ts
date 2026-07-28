@@ -6,6 +6,8 @@ import {
   taskDetailSchema,
   taskEventSchema,
   taskRecordSchema,
+  taskRequestRecordSchema,
+  taskSummarySchema,
   type AgentEvent,
   type ArtifactKind,
   type ArtifactRecord,
@@ -16,7 +18,10 @@ import {
   type TaskEventType,
   type TaskKind,
   type TaskRecord,
+  type TaskRequestKind,
+  type TaskRequestRecord,
   type TaskStatus,
+  type TaskSummary,
 } from "@deki-ai/shared";
 import { z } from "zod";
 
@@ -26,6 +31,7 @@ export const promptExecutionInputSchema = z.object({
   sourceSessionFile: z.string().min(1).optional(),
   sourceEntryId: z.string().min(1).optional(),
   preferFork: z.boolean(),
+  continuation: z.boolean().optional(),
 }).strict();
 export type PromptExecutionInput = z.infer<typeof promptExecutionInputSchema>;
 export type TaskExecutionInput = PromptExecutionInput;
@@ -36,6 +42,7 @@ export interface TaskExecutionHandle {
   modelId?: string;
   completion: Promise<void>;
   cancel(): Promise<void>;
+  captureContext?(): PromptExecutionInput;
 }
 
 export type TaskExecutor = (input: {
@@ -48,6 +55,7 @@ export type TaskExecutor = (input: {
 interface TaskRow {
   id: string;
   workspace_id: string;
+  workspace_path: string | null;
   root_task_id: string;
   parent_task_id: string | null;
   kind: string;
@@ -106,14 +114,28 @@ interface EventRow {
   payload_json: string;
 }
 
+interface RequestRow {
+  id: string;
+  task_id: string;
+  run_id: string;
+  kind: string;
+  status: string;
+  title: string;
+  description: string | null;
+  payload_json: string;
+  response_json: string | null;
+  created_at: string;
+  resolved_at: string | null;
+}
+
 const taskTransitions: Record<TaskStatus, ReadonlySet<TaskStatus>> = {
-  queued: new Set(["running", "cancelled"]),
+  queued: new Set(["running", "paused", "cancelled"]),
   running: new Set([
     "waiting_approval", "waiting_user", "paused", "succeeded",
     "failed", "cancelled", "interrupted",
   ]),
-  waiting_approval: new Set(["running", "cancelled", "interrupted"]),
-  waiting_user: new Set(["running", "cancelled", "interrupted"]),
+  waiting_approval: new Set(["running", "paused", "cancelled", "interrupted"]),
+  waiting_user: new Set(["running", "paused", "cancelled", "interrupted"]),
   paused: new Set(["queued", "cancelled"]),
   succeeded: new Set(),
   failed: new Set(["queued"]),
@@ -154,6 +176,7 @@ export class TaskStore {
 
   createTask(input: {
     workspaceId: string;
+    workspacePath?: string;
     kind: TaskKind;
     title: string;
     goal: string;
@@ -168,6 +191,7 @@ export class TaskStore {
     const task = taskRecordSchema.parse({
       id,
       workspaceId: input.workspaceId,
+      ...(input.workspacePath ? { workspacePath: input.workspacePath } : {}),
       rootTaskId: input.parentTaskId
         ? this.getTask(input.parentTaskId)?.rootTaskId ?? input.parentTaskId
         : id,
@@ -186,13 +210,14 @@ export class TaskStore {
     this.#transaction((events) => {
       this.#database.prepare(`
         INSERT INTO tasks (
-          id, workspace_id, root_task_id, parent_task_id, kind, title, goal,
-          status, priority, session_id, plan_id, current_run_id,
+          id, workspace_id, workspace_path, root_task_id, parent_task_id, kind,
+          title, goal, status, priority, session_id, plan_id, current_run_id,
           assigned_profile, execution_json, created_at, updated_at, completed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?, ?, NULL)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?, ?, NULL)
       `).run(
         task.id,
         task.workspaceId,
+        task.workspacePath ?? null,
         task.rootTaskId,
         task.parentTaskId ?? null,
         task.kind,
@@ -225,55 +250,83 @@ export class TaskStore {
   getTaskDetail(id: string): TaskDetail | undefined {
     const task = this.getTask(id);
     if (!task) return undefined;
-    const runs = this.#database.prepare(`
-      SELECT * FROM runs WHERE task_id = ? ORDER BY attempt ASC
-    `).all(id) as unknown as RunRow[];
-    const artifacts = this.#database.prepare(`
-      SELECT * FROM artifacts WHERE task_id = ? ORDER BY created_at ASC
-    `).all(id) as unknown as ArtifactRow[];
-    const events = this.#database.prepare(`
-      SELECT * FROM task_events WHERE task_id = ? ORDER BY sequence ASC
-    `).all(id) as unknown as EventRow[];
+    const runs = this.#database.prepare(
+      "SELECT * FROM runs WHERE task_id = ? ORDER BY attempt ASC",
+    ).all(id) as unknown as RunRow[];
+    const artifacts = this.#database.prepare(
+      "SELECT * FROM artifacts WHERE task_id = ? ORDER BY created_at ASC",
+    ).all(id) as unknown as ArtifactRow[];
+    const events = this.#database.prepare(
+      "SELECT * FROM task_events WHERE task_id = ? ORDER BY sequence ASC",
+    ).all(id) as unknown as EventRow[];
+    const requests = this.#database.prepare(
+      "SELECT * FROM task_requests WHERE task_id = ? ORDER BY created_at ASC",
+    ).all(id) as unknown as RequestRow[];
     return taskDetailSchema.parse({
       task,
       runs: runs.map(rowToRun),
       artifacts: artifacts.map(rowToArtifact),
       events: events.map(rowToEvent),
+      requests: requests.map(rowToRequest),
     });
+  }
+
+  listTaskSummaries(options: {
+    statuses?: TaskStatus[];
+    workspaceIds?: string[];
+    query?: string;
+    limit?: number;
+  } = {}): TaskSummary[] {
+    const limit = Math.min(500, Math.max(1, options.limit ?? 100));
+    if (options.statuses?.length === 0 || options.workspaceIds?.length === 0) return [];
+    const clauses: string[] = [];
+    const values: Array<string | number> = [];
+    if (options.statuses?.length) {
+      clauses.push(`status IN (${options.statuses.map(() => "?").join(", ")})`);
+      values.push(...options.statuses);
+    }
+    if (options.workspaceIds?.length) {
+      clauses.push(`workspace_id IN (${options.workspaceIds.map(() => "?").join(", ")})`);
+      values.push(...options.workspaceIds);
+    }
+    if (options.query?.trim()) {
+      const query = `%${options.query.trim()}%`;
+      clauses.push(`(
+        title LIKE ? OR goal LIKE ? OR EXISTS (
+          SELECT 1 FROM runs
+          WHERE runs.task_id = tasks.id
+            AND (runs.result_summary LIKE ? OR runs.error LIKE ?)
+        )
+      )`);
+      values.push(query, query, query, query);
+    }
+    const rows = this.#database.prepare(`
+      SELECT * FROM tasks
+      ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
+      ORDER BY updated_at DESC, created_at DESC
+      LIMIT ?
+    `).all(...values, limit) as unknown as TaskRow[];
+    return rows.map((row) => this.#summaryFor(rowToTask(row)));
   }
 
   listTasks(
     workspaceId: string,
     options: { statuses?: TaskStatus[]; limit?: number } = {},
   ): TaskRecord[] {
-    const limit = Math.min(500, Math.max(1, options.limit ?? 100));
-    if (options.statuses && options.statuses.length === 0) return [];
-    if (options.statuses?.length) {
-      const placeholders = options.statuses.map(() => "?").join(", ");
-      const rows = this.#database.prepare(`
-        SELECT * FROM tasks
-        WHERE workspace_id = ? AND status IN (${placeholders})
-        ORDER BY updated_at DESC, created_at DESC
-        LIMIT ?
-      `).all(workspaceId, ...options.statuses, limit) as unknown as TaskRow[];
-      return rows.map(rowToTask);
-    }
-    const rows = this.#database.prepare(`
-      SELECT * FROM tasks
-      WHERE workspace_id = ?
-      ORDER BY updated_at DESC, created_at DESC
-      LIMIT ?
-    `).all(workspaceId, limit) as unknown as TaskRow[];
-    return rows.map(rowToTask);
+    return this.listTaskSummaries({
+      workspaceIds: [workspaceId],
+      ...(options.statuses ? { statuses: options.statuses } : {}),
+      ...(options.limit ? { limit: options.limit } : {}),
+    }).map((summary) => summary.task);
   }
 
-  listQueuedTasks(workspaceId: string, limit: number): TaskRecord[] {
+  listQueuedTasks(limit = 500): TaskRecord[] {
     const rows = this.#database.prepare(`
       SELECT * FROM tasks
-      WHERE workspace_id = ? AND status = 'queued'
+      WHERE status = 'queued'
       ORDER BY priority DESC, created_at ASC
       LIMIT ?
-    `).all(workspaceId, limit) as unknown as TaskRow[];
+    `).all(Math.min(500, Math.max(1, limit))) as unknown as TaskRow[];
     return rows.map(rowToTask);
   }
 
@@ -283,6 +336,25 @@ export class TaskStore {
     ).get(id) as { execution_json: string } | undefined;
     if (!row) throw new Error("未找到任务");
     return promptExecutionInputSchema.parse(JSON.parse(row.execution_json));
+  }
+
+  updateExecution(taskId: string, execution: TaskExecutionInput): void {
+    this.#requireTask(taskId);
+    this.#database.prepare(
+      "UPDATE tasks SET execution_json = ?, updated_at = ? WHERE id = ?",
+    ).run(
+      JSON.stringify(promptExecutionInputSchema.parse(execution)),
+      new Date().toISOString(),
+      taskId,
+    );
+  }
+
+  backfillWorkspacePath(workspaceId: string, workspacePath: string): number {
+    const result = this.#database.prepare(`
+      UPDATE tasks SET workspace_path = ?
+      WHERE workspace_id = ? AND workspace_path IS NULL
+    `).run(workspacePath, workspaceId);
+    return Number(result.changes);
   }
 
   createRun(taskId: string, runnerId = "local"): RunRecord {
@@ -314,7 +386,7 @@ export class TaskStore {
       const now = new Date().toISOString();
       this.#database.prepare(`
         UPDATE tasks
-        SET status = 'running', current_run_id = ?, updated_at = ?
+        SET status = 'running', current_run_id = ?, updated_at = ?, completed_at = NULL
         WHERE id = ?
       `).run(run.id, now, taskId);
       events.push(this.#appendEvent(taskId, "run.created", {
@@ -329,11 +401,7 @@ export class TaskStore {
   bindRun(
     taskId: string,
     runId: string,
-    input: {
-      sessionId: string;
-      modelProvider?: string;
-      modelId?: string;
-    },
+    input: { sessionId: string; modelProvider?: string; modelId?: string },
   ): RunRecord {
     const run = this.#requireRun(runId);
     this.#assertRunTransition(run.status, "running");
@@ -352,19 +420,26 @@ export class TaskStore {
         runId,
         taskId,
       );
-      this.#database.prepare(`
-        UPDATE tasks SET session_id = ?, updated_at = ? WHERE id = ?
-      `).run(input.sessionId, now, taskId);
+      this.#database.prepare(
+        "UPDATE tasks SET session_id = ?, updated_at = ? WHERE id = ?",
+      ).run(input.sessionId, now, taskId);
       events.push(this.#appendEvent(taskId, "run.started", {}, runId, input.sessionId));
     });
     return this.#requireRun(runId);
   }
 
-  setApprovalWaiting(taskId: string, runId: string, waiting: boolean): void {
+  setWaiting(
+    taskId: string,
+    runId: string,
+    kind: "approval" | "user_input",
+    waiting: boolean,
+  ): void {
     const task = this.#requireTask(taskId);
     const run = this.#requireRun(runId);
-    const nextTask: TaskStatus = waiting ? "waiting_approval" : "running";
-    const nextRun: RunStatus = waiting ? "waiting_approval" : "running";
+    const waitingTask: TaskStatus = kind === "approval" ? "waiting_approval" : "waiting_user";
+    const waitingRun: RunStatus = kind === "approval" ? "waiting_approval" : "waiting_user";
+    const nextTask: TaskStatus = waiting ? waitingTask : "running";
+    const nextRun: RunStatus = waiting ? waitingRun : "running";
     if (task.status === nextTask && run.status === nextRun) return;
     this.#assertTaskTransition(task.status, nextTask);
     this.#assertRunTransition(run.status, nextRun);
@@ -378,7 +453,9 @@ export class TaskStore {
       ).run(nextRun, runId, taskId);
       events.push(this.#appendEvent(
         taskId,
-        waiting ? "task.waiting_approval" : "task.resumed",
+        waiting
+          ? kind === "approval" ? "task.waiting_approval" : "task.waiting_user"
+          : "task.resumed",
         {},
         runId,
         task.sessionId,
@@ -391,6 +468,7 @@ export class TaskStore {
     runId: string,
     status: "succeeded" | "failed" | "cancelled" | "interrupted",
     error?: string,
+    resultSummary?: string,
   ): void {
     const task = this.#requireTask(taskId);
     const run = this.#requireRun(runId);
@@ -405,29 +483,26 @@ export class TaskStore {
         : status === "cancelled"
           ? "run.cancelled"
           : "run.interrupted";
-    const taskEvent = `task.${status}` as TaskEventType;
     this.#transaction((events) => {
       this.#database.prepare(`
         UPDATE runs
-        SET status = ?, finished_at = ?, error = ?
+        SET status = ?, finished_at = ?, error = ?, result_summary = ?
         WHERE id = ? AND task_id = ?
-      `).run(status, now, error ?? null, runId, taskId);
+      `).run(status, now, error ?? null, resultSummary ?? null, runId, taskId);
       this.#database.prepare(`
         UPDATE tasks
         SET status = ?, updated_at = ?, completed_at = ?
         WHERE id = ?
       `).run(status, now, now, taskId);
-      const payload = error ? { error } : {};
+      this.#cancelPendingRequests(taskId, now);
+      const payload = {
+        ...(error ? { error } : {}),
+        ...(resultSummary ? { resultSummary } : {}),
+      };
+      events.push(this.#appendEvent(taskId, runEvent, payload, runId, task.sessionId));
       events.push(this.#appendEvent(
         taskId,
-        runEvent,
-        payload,
-        runId,
-        task.sessionId,
-      ));
-      events.push(this.#appendEvent(
-        taskId,
-        taskEvent,
+        `task.${status}` as TaskEventType,
         payload,
         runId,
         task.sessionId,
@@ -435,22 +510,204 @@ export class TaskStore {
     });
   }
 
-  cancelQueuedTask(taskId: string): void {
+  pauseQueuedTask(taskId: string): void {
     const task = this.#requireTask(taskId);
-    if (task.status === "cancelled") return;
-    if (task.status !== "queued") {
-      throw new Error(`任务 ${taskId} 当前状态为 ${task.status}，不能直接取消队列`);
+    if (task.status === "paused") return;
+    if (task.status !== "queued") throw new Error("只有排队任务可以直接暂停");
+    this.#assertTaskTransition(task.status, "paused");
+    this.#transitionTaskOnly(task, "paused", "task.paused");
+  }
+
+  requestPause(taskId: string): void {
+    const task = this.#requireTask(taskId);
+    if (!["running", "waiting_approval", "waiting_user"].includes(task.status)) {
+      throw new Error("任务当前不能暂停");
     }
-    this.#assertTaskTransition(task.status, "cancelled");
+    this.#transaction((events) => {
+      events.push(this.#appendEvent(
+        task.id,
+        "task.pause_requested",
+        {},
+        task.currentRunId,
+        task.sessionId,
+      ));
+    });
+  }
+
+  finishPausedRun(taskId: string, runId: string): void {
+    const task = this.#requireTask(taskId);
+    const run = this.#requireRun(runId);
+    if (task.status === "paused") return;
+    this.#assertTaskTransition(task.status, "paused");
+    this.#assertRunTransition(run.status, "interrupted");
+    const now = new Date().toISOString();
+    this.#transaction((events) => {
+      this.#database.prepare(`
+        UPDATE runs SET status = 'interrupted', finished_at = ?, error = ?
+        WHERE id = ? AND task_id = ?
+      `).run(now, "任务由用户暂停", runId, taskId);
+      this.#database.prepare(`
+        UPDATE tasks SET status = 'paused', updated_at = ?, completed_at = NULL
+        WHERE id = ?
+      `).run(now, taskId);
+      this.#cancelPendingRequests(taskId, now);
+      events.push(this.#appendEvent(
+        taskId,
+        "run.interrupted",
+        { reason: "paused" },
+        runId,
+        task.sessionId,
+      ));
+      events.push(this.#appendEvent(
+        taskId,
+        "task.paused",
+        {},
+        runId,
+        task.sessionId,
+      ));
+    });
+  }
+
+  requeueTask(taskId: string, expected: "paused" | "failed" | "interrupted"): void {
+    const task = this.#requireTask(taskId);
+    if (task.status !== expected) throw new Error(`任务当前状态不是 ${expected}`);
+    this.#assertTaskTransition(task.status, "queued");
     const now = new Date().toISOString();
     this.#transaction((events) => {
       this.#database.prepare(`
         UPDATE tasks
-        SET status = 'cancelled', updated_at = ?, completed_at = ?
+        SET status = 'queued', updated_at = ?, completed_at = NULL, current_run_id = NULL
         WHERE id = ?
-      `).run(now, now, taskId);
-      events.push(this.#appendEvent(taskId, "task.cancelled", {}));
+      `).run(now, taskId);
+      events.push(this.#appendEvent(taskId, "task.resumed", { from: expected }));
+      events.push(this.#appendEvent(taskId, "task.queued", { from: expected }));
     });
+  }
+
+  promoteTask(taskId: string): void {
+    const task = this.#requireTask(taskId);
+    if (task.kind === "background") return;
+    if (isTerminalTaskStatus(task.status)) throw new Error("终态任务不能转到后台");
+    const now = new Date().toISOString();
+    this.#transaction((events) => {
+      this.#database.prepare(
+        "UPDATE tasks SET kind = 'background', updated_at = ? WHERE id = ?",
+      ).run(now, taskId);
+      events.push(this.#appendEvent(
+        taskId,
+        "task.promoted",
+        {},
+        task.currentRunId,
+        task.sessionId,
+      ));
+    });
+  }
+
+  cancelInactiveTask(taskId: string): void {
+    const task = this.#requireTask(taskId);
+    if (task.status === "cancelled") return;
+    if (task.status !== "queued" && task.status !== "paused") {
+      throw new Error(`任务 ${taskId} 当前状态不能直接取消`);
+    }
+    this.#assertTaskTransition(task.status, "cancelled");
+    this.#transitionTaskOnly(task, "cancelled", "task.cancelled", true);
+  }
+
+  createRequest(input: {
+    id: string;
+    taskId: string;
+    runId: string;
+    kind: TaskRequestKind;
+    title: string;
+    description?: string;
+    payload?: Record<string, unknown>;
+  }): TaskRequestRecord {
+    const existing = this.getRequest(input.id);
+    if (existing) return existing;
+    const request = taskRequestRecordSchema.parse({
+      id: input.id,
+      taskId: input.taskId,
+      runId: input.runId,
+      kind: input.kind,
+      status: "pending",
+      title: input.title,
+      ...(input.description ? { description: input.description } : {}),
+      payload: input.payload ?? {},
+      createdAt: new Date().toISOString(),
+    });
+    this.#transaction((events) => {
+      this.#database.prepare(`
+        INSERT INTO task_requests (
+          id, task_id, run_id, kind, status, title, description,
+          payload_json, response_json, created_at, resolved_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL)
+      `).run(
+        request.id,
+        request.taskId,
+        request.runId,
+        request.kind,
+        request.status,
+        request.title,
+        request.description ?? null,
+        JSON.stringify(request.payload),
+        request.createdAt,
+      );
+      if (request.kind === "user_input") {
+        events.push(this.#appendEvent(
+          request.taskId,
+          "user_input.requested",
+          { requestId: request.id, title: request.title },
+          request.runId,
+        ));
+      }
+    });
+    return request;
+  }
+
+  getRequest(id: string): TaskRequestRecord | undefined {
+    const row = this.#database.prepare(
+      "SELECT * FROM task_requests WHERE id = ?",
+    ).get(id) as unknown as RequestRow | undefined;
+    return row ? rowToRequest(row) : undefined;
+  }
+
+  resolveRequest(
+    id: string,
+    response: unknown,
+    status: "resolved" | "cancelled" | "expired" = "resolved",
+  ): TaskRequestRecord | undefined {
+    const request = this.getRequest(id);
+    if (!request || request.status !== "pending") return request;
+    const now = new Date().toISOString();
+    this.#transaction((events) => {
+      this.#database.prepare(`
+        UPDATE task_requests
+        SET status = ?, response_json = ?, resolved_at = ?
+        WHERE id = ?
+      `).run(status, JSON.stringify(response), now, id);
+      if (request.kind === "user_input" && status === "resolved") {
+        events.push(this.#appendEvent(
+          request.taskId,
+          "user_input.resolved",
+          { requestId: request.id },
+          request.runId,
+        ));
+      }
+    });
+    return this.getRequest(id);
+  }
+
+  pendingRequestCount(taskId: string, kind?: TaskRequestKind): number {
+    const row = kind
+      ? this.#database.prepare(`
+          SELECT COUNT(*) AS count FROM task_requests
+          WHERE task_id = ? AND kind = ? AND status = 'pending'
+        `).get(taskId, kind)
+      : this.#database.prepare(`
+          SELECT COUNT(*) AS count FROM task_requests
+          WHERE task_id = ? AND status = 'pending'
+        `).get(taskId);
+    return (row as { count: number }).count;
   }
 
   createArtifact(input: {
@@ -534,6 +791,7 @@ export class TaskStore {
           SET status = 'interrupted', updated_at = ?, completed_at = ?
           WHERE id = ?
         `).run(now, now, task.id);
+        this.#cancelPendingRequests(task.id, now);
         events.push(this.#appendEvent(
           task.id,
           "task.interrupted",
@@ -546,12 +804,11 @@ export class TaskStore {
     return tasks.length;
   }
 
-  countActive(workspaceId: string): number {
+  countActive(): number {
     const row = this.#database.prepare(`
       SELECT COUNT(*) AS count FROM tasks
-      WHERE workspace_id = ?
-        AND status IN ('running', 'waiting_approval', 'waiting_user')
-    `).get(workspaceId) as { count: number };
+      WHERE status IN ('running', 'waiting_approval', 'waiting_user')
+    `).get() as { count: number };
     return row.count;
   }
 
@@ -567,6 +824,54 @@ export class TaskStore {
 
   close(): void {
     this.#database.close();
+  }
+
+  #summaryFor(task: TaskRecord): TaskSummary {
+    const currentRun = task.currentRunId
+      ? this.#database.prepare("SELECT * FROM runs WHERE id = ?")
+          .get(task.currentRunId) as unknown as RunRow | undefined
+      : undefined;
+    const latestRun = currentRun ?? this.#database.prepare(`
+      SELECT * FROM runs WHERE task_id = ? ORDER BY attempt DESC LIMIT 1
+    `).get(task.id) as unknown as RunRow | undefined;
+    return taskSummarySchema.parse({
+      task,
+      ...(currentRun ? { currentRun: rowToRun(currentRun) } : {}),
+      pendingRequestCount: this.pendingRequestCount(task.id),
+      ...(latestRun?.result_summary ? { resultSummary: latestRun.result_summary } : {}),
+      ...(latestRun?.error ? { error: latestRun.error } : {}),
+    });
+  }
+
+  #transitionTaskOnly(
+    task: TaskRecord,
+    status: TaskStatus,
+    eventType: TaskEventType,
+    terminal = false,
+  ): void {
+    const now = new Date().toISOString();
+    this.#transaction((events) => {
+      this.#database.prepare(`
+        UPDATE tasks SET status = ?, updated_at = ?, completed_at = ?
+        WHERE id = ?
+      `).run(status, now, terminal ? now : null, task.id);
+      if (terminal) this.#cancelPendingRequests(task.id, now);
+      events.push(this.#appendEvent(
+        task.id,
+        eventType,
+        {},
+        task.currentRunId,
+        task.sessionId,
+      ));
+    });
+  }
+
+  #cancelPendingRequests(taskId: string, now: string): void {
+    this.#database.prepare(`
+      UPDATE task_requests
+      SET status = 'cancelled', resolved_at = ?
+      WHERE task_id = ? AND status = 'pending'
+    `).run(now, taskId);
   }
 
   #requireTask(id: string): TaskRecord {
@@ -650,82 +955,127 @@ export class TaskStore {
   }
 
   #migrate(): void {
-    const version = this.#database.prepare("PRAGMA user_version").get() as {
-      user_version: number;
-    };
-    if (version.user_version >= 1) return;
-    this.#database.exec(`
-      BEGIN;
-      CREATE TABLE tasks (
-        id TEXT PRIMARY KEY,
-        workspace_id TEXT NOT NULL,
-        root_task_id TEXT NOT NULL,
-        parent_task_id TEXT REFERENCES tasks(id),
-        kind TEXT NOT NULL,
-        title TEXT NOT NULL,
-        goal TEXT NOT NULL,
-        status TEXT NOT NULL,
-        priority INTEGER NOT NULL DEFAULT 0,
-        session_id TEXT,
-        plan_id TEXT,
-        current_run_id TEXT,
-        assigned_profile TEXT,
-        execution_json TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        completed_at TEXT
-      );
-      CREATE INDEX tasks_workspace_schedule_idx
-        ON tasks(workspace_id, status, priority DESC, created_at ASC);
-      CREATE INDEX tasks_workspace_updated_idx
-        ON tasks(workspace_id, updated_at DESC);
-      CREATE TABLE runs (
-        id TEXT PRIMARY KEY,
-        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-        attempt INTEGER NOT NULL,
-        status TEXT NOT NULL,
-        session_id TEXT,
-        runner_id TEXT NOT NULL,
-        model_provider TEXT,
-        model_id TEXT,
-        started_at TEXT,
-        finished_at TEXT,
-        error TEXT,
-        result_summary TEXT,
-        input_tokens INTEGER NOT NULL DEFAULT 0,
-        output_tokens INTEGER NOT NULL DEFAULT 0,
-        tool_call_count INTEGER NOT NULL DEFAULT 0,
-        UNIQUE(task_id, attempt)
-      );
-      CREATE INDEX runs_task_attempt_idx ON runs(task_id, attempt);
-      CREATE TABLE artifacts (
-        id TEXT PRIMARY KEY,
-        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
-        kind TEXT NOT NULL,
-        title TEXT NOT NULL,
-        uri TEXT,
-        content TEXT,
-        metadata_json TEXT NOT NULL,
-        created_at TEXT NOT NULL
-      );
-      CREATE INDEX artifacts_task_created_idx ON artifacts(task_id, created_at);
-      CREATE TABLE task_events (
-        event_id TEXT PRIMARY KEY,
-        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-        run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
-        session_id TEXT,
-        timestamp TEXT NOT NULL,
-        sequence INTEGER NOT NULL,
-        type TEXT NOT NULL,
-        payload_json TEXT NOT NULL,
-        UNIQUE(task_id, sequence)
-      );
-      CREATE INDEX task_events_task_sequence_idx
-        ON task_events(task_id, sequence);
-      PRAGMA user_version = 1;
-      COMMIT;
-    `);
+    const { user_version: version } = this.#database.prepare(
+      "PRAGMA user_version",
+    ).get() as { user_version: number };
+    if (version === 0) {
+      this.#database.exec(`
+        BEGIN;
+        CREATE TABLE tasks (
+          id TEXT PRIMARY KEY,
+          workspace_id TEXT NOT NULL,
+          workspace_path TEXT,
+          root_task_id TEXT NOT NULL,
+          parent_task_id TEXT REFERENCES tasks(id),
+          kind TEXT NOT NULL,
+          title TEXT NOT NULL,
+          goal TEXT NOT NULL,
+          status TEXT NOT NULL,
+          priority INTEGER NOT NULL DEFAULT 0,
+          session_id TEXT,
+          plan_id TEXT,
+          current_run_id TEXT,
+          assigned_profile TEXT,
+          execution_json TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          completed_at TEXT
+        );
+        CREATE INDEX tasks_workspace_schedule_idx
+          ON tasks(workspace_id, status, priority DESC, created_at ASC);
+        CREATE INDEX tasks_workspace_updated_idx
+          ON tasks(workspace_id, updated_at DESC);
+        CREATE INDEX tasks_global_schedule_idx
+          ON tasks(status, priority DESC, created_at ASC);
+        CREATE TABLE runs (
+          id TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          attempt INTEGER NOT NULL,
+          status TEXT NOT NULL,
+          session_id TEXT,
+          runner_id TEXT NOT NULL,
+          model_provider TEXT,
+          model_id TEXT,
+          started_at TEXT,
+          finished_at TEXT,
+          error TEXT,
+          result_summary TEXT,
+          input_tokens INTEGER NOT NULL DEFAULT 0,
+          output_tokens INTEGER NOT NULL DEFAULT 0,
+          tool_call_count INTEGER NOT NULL DEFAULT 0,
+          UNIQUE(task_id, attempt)
+        );
+        CREATE INDEX runs_task_attempt_idx ON runs(task_id, attempt);
+        CREATE TABLE artifacts (
+          id TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+          kind TEXT NOT NULL,
+          title TEXT NOT NULL,
+          uri TEXT,
+          content TEXT,
+          metadata_json TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX artifacts_task_created_idx ON artifacts(task_id, created_at);
+        CREATE TABLE task_events (
+          event_id TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+          session_id TEXT,
+          timestamp TEXT NOT NULL,
+          sequence INTEGER NOT NULL,
+          type TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          UNIQUE(task_id, sequence)
+        );
+        CREATE INDEX task_events_task_sequence_idx
+          ON task_events(task_id, sequence);
+        CREATE TABLE task_requests (
+          id TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+          kind TEXT NOT NULL,
+          status TEXT NOT NULL,
+          title TEXT NOT NULL,
+          description TEXT,
+          payload_json TEXT NOT NULL,
+          response_json TEXT,
+          created_at TEXT NOT NULL,
+          resolved_at TEXT
+        );
+        CREATE INDEX task_requests_pending_idx
+          ON task_requests(task_id, status, created_at);
+        PRAGMA user_version = 2;
+        COMMIT;
+      `);
+      return;
+    }
+    if (version === 1) {
+      this.#database.exec(`
+        BEGIN;
+        ALTER TABLE tasks ADD COLUMN workspace_path TEXT;
+        CREATE INDEX tasks_global_schedule_idx
+          ON tasks(status, priority DESC, created_at ASC);
+        CREATE TABLE task_requests (
+          id TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+          kind TEXT NOT NULL,
+          status TEXT NOT NULL,
+          title TEXT NOT NULL,
+          description TEXT,
+          payload_json TEXT NOT NULL,
+          response_json TEXT,
+          created_at TEXT NOT NULL,
+          resolved_at TEXT
+        );
+        CREATE INDEX task_requests_pending_idx
+          ON task_requests(task_id, status, created_at);
+        PRAGMA user_version = 2;
+        COMMIT;
+      `);
+    }
   }
 }
 
@@ -736,16 +1086,25 @@ interface ActiveExecution {
   handle?: TaskExecutionHandle;
   cancelRequested: boolean;
   interruptRequested: boolean;
+  pauseRequested: boolean;
+  slotHeld: boolean;
+  summary: string;
   completion: Promise<void>;
+}
+
+interface ResumeWaiter {
+  taskId: string;
+  resolve: () => void;
 }
 
 export class TaskOrchestrator {
   readonly #store: TaskStore;
-  readonly #workspaceId: string;
   readonly #executor: TaskExecutor;
+  readonly #defaultWorkspaceId: string | undefined;
+  readonly #isWorkspaceAvailable: (task: TaskRecord) => boolean;
   readonly #onEvent: ((event: TaskEvent) => void) | undefined;
   readonly #active = new Map<string, ActiveExecution>();
-  readonly #pendingApprovals = new Map<string, number>();
+  readonly #resumeWaiters: ResumeWaiter[] = [];
   #concurrency: number;
   #started = false;
   #paused = false;
@@ -754,30 +1113,28 @@ export class TaskOrchestrator {
 
   constructor(options: {
     store: TaskStore;
-    workspaceId: string;
+    workspaceId?: string;
     concurrency: number;
     executor: TaskExecutor;
+    isWorkspaceAvailable?: (task: TaskRecord) => boolean;
     onEvent?: (event: TaskEvent) => void;
+    recoverOnStart?: boolean;
   }) {
     this.#store = options.store;
-    this.#workspaceId = options.workspaceId;
+    this.#defaultWorkspaceId = options.workspaceId;
     this.#concurrency = normalizeConcurrency(options.concurrency);
     this.#executor = options.executor;
+    this.#isWorkspaceAvailable = options.isWorkspaceAvailable ?? (() => true);
     this.#onEvent = options.onEvent;
     this.#unsubscribe = this.#store.subscribe((event) => this.#onEvent?.(event));
-    this.#store.recoverInterrupted();
+    if (options.recoverOnStart !== false) this.#store.recoverInterrupted();
   }
 
   start(): void {
     if (this.#disposed) throw new Error("Task Orchestrator 已释放");
-    if (this.#started) {
-      this.#paused = false;
-      this.#pump();
-      return;
-    }
     this.#started = true;
     this.#paused = false;
-    this.#pump();
+    this.#drain();
   }
 
   pause(): void {
@@ -786,10 +1143,12 @@ export class TaskOrchestrator {
 
   setConcurrency(value: number): void {
     this.#concurrency = normalizeConcurrency(value);
-    this.#pump();
+    this.#drain();
   }
 
   submitPrompt(input: {
+    workspaceId?: string;
+    workspacePath?: string;
     title: string;
     prompt: string;
     kind: "interactive" | "background";
@@ -797,49 +1156,76 @@ export class TaskOrchestrator {
     priority?: number;
   }): TaskRecord {
     if (this.#disposed) throw new Error("Task Orchestrator 已释放");
+    const workspaceId = input.workspaceId ?? this.#defaultWorkspaceId;
+    if (!workspaceId) throw new Error("提交任务时必须指定工作区");
     const task = this.#store.createTask({
-      workspaceId: this.#workspaceId,
-      kind: input.kind,
+      workspaceId,
+      ...(input.workspacePath ? { workspacePath: input.workspacePath } : {}),
       title: input.title,
       goal: input.prompt,
+      kind: input.kind,
       execution: input.execution,
       ...(input.priority === undefined ? {} : { priority: input.priority }),
     });
-    this.#pump();
+    this.#drain();
     return task;
   }
 
-  listTasks(options: { statuses?: TaskStatus[]; limit?: number } = {}): TaskRecord[] {
-    return this.#store.listTasks(this.#workspaceId, options);
+  listTaskSummaries(options: {
+    statuses?: TaskStatus[];
+    workspaceIds?: string[];
+    query?: string;
+    limit?: number;
+  } = {}): TaskSummary[] {
+    return this.#store.listTaskSummaries(options);
+  }
+
+  listTasks(options: {
+    statuses?: TaskStatus[];
+    workspaceIds?: string[];
+    query?: string;
+    limit?: number;
+  } = {}): TaskRecord[] {
+    const scoped = options.workspaceIds
+      ?? (this.#defaultWorkspaceId ? [this.#defaultWorkspaceId] : undefined);
+    return this.#store.listTaskSummaries({
+      ...options,
+      ...(scoped ? { workspaceIds: scoped } : {}),
+    }).map((summary) => summary.task);
   }
 
   getTask(taskId: string): TaskDetail | undefined {
-    const detail = this.#store.getTaskDetail(taskId);
-    return detail?.task.workspaceId === this.#workspaceId ? detail : undefined;
+    return this.#store.getTaskDetail(taskId);
   }
 
-  hasNonTerminalForSession(sessionId: string): boolean {
-    return this.#store.hasNonTerminalForSession(this.#workspaceId, sessionId);
+  hasNonTerminalForSession(workspaceId: string, sessionId: string): boolean {
+    return this.#store.hasNonTerminalForSession(workspaceId, sessionId);
   }
 
-  currentTaskForSession(sessionId: string): TaskRecord | undefined {
-    return this.#store.listTasks(this.#workspaceId, {
+  currentTaskForSession(
+    workspaceIdOrSessionId: string,
+    maybeSessionId?: string,
+  ): TaskRecord | undefined {
+    const workspaceId = maybeSessionId ? workspaceIdOrSessionId : this.#defaultWorkspaceId;
+    const sessionId = maybeSessionId ?? workspaceIdOrSessionId;
+    if (!workspaceId) return undefined;
+    return this.#store.listTasks(workspaceId, {
       statuses: ["running", "waiting_approval", "waiting_user"],
       limit: 500,
     }).find((task) => task.sessionId === sessionId);
   }
 
   get activeRunCount(): number {
-    return this.#active.size;
+    return [...this.#active.values()].filter((active) => active.slotHeld).length;
   }
 
   async cancelTask(taskId: string): Promise<boolean> {
     const task = this.#store.getTask(taskId);
-    if (!task || task.workspaceId !== this.#workspaceId) return false;
+    if (!task) return false;
     if (isTerminalTaskStatus(task.status)) return true;
-    if (task.status === "queued") {
-      this.#store.cancelQueuedTask(taskId);
-      this.#pump();
+    if (task.status === "queued" || task.status === "paused") {
+      this.#store.cancelInactiveTask(taskId);
+      this.#drain();
       return true;
     }
     const active = this.#active.get(taskId);
@@ -850,33 +1236,140 @@ export class TaskOrchestrator {
     return true;
   }
 
+  async pauseTask(taskId: string): Promise<boolean> {
+    const task = this.#store.getTask(taskId);
+    if (!task) return false;
+    if (task.status === "paused") return true;
+    if (task.status === "queued") {
+      this.#store.pauseQueuedTask(taskId);
+      return true;
+    }
+    const active = this.#active.get(taskId);
+    if (!active) return false;
+    this.#store.requestPause(taskId);
+    active.pauseRequested = true;
+    active.controller.abort();
+    await active.handle?.cancel().catch(() => undefined);
+    return true;
+  }
+
+  resumeTask(taskId: string): boolean {
+    const task = this.#store.getTask(taskId);
+    if (!task || (task.status !== "paused" && task.status !== "interrupted")) return false;
+    this.#store.requeueTask(taskId, task.status);
+    this.#markContinuation(taskId);
+    this.#drain();
+    return true;
+  }
+
+  retryTask(taskId: string): boolean {
+    const task = this.#store.getTask(taskId);
+    if (!task || task.status !== "failed") return false;
+    this.#store.requeueTask(taskId, "failed");
+    this.#markContinuation(taskId);
+    this.#drain();
+    return true;
+  }
+
+  promoteTask(taskId: string): boolean {
+    if (!this.#store.getTask(taskId)) return false;
+    this.#store.promoteTask(taskId);
+    return true;
+  }
+
+  async acquireResumeSlot(taskId: string): Promise<boolean> {
+    const active = this.#active.get(taskId);
+    if (!active) return false;
+    if (active.slotHeld) return true;
+    if (this.#resumeWaiters.some((waiter) => waiter.taskId === taskId)) return false;
+    if (this.#heldSlots() < this.#concurrency) {
+      active.slotHeld = true;
+      return true;
+    }
+    await new Promise<void>((resolve) => {
+      this.#resumeWaiters.push({ taskId, resolve });
+    });
+    return this.#active.has(taskId);
+  }
+
   handleAgentEvent(event: AgentEvent): void {
     const taskId = event.taskId;
     const runId = event.runId;
-    if (!taskId || !runId || !this.#active.has(taskId)) return;
+    if (!taskId || !runId) return;
+    const active = this.#active.get(taskId);
     const task = this.#store.getTask(taskId);
-    if (!task || isTerminalTaskStatus(task.status)) return;
+    if (!active || !task || isTerminalTaskStatus(task.status)) return;
+
+    if (event.type === "message.delta") {
+      active.summary = `${active.summary}${event.delta}`.slice(-20_000);
+      return;
+    }
+    if (event.type === "diff.available") {
+      this.#store.createArtifact({
+        taskId,
+        runId,
+        kind: "diff",
+        title: "Workspace Diff",
+        content: event.diff,
+        metadata: { callId: event.callId },
+      });
+      return;
+    }
     if (event.type === "approval.requested") {
-      const count = (this.#pendingApprovals.get(taskId) ?? 0) + 1;
-      this.#pendingApprovals.set(taskId, count);
-      if (count === 1) this.#store.setApprovalWaiting(taskId, runId, true);
+      this.#store.createRequest({
+        id: event.requestId,
+        taskId,
+        runId,
+        kind: "approval",
+        title: event.title,
+        description: event.description,
+        payload: {
+          category: event.category,
+          details: event.details,
+          ...(event.diff ? { diff: event.diff } : {}),
+          expiresAt: event.expiresAt,
+        },
+      });
+      this.#store.setWaiting(taskId, runId, "approval", true);
+      this.#releaseSlot(active);
       return;
     }
     if (event.type === "approval.resolved") {
-      const count = Math.max(0, (this.#pendingApprovals.get(taskId) ?? 0) - 1);
-      if (count === 0) {
-        this.#pendingApprovals.delete(taskId);
-        const current = this.#store.getTask(taskId);
-        if (current?.status === "waiting_approval") {
-          this.#store.setApprovalWaiting(taskId, runId, false);
-        }
-      } else {
-        this.#pendingApprovals.set(taskId, count);
+      this.#store.resolveRequest(event.requestId, { decision: event.decision });
+      if (
+        this.#store.pendingRequestCount(taskId, "approval") === 0
+        && this.#store.getTask(taskId)?.status === "waiting_approval"
+      ) {
+        this.#store.setWaiting(taskId, runId, "approval", false);
+      }
+      return;
+    }
+    if (event.type === "user_input.requested") {
+      this.#store.createRequest({
+        id: event.requestId,
+        taskId,
+        runId,
+        kind: "user_input",
+        title: event.title,
+        ...(event.description ? { description: event.description } : {}),
+        payload: { ...(event.options ? { options: event.options } : {}) },
+      });
+      this.#store.setWaiting(taskId, runId, "user_input", true);
+      this.#releaseSlot(active);
+      return;
+    }
+    if (event.type === "user_input.resolved") {
+      this.#store.resolveRequest(event.requestId, { value: event.value });
+      if (
+        this.#store.pendingRequestCount(taskId, "user_input") === 0
+        && this.#store.getTask(taskId)?.status === "waiting_user"
+      ) {
+        this.#store.setWaiting(taskId, runId, "user_input", false);
       }
     }
   }
 
-  async dispose(): Promise<void> {
+  async dispose(options: { closeStore?: boolean } = {}): Promise<void> {
     if (this.#disposed) return;
     this.#paused = true;
     this.#disposed = true;
@@ -887,30 +1380,56 @@ export class TaskOrchestrator {
       await active.completion.catch(() => undefined);
     });
     await Promise.allSettled(completions);
+    for (const waiter of this.#resumeWaiters.splice(0)) waiter.resolve();
     this.#unsubscribe?.();
     this.#unsubscribe = undefined;
-    this.#store.close();
+    if (options.closeStore !== false) this.#store.close();
   }
 
-  #pump(): void {
+  #markContinuation(taskId: string): void {
+    const execution = this.#store.getExecution(taskId);
+    this.#store.updateExecution(taskId, { ...execution, preferFork: true, continuation: true });
+  }
+
+  #releaseSlot(active: ActiveExecution): void {
+    active.slotHeld = false;
+    this.#drain();
+  }
+
+  #heldSlots(): number {
+    return [...this.#active.values()].filter((active) => active.slotHeld).length;
+  }
+
+  #drain(): void {
     if (!this.#started || this.#paused || this.#disposed) return;
-    const available = this.#concurrency - this.#active.size;
+    while (this.#heldSlots() < this.#concurrency && this.#resumeWaiters.length) {
+      const waiter = this.#resumeWaiters.shift()!;
+      const active = this.#active.get(waiter.taskId);
+      if (active) active.slotHeld = true;
+      waiter.resolve();
+    }
+    let available = this.#concurrency - this.#heldSlots();
     if (available <= 0) return;
-    const queued = this.#store.listQueuedTasks(this.#workspaceId, available);
+    const queued = this.#store.listQueuedTasks();
     for (const task of queued) {
-      if (this.#active.has(task.id)) continue;
+      if (available <= 0) break;
+      if (this.#active.has(task.id) || !this.#isWorkspaceAvailable(task)) continue;
       const run = this.#store.createRun(task.id);
       const controller = new AbortController();
-      const active = {
+      const active: ActiveExecution = {
         taskId: task.id,
         runId: run.id,
         controller,
         cancelRequested: false,
         interruptRequested: false,
+        pauseRequested: false,
+        slotHeld: true,
+        summary: "",
         completion: Promise.resolve(),
-      } satisfies ActiveExecution;
+      };
       this.#active.set(task.id, active);
       active.completion = this.#execute(active, task, run);
+      available -= 1;
     }
   }
 
@@ -932,36 +1451,59 @@ export class TaskOrchestrator {
         ...(handle.modelProvider ? { modelProvider: handle.modelProvider } : {}),
         ...(handle.modelId ? { modelId: handle.modelId } : {}),
       });
-      if (active.cancelRequested || active.interruptRequested) {
+      if (active.cancelRequested || active.interruptRequested || active.pauseRequested) {
         await handle.cancel().catch(() => undefined);
       }
       await handle.completion;
-      this.#store.finishRun(
-        task.id,
-        run.id,
-        active.interruptRequested
-          ? "interrupted"
-          : active.cancelRequested
-            ? "cancelled"
-            : "succeeded",
-      );
+      if (active.pauseRequested) {
+        if (handle.captureContext) this.#store.updateExecution(task.id, handle.captureContext());
+        this.#store.finishPausedRun(task.id, run.id);
+      } else {
+        this.#store.finishRun(
+          task.id,
+          run.id,
+          active.interruptRequested
+            ? "interrupted"
+            : active.cancelRequested
+              ? "cancelled"
+              : "succeeded",
+          undefined,
+          summarize(active.summary),
+        );
+      }
     } catch (error) {
-      this.#store.finishRun(
-        task.id,
-        run.id,
-        active.interruptRequested
-          ? "interrupted"
-          : active.cancelRequested || isAbortError(error)
-            ? "cancelled"
-            : "failed",
-        active.cancelRequested || active.interruptRequested
-          ? undefined
-          : formatError(error),
-      );
+      if (active.pauseRequested) {
+        if (active.handle?.captureContext) {
+          this.#store.updateExecution(task.id, active.handle.captureContext());
+        }
+        this.#store.finishPausedRun(task.id, run.id);
+      } else {
+        if (
+          active.handle?.captureContext
+          && !active.cancelRequested
+          && !active.interruptRequested
+        ) {
+          this.#store.updateExecution(task.id, active.handle.captureContext());
+        }
+        this.#store.finishRun(
+          task.id,
+          run.id,
+          active.interruptRequested
+            ? "interrupted"
+            : active.cancelRequested || isAbortError(error)
+              ? "cancelled"
+              : "failed",
+          active.cancelRequested || active.interruptRequested
+            ? undefined
+            : formatError(error),
+          summarize(active.summary),
+        );
+      }
     } finally {
-      this.#pendingApprovals.delete(task.id);
       this.#active.delete(task.id);
-      this.#pump();
+      const index = this.#resumeWaiters.findIndex((waiter) => waiter.taskId === task.id);
+      if (index >= 0) this.#resumeWaiters.splice(index, 1)[0]?.resolve();
+      this.#drain();
     }
   }
 }
@@ -970,6 +1512,7 @@ function rowToTask(row: TaskRow): TaskRecord {
   return taskRecordSchema.parse({
     id: row.id,
     workspaceId: row.workspace_id,
+    ...(row.workspace_path ? { workspacePath: row.workspace_path } : {}),
     rootTaskId: row.root_task_id,
     ...(row.parent_task_id ? { parentTaskId: row.parent_task_id } : {}),
     kind: row.kind,
@@ -1034,6 +1577,22 @@ function rowToEvent(row: EventRow): TaskEvent {
   });
 }
 
+function rowToRequest(row: RequestRow): TaskRequestRecord {
+  return taskRequestRecordSchema.parse({
+    id: row.id,
+    taskId: row.task_id,
+    runId: row.run_id,
+    kind: row.kind,
+    status: row.status,
+    title: row.title,
+    ...(row.description ? { description: row.description } : {}),
+    payload: JSON.parse(row.payload_json),
+    ...(row.response_json ? { response: JSON.parse(row.response_json) } : {}),
+    createdAt: row.created_at,
+    ...(row.resolved_at ? { resolvedAt: row.resolved_at } : {}),
+  });
+}
+
 function isTerminalTaskStatus(status: TaskStatus): boolean {
   return status === "succeeded"
     || status === "failed"
@@ -1049,14 +1608,39 @@ function isTerminalRunStatus(status: RunStatus): boolean {
 }
 
 function normalizeConcurrency(value: number): number {
-  return Math.min(8, Math.max(1, Math.trunc(value)));
+  return Math.max(1, Math.min(32, Math.trunc(value)));
+}
+
+function summarize(value: string): string | undefined {
+  const trimmed = value.trim();
+  return trimmed ? trimmed.slice(-4_000) : undefined;
 }
 
 function isAbortError(error: unknown): boolean {
   return error instanceof Error
-    && (error.name === "AbortError" || /abort|cancel/iu.test(error.message));
+    && (error.name === "AbortError" || /abort|cancel/i.test(error.message));
 }
 
 function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+export function createTaskRecordFixture(
+  overrides: Partial<TaskRecord> = {},
+): TaskRecord {
+  const id = overrides.id ?? randomUUID();
+  const now = new Date().toISOString();
+  return taskRecordSchema.parse({
+    id,
+    workspaceId: "workspace-test",
+    rootTaskId: id,
+    kind: "background",
+    title: "Test task",
+    goal: "Complete the test task",
+    status: "queued",
+    priority: 0,
+    createdAt: now,
+    updatedAt: now,
+    ...overrides,
+  });
 }

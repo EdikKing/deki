@@ -21,6 +21,7 @@ import type {
   ThinkingLevel,
 } from "@deki-ai/shared";
 import { SettingsView } from "./SettingsView";
+import { TaskCenter } from "./TaskCenter";
 import {
   builtinModelProviders,
 } from "./builtinModelProviders";
@@ -61,6 +62,11 @@ export function App() {
   const [error, setError] = useState<string>();
   const [settings, setSettings] = useState<SettingsSnapshot>();
   const [showSettings, setShowSettings] = useState(false);
+  const [showTaskCenter, setShowTaskCenter] = useState(false);
+  const [selectedTaskId, setSelectedTaskId] = useState<string>();
+  const [taskAttentionCount, setTaskAttentionCount] = useState(0);
+  const [foregroundTaskId, setForegroundTaskId] = useState<string>();
+  const [backgroundTask, setBackgroundTask] = useState<{ id: string; title: string }>();
   const [approval, setApproval] = useState<Extract<AgentEvent, { type: "approval.requested" }>>();
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [activeSession, setActiveSession] = useState<SessionSummary>();
@@ -110,12 +116,17 @@ export function App() {
       }
       if (belongsToActiveSession && (event.type === "run.completed" || event.type === "run.failed")) {
         setBusy(false);
+        setForegroundTaskId(undefined);
       }
       if (event.type === "run.completed" || event.type === "run.failed") void refreshSessions();
       if (belongsToActiveSession && event.type === "run.failed") {
         setError(event.error);
       }
-      if (event.type === "approval.requested") setApproval(event);
+      if (
+        belongsToActiveSession
+        && event.type === "approval.requested"
+        && (!event.taskId || event.sessionId === activeSessionId.current)
+      ) setApproval(event);
       if (event.type === "approval.resolved") {
         setApproval((current) => current?.requestId === event.requestId ? undefined : current);
       }
@@ -134,6 +145,29 @@ export function App() {
       unsubscribeAgent();
       unsubscribeSettings();
       window.removeEventListener("keydown", onKeyDown);
+    };
+  }, []);
+
+  useEffect(() => {
+    const refreshAttention = async () => {
+      const rows = await window.deki.listTasks({
+        statuses: ["waiting_approval", "waiting_user"],
+        limit: 500,
+      });
+      setTaskAttentionCount(rows.length);
+    };
+    void refreshAttention();
+    const unsubscribeTasks = window.deki.subscribeTaskEvents(() => {
+      void refreshAttention();
+      void refresh();
+    });
+    const unsubscribeOpenTask = window.deki.subscribeOpenTask((taskId) => {
+      setSelectedTaskId(taskId);
+      setShowTaskCenter(true);
+    });
+    return () => {
+      unsubscribeTasks();
+      unsubscribeOpenTask();
     };
   }, []);
 
@@ -313,14 +347,17 @@ export function App() {
     );
   }
 
-  async function submit() {
+  async function submit(mode: "foreground" | "background" = "foreground") {
     const value = prompt.trim();
-    if (!value || (busy && (settings?.effective.agent.maxConcurrentRuns ?? 1) <= 1)) return;
-    const concurrentBranch = busy;
+    if (!value || (mode === "foreground" && busy)) return;
     const sessionCommand = value.startsWith("/");
+    if (mode === "background" && sessionCommand) {
+      setError(zh ? "会话命令不能在后台运行" : "Session commands cannot run in background");
+      return;
+    }
     setPrompt("");
     setError(undefined);
-    if (!concurrentBranch) {
+    if (mode === "foreground") {
       setMessages((current) => [
         ...current,
         {
@@ -330,28 +367,32 @@ export function App() {
           timestamp: new Date().toISOString(),
         },
       ]);
+      setBusy(true);
     }
-    setBusy(true);
-    const result = await window.deki.sendPrompt(value);
-    if (!result.ok || sessionCommand) {
+    const result = await window.deki.sendPrompt(value, { mode });
+    if (mode === "foreground" && (!result.ok || sessionCommand)) {
       setBusy(false);
     }
     if (!result.ok) {
       setError(result.error ?? "请求失败");
-    } else if (concurrentBranch) {
-      setMessages((current) => [...current, {
-        id: crypto.randomUUID(),
-        role: "assistant",
-        content: zh
-          ? "已从当前上下文创建并发分叉；运行结果会出现在新的会话中。"
-          : "Created a concurrent fork from the current context; its result will appear in a new chat.",
-        timestamp: new Date().toISOString(),
-      }]);
+    } else if (result.task && mode === "background") {
+      setBackgroundTask({ id: result.task.id, title: result.task.title });
+    } else if (result.task) {
+      setForegroundTaskId(result.task.id);
     }
     await refresh();
   }
 
   async function switchProjectContext(workspace?: string) {
+    if (foregroundTaskId) {
+      const promoted = await window.deki.promoteTask(foregroundTaskId);
+      if (!promoted.ok) {
+        setError(promoted.error ?? (zh ? "当前任务无法转到后台" : "Unable to move the current task to background"));
+        return undefined;
+      }
+      setForegroundTaskId(undefined);
+      setBusy(false);
+    }
     setMessages([]);
     setEvents([]);
     setSessions([]);
@@ -372,6 +413,7 @@ export function App() {
   }
 
   function toggleProjectNode(workspace?: string) {
+    setShowTaskCenter(false);
     const key = workspace ?? GENERAL_PROJECT_KEY;
     if (key === activeProjectKey) {
       setExpandedProjectKey((current) => current === key ? "" : key);
@@ -382,6 +424,7 @@ export function App() {
   }
 
   async function createSessionForProject(workspace?: string) {
+    setShowTaskCenter(false);
     const key = workspace ?? GENERAL_PROJECT_KEY;
     setExpandedProjectKey(key);
     let nextState: BootstrapState | undefined = state;
@@ -421,12 +464,23 @@ export function App() {
         </div>
 
         <nav className="sidebar-navigation" aria-label={zh ? "项目和会话" : "Projects and sessions"}>
+          <button
+            className={`task-center-nav${showTaskCenter ? " active" : ""}`}
+            onClick={() => {
+              setShowTaskCenter(true);
+              setSelectedTaskId(undefined);
+            }}
+            data-testid="open-task-center"
+          >
+            <span className="task-center-nav-icon" aria-hidden="true">✓</span>
+            <strong>{zh ? "任务" : "Tasks"}</strong>
+            {taskAttentionCount > 0 && <span className="task-attention-badge">{taskAttentionCount}</span>}
+          </button>
           <section className="navigation-section project-tree-section">
             <header className="navigation-heading">
               <span>{zh ? "项目" : "Projects"}</span>
               <button
                 className="icon-button"
-                disabled={busy}
                 title={zh ? "添加或切换项目" : "Add or switch project"}
                 aria-label={zh ? "添加项目" : "Add project"}
                 onClick={() => void runCommand(
@@ -448,7 +502,6 @@ export function App() {
                     <div className="project-tree-row">
                       <button
                         className="project-tree-toggle"
-                        disabled={busy}
                         title={node.workspace}
                         aria-expanded={expanded}
                         onClick={() => toggleProjectNode(node.workspace)}
@@ -561,6 +614,23 @@ export function App() {
         </div>
       </aside>
 
+      {showTaskCenter ? (
+        <TaskCenter
+          zh={zh}
+          {...(selectedTaskId ? { initialTaskId: selectedTaskId } : {})}
+          onOpenSession={async (taskId) => {
+            const result = await window.deki.openTaskSession(taskId);
+            if (!result.ok) {
+              setError(result.error ?? (zh ? "无法打开任务会话" : "Unable to open task chat"));
+              return;
+            }
+            setShowTaskCenter(false);
+            setSelectedTaskId(undefined);
+            await refresh();
+            await refreshSessions();
+          }}
+        />
+      ) : (
       <section className="app-main">
         <header className="topbar">
           <div className="project-heading">
@@ -653,7 +723,6 @@ export function App() {
                 <textarea
                   className="composer-input"
                   value={prompt}
-                  disabled={busy && (settings?.effective.agent.maxConcurrentRuns ?? 1) <= 1}
                   placeholder={state.ready
                     ? (zh
                         ? "输入消息…（Enter 发送，Shift+Enter 换行，/remember 保存记忆）"
@@ -738,7 +807,6 @@ export function App() {
                       className="composer-tool"
                       aria-label={zh ? "选择项目" : "Choose project"}
                       title={zh ? "选择或切换项目" : "Choose or switch project"}
-                      disabled={busy}
                       onClick={() => void runCommand(
                         window.deki.chooseWorkspace(),
                         setError,
@@ -747,16 +815,32 @@ export function App() {
                     >
                       <FolderIcon />
                     </button>
+                    <button
+                      className="composer-submit composer-background"
+                      aria-label={zh ? "后台运行" : "Run in background"}
+                      title={zh ? "在独立会话中后台运行" : "Run in a separate background session"}
+                      disabled={!prompt.trim() || isSessionCommand || !state.ready}
+                      onClick={() => void submit("background")}
+                    >
+                      <span aria-hidden="true">↗</span>
+                    </button>
                     {busy ? (<>
-                      {(settings?.effective.agent.maxConcurrentRuns ?? 1) > 1 && (
+                      {foregroundTaskId && (
                         <button
-                          className="composer-submit primary"
-                          aria-label={zh ? "并发提交" : "Submit concurrently"}
-                          title={zh ? "提交为并发后续运行" : "Submit as another run"}
-                          disabled={!prompt.trim()}
-                          onClick={() => void submit()}
+                          className="composer-tool"
+                          aria-label={zh ? "转到后台" : "Move to background"}
+                          title={zh ? "让当前任务继续在后台运行" : "Keep the current task running in background"}
+                          onClick={() => void runCommand(
+                            window.deki.promoteTask(foregroundTaskId),
+                            setError,
+                            async () => {
+                              setForegroundTaskId(undefined);
+                              setBusy(false);
+                              await refresh();
+                            },
+                          )}
                         >
-                          <span aria-hidden="true">↑</span>
+                          <span aria-hidden="true">⇱</span>
                         </button>
                       )}
                       <button
@@ -773,7 +857,7 @@ export function App() {
                         aria-label={zh ? "发送" : "Send"}
                         title={zh ? "发送" : "Send"}
                         disabled={!state.ready && !isSessionCommand}
-                        onClick={() => void submit()}
+                        onClick={() => void submit("foreground")}
                       >
                         <span aria-hidden="true">↑</span>
                       </button>
@@ -782,6 +866,23 @@ export function App() {
                 </div>
               </div>
             </div>
+            {backgroundTask && (
+              <button
+                className="background-task-notice"
+                onClick={() => {
+                  setSelectedTaskId(backgroundTask.id);
+                  setShowTaskCenter(true);
+                  setBackgroundTask(undefined);
+                }}
+              >
+                <span>✓</span>
+                <span>
+                  <strong>{zh ? "已提交到后台" : "Submitted in background"}</strong>
+                  <small>{backgroundTask.title}</small>
+                </span>
+                <span aria-hidden="true">→</span>
+              </button>
+            )}
             {error && <p className="error inline-error">{error}</p>}
           </section>
 
@@ -877,6 +978,7 @@ export function App() {
           </aside>
         </div>
       </section>
+      )}
       {approval && (
         <div className="approval-overlay" role="dialog" aria-modal="true" aria-label={zh ? "操作审批" : "Operation approval"}>
           <section className="approval-dialog">
@@ -902,7 +1004,11 @@ export function App() {
     decision: "allow_once" | "allow_session" | "allow_project" | "deny",
   ) {
     if (!approval) return;
-    const result = await window.deki.respondToApproval(approval.requestId, decision);
+    const result = await window.deki.respondToApproval(
+      approval.requestId,
+      decision,
+      approval.taskId,
+    );
     if (!result.ok) setError(result.error);
     setApproval(undefined);
   }

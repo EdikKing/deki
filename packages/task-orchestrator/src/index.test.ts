@@ -133,6 +133,64 @@ describe("TaskStore", () => {
     expect(store.listTasks("workspace-b").map((task) => task.title)).toEqual(["B"]);
     store.close();
   });
+
+  it("searches globally and persists workspace paths, requests, and summaries", async () => {
+    const store = await createStore();
+    const task = store.createTask({
+      workspaceId: "workspace-a",
+      workspacePath: "/projects/alpha",
+      kind: "background",
+      title: "修复登录回归",
+      goal: "检查认证流程",
+      execution: promptExecution(true),
+    });
+    const run = store.createRun(task.id);
+    store.bindRun(task.id, run.id, { sessionId: "session-a" });
+    store.createRequest({
+      id: "input-1",
+      taskId: task.id,
+      runId: run.id,
+      kind: "user_input",
+      title: "选择兼容策略",
+      payload: { options: ["保持旧行为", "启用新行为"] },
+    });
+
+    expect(store.listTaskSummaries({ query: "登录" })[0]).toMatchObject({
+      task: { workspacePath: "/projects/alpha" },
+      pendingRequestCount: 1,
+    });
+    store.resolveRequest("input-1", { value: "保持旧行为" });
+    store.finishRun(task.id, run.id, "succeeded", undefined, "登录回归已修复");
+    const detail = store.getTaskDetail(task.id)!;
+    expect(detail.requests[0]).toMatchObject({ status: "resolved" });
+    expect(detail.events.map((event) => event.type)).toContain("user_input.requested");
+    expect(detail.events.map((event) => event.type)).toContain("user_input.resolved");
+    expect(store.listTaskSummaries({ query: "回归已修复" })[0]?.resultSummary)
+      .toBe("登录回归已修复");
+    store.close();
+  });
+
+  it("pauses queued tasks and requeues paused, failed, and interrupted tasks", async () => {
+    const store = await createStore();
+    const paused = store.createTask({
+      workspaceId: "workspace-a",
+      kind: "background",
+      title: "暂停",
+      goal: "暂停",
+      execution: promptExecution(true),
+    });
+    store.pauseQueuedTask(paused.id);
+    expect(store.getTask(paused.id)?.status).toBe("paused");
+    store.requeueTask(paused.id, "paused");
+    expect(store.getTask(paused.id)?.status).toBe("queued");
+
+    const run = store.createRun(paused.id);
+    store.bindRun(paused.id, run.id, { sessionId: "session-paused" });
+    store.finishRun(paused.id, run.id, "failed", "失败");
+    store.requeueTask(paused.id, "failed");
+    expect(store.getTask(paused.id)?.status).toBe("queued");
+    store.close();
+  });
 });
 
 describe("TaskOrchestrator", () => {
@@ -388,6 +446,80 @@ describe("TaskOrchestrator", () => {
     expect(reopened.getTask(active.id)?.status).toBe("interrupted");
     expect(reopened.getTask(queued.id)?.status).toBe("queued");
     reopened.close();
+  });
+
+  it("shares one concurrency limit across workspaces", async () => {
+    const store = await createStore();
+    const handles: Array<ReturnType<typeof deferredHandle>> = [];
+    const starts: string[] = [];
+    const orchestrator = new TaskOrchestrator({
+      store,
+      concurrency: 1,
+      executor: async ({ task }) => {
+        starts.push(`${task.workspaceId}:${task.title}`);
+        const handle = deferredHandle(`session-${task.title}`);
+        handles.push(handle);
+        return handle;
+      },
+    });
+    orchestrator.start();
+    orchestrator.submitPrompt({
+      workspaceId: "workspace-a",
+      title: "A",
+      prompt: "A",
+      kind: "background",
+      execution: promptExecution(true),
+    });
+    orchestrator.submitPrompt({
+      workspaceId: "workspace-b",
+      title: "B",
+      prompt: "B",
+      kind: "background",
+      execution: promptExecution(true),
+    });
+    await settle();
+    expect(starts).toEqual(["workspace-a:A"]);
+    handles[0]!.resolve();
+    await settle();
+    expect(starts).toEqual(["workspace-a:A", "workspace-b:B"]);
+    handles[1]!.resolve();
+    await settle();
+    await orchestrator.dispose();
+  });
+
+  it("pauses an active run and resumes it as a new attempt", async () => {
+    const store = await createStore();
+    const handles: Array<ReturnType<typeof deferredHandle>> = [];
+    const orchestrator = new TaskOrchestrator({
+      store,
+      workspaceId: "workspace-a",
+      concurrency: 1,
+      executor: async () => {
+        const handle = deferredHandle(`session-${handles.length + 1}`);
+        handles.push(handle);
+        return handle;
+      },
+    });
+    orchestrator.start();
+    const task = orchestrator.submitPrompt({
+      title: "pause-resume",
+      prompt: "pause-resume",
+      kind: "interactive",
+      execution: promptExecution(),
+    });
+    await settle();
+    await orchestrator.pauseTask(task.id);
+    handles[0]!.reject(abortError());
+    await settle();
+    expect(orchestrator.getTask(task.id)?.task.status).toBe("paused");
+    expect(orchestrator.resumeTask(task.id)).toBe(true);
+    await settle();
+    expect(handles).toHaveLength(2);
+    handles[1]!.resolve();
+    await settle();
+    expect(orchestrator.getTask(task.id)?.runs).toHaveLength(2);
+    expect(orchestrator.getTask(task.id)?.task.status).toBe("succeeded");
+    await orchestrator.dispose();
   });
 });
 

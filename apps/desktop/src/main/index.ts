@@ -8,6 +8,7 @@ import {
   dialog,
   ipcMain,
   net,
+  Notification,
   protocol,
   session,
   shell,
@@ -54,7 +55,6 @@ import {
 import {
   agentEventSchema,
   auditRecordSummarySchema,
-  approvalDecisionInputSchema,
   bootstrapStateSchema,
   commandResultSchema,
   clearDataInputSchema,
@@ -85,7 +85,9 @@ import {
   taskEventSchema,
   taskIdInputSchema,
   taskListInputSchema,
-  taskRecordSchema,
+  taskSummarySchema,
+  taskInputResponseSchema,
+  taskApprovalDecisionInputSchema,
   taskSubmissionResultSchema,
   rememberInputSchema,
   removeModelProviderInputSchema,
@@ -116,7 +118,11 @@ protocol.registerSchemesAsPrivileged([{
 }]);
 
 let controller: DesktopController | undefined;
+let taskStore: TaskStore | undefined;
+let taskOrchestrator: TaskOrchestrator | undefined;
+const workspaceControllers = new Map<string, DesktopController>();
 let quitting = false;
+let shutdownComplete = false;
 let updateCheckTimer: NodeJS.Timeout | undefined;
 let appliedUpdateConfiguration = "";
 const { autoUpdater } = electronUpdater;
@@ -148,6 +154,7 @@ class DesktopController {
     paths: DekiPaths,
     memory: MemoryEngine,
     settings: SettingsStore,
+    tasks: TaskOrchestrator,
     recentWorkspaces: string[],
     resumeLatest: boolean,
   ) {
@@ -160,49 +167,7 @@ class DesktopController {
     this.#settings = settings;
     this.#models = new ModelConfigStore(paths.modelsFile);
     this.#checkpoints = workspace ? new GitCheckpointManager(workspace) : undefined;
-    this.#tasks = new TaskOrchestrator({
-      store: new TaskStore(paths.tasksDatabase),
-      workspaceId: scopeId,
-      concurrency: settings.snapshot().effective.agent.maxConcurrentRuns,
-      executor: async ({ task, run, execution, signal }) => {
-        const runtime = this.#runtime;
-        if (!runtime) throw new Error("Agent Runtime 尚未就绪");
-        const promptExecution = execution as PromptExecutionInput;
-        const handle = await runtime.startPrompt({
-          taskId: task.id,
-          runId: run.id,
-          prompt: task.goal,
-          context: {
-            sourceSessionId: promptExecution.sourceSessionId,
-            ...(promptExecution.sourceSessionFile
-              ? { sourceSessionFile: promptExecution.sourceSessionFile }
-              : {}),
-            ...(promptExecution.sourceEntryId
-              ? { sourceEntryId: promptExecution.sourceEntryId }
-              : {}),
-            preferFork: promptExecution.preferFork,
-          },
-        });
-        if (signal.aborted) await handle.cancel();
-        return handle;
-      },
-      onEvent: (event) => {
-        broadcastTaskEvent(event);
-        if (
-          this.#reloadPending
-          && (
-            event.type === "task.succeeded"
-            || event.type === "task.failed"
-            || event.type === "task.cancelled"
-            || event.type === "task.interrupted"
-          )
-        ) {
-          setImmediate(() => {
-            void this.#reloadRuntimeWhenIdle();
-          });
-        }
-      },
-    });
+    this.#tasks = tasks;
     this.#resumeLatest = resumeLatest;
     this.#recentWorkspaces = recentWorkspaces;
     this.#settings.subscribe((snapshot) => {
@@ -213,7 +178,10 @@ class DesktopController {
 
   static async create(
     workspace?: string,
-    options: { resumeLatest?: boolean } = {},
+    options: {
+      resumeLatest?: boolean;
+      tasks?: TaskOrchestrator;
+    } = {},
   ): Promise<DesktopController> {
     const paths = getDekiPaths();
     await ensureDekiDirectories(paths);
@@ -249,6 +217,7 @@ class DesktopController {
       paths,
       memory,
       settings,
+      options.tasks ?? requireTaskOrchestrator(),
       await listRecentWorkspaces(paths.configFile),
       options.resumeLatest === true,
     );
@@ -263,6 +232,14 @@ class DesktopController {
 
   get workspacePath(): string | undefined {
     return this.#workspace;
+  }
+
+  get scopeId(): string {
+    return this.#scopeId;
+  }
+
+  get availableForTasks(): boolean {
+    return this.#trusted && Boolean(this.#runtime?.snapshot().ready);
   }
 
   getState(): BootstrapState {
@@ -323,9 +300,15 @@ class DesktopController {
     }
   }
 
-  async sendPrompt(prompt: string): Promise<TaskSubmissionResult> {
+  async sendPrompt(
+    prompt: string,
+    mode: "foreground" | "background" = "foreground",
+  ): Promise<TaskSubmissionResult> {
     const trimmed = prompt.trim();
     if (trimmed.startsWith("/")) {
+      if (mode === "background") {
+        return { ok: false, error: "会话命令不能在后台运行" };
+      }
       return this.#run(async (runtime) => runtime.prompt(trimmed));
     }
     if (!this.#trusted) {
@@ -339,16 +322,22 @@ class DesktopController {
       const snapshot = runtime.snapshot();
       const sessionId = snapshot.sessionId;
       if (!sessionId) throw new Error("当前会话尚未就绪");
+      if (mode === "foreground" && snapshot.streaming) {
+        return { ok: false, error: "当前会话正在运行，请使用“后台运行”提交新任务" };
+      }
       const hasPending = this.#tasks.listTasks({
         statuses: ["queued", "running", "waiting_approval", "waiting_user"],
+        workspaceIds: [this.#scopeId],
         limit: 500,
       }).some((task) => task.sessionId === sessionId || !task.sessionId);
-      const preferFork = snapshot.streaming || hasPending;
+      const preferFork = mode === "background" || snapshot.streaming || hasPending;
       const context = runtime.capturePromptContext(preferFork);
       const task = this.#tasks.submitPrompt({
+        workspaceId: this.#scopeId,
+        ...(this.#workspace ? { workspacePath: this.#workspace } : {}),
         title: createTaskTitle(trimmed),
         prompt: trimmed,
-        kind: preferFork ? "background" : "interactive",
+        kind: mode === "background" ? "background" : "interactive",
         execution: {
           type: "agent-prompt",
           sourceSessionId: context.sourceSessionId,
@@ -370,7 +359,7 @@ class DesktopController {
   async abort(): Promise<CommandResult> {
     const sessionId = this.#runtime?.snapshot().sessionId;
     const task = sessionId
-      ? this.#tasks.currentTaskForSession(sessionId)
+      ? this.#tasks.currentTaskForSession(this.#scopeId, sessionId)
       : undefined;
     return task
       ? this.cancelTask(task.id)
@@ -378,9 +367,11 @@ class DesktopController {
   }
 
   listTasks(input: TaskListInput) {
-    return this.#tasks.listTasks({
+    return this.#tasks.listTaskSummaries({
       limit: input.limit,
+      workspaceIds: input.workspaceIds ?? [this.#scopeId],
       ...(input.statuses ? { statuses: input.statuses } : {}),
+      ...(input.query ? { query: input.query } : {}),
     });
   }
 
@@ -396,6 +387,46 @@ class DesktopController {
     } catch (error) {
       return { ok: false, error: formatError(error) };
     }
+  }
+
+  async executeTask(input: {
+    task: import("@deki-ai/shared").TaskRecord;
+    run: import("@deki-ai/shared").RunRecord;
+    execution: PromptExecutionInput;
+    signal: AbortSignal;
+  }) {
+    const runtime = this.#runtime;
+    if (!runtime) throw new Error("任务所属工作区 Runtime 尚未就绪");
+    const prompt = input.execution.continuation
+      ? [
+          "继续完成此前任务。先检查当前会话和工作区状态，不要重复已经完成的步骤，",
+          "也不要盲目重放可能产生副作用的工具调用。",
+          "",
+          `原始目标：${input.task.goal}`,
+        ].join("\n")
+      : input.task.goal;
+    const handle = await runtime.startPrompt({
+      taskId: input.task.id,
+      runId: input.run.id,
+      prompt,
+      context: {
+        sourceSessionId: input.execution.sourceSessionId,
+        ...(input.execution.sourceSessionFile
+          ? { sourceSessionFile: input.execution.sourceSessionFile }
+          : {}),
+        ...(input.execution.sourceEntryId
+          ? { sourceEntryId: input.execution.sourceEntryId }
+          : {}),
+        preferFork: input.execution.preferFork,
+      },
+    });
+    if (input.signal.aborted) await handle.cancel();
+    return handle;
+  }
+
+  async openTaskSession(sessionId: string): Promise<CommandResult> {
+    if (this.#runtime?.snapshot().sessionId === sessionId) return { ok: true };
+    return this.switchSession(sessionId);
   }
 
   async newSession(): Promise<CommandResult> {
@@ -557,6 +588,12 @@ class DesktopController {
     return this.#runtime?.respondToApproval(requestId, decision)
       ? { ok: true }
       : { ok: false, error: "审批请求已失效或不存在" };
+  }
+
+  respondToTaskInput(requestId: string, value: string): CommandResult {
+    return this.#runtime?.respondToTaskInput(requestId, value)
+      ? { ok: true }
+      : { ok: false, error: "用户输入请求已失效或不存在" };
   }
 
   async revokeTrust(): Promise<CommandResult> {
@@ -1203,7 +1240,6 @@ class DesktopController {
   }
 
   async dispose(): Promise<void> {
-    await this.#tasks.dispose();
     await this.#runtime?.dispose();
     this.#runtime = undefined;
     this.#memory.close();
@@ -1216,7 +1252,6 @@ class DesktopController {
       this.#reloadPending = true;
       return;
     }
-    this.#tasks.pause();
     await this.#runtime?.dispose();
     this.#runtime = undefined;
     await this.#startRuntime();
@@ -1434,12 +1469,69 @@ async function writeDiagnosticLog(
 
 async function bootstrap(): Promise<void> {
   const workspace = await resolveStartupWorkspace(process.argv);
-  controller = await DesktopController.create(workspace, {
-    resumeLatest: process.argv.includes("--resume"),
-  });
+  await initializeDesktopState(
+    workspace,
+    process.argv.includes("--resume"),
+  );
   registerIpcHandlers();
   await configureAppProtocol();
   createWindow();
+}
+
+async function initializeDesktopState(
+  workspace: string | undefined,
+  resumeLatest = false,
+): Promise<void> {
+  const paths = getDekiPaths();
+  await ensureDekiDirectories(paths);
+  taskStore = new TaskStore(paths.tasksDatabase);
+  taskStore.recoverInterrupted();
+  const knownWorkspaces = await listRecentWorkspaces(paths.configFile);
+  for (const knownWorkspace of [
+    ...knownWorkspaces,
+    ...(workspace && !knownWorkspaces.includes(workspace) ? [workspace] : []),
+  ]) {
+    taskStore.backfillWorkspacePath(workspaceId(knownWorkspace), knownWorkspace);
+  }
+  taskOrchestrator = new TaskOrchestrator({
+    store: taskStore,
+    concurrency: 1,
+    recoverOnStart: false,
+    isWorkspaceAvailable: (task) =>
+      workspaceControllers.get(task.workspaceId)?.availableForTasks ?? false,
+    executor: async (input) => {
+      const host = workspaceControllers.get(input.task.workspaceId);
+      if (!host) throw new Error("任务所属工作区尚未加载");
+      return host.executeTask({
+        ...input,
+        execution: input.execution as PromptExecutionInput,
+      });
+    },
+    onEvent: (event) => {
+      broadcastTaskEvent(event);
+      maybeNotifyTaskEvent(event);
+    },
+  });
+  controller = await getOrCreateController(workspace, {
+    resumeLatest,
+  });
+  taskOrchestrator.setConcurrency(
+    controller.getSettings().effective.agent.maxConcurrentRuns,
+  );
+  await restoreQueuedWorkspaceHosts();
+  taskOrchestrator.start();
+}
+
+async function shutdownDesktopState(): Promise<void> {
+  await taskOrchestrator?.dispose({ closeStore: false });
+  await Promise.allSettled(
+    [...workspaceControllers.values()].map((host) => host.dispose()),
+  );
+  workspaceControllers.clear();
+  taskStore?.close();
+  taskStore = undefined;
+  taskOrchestrator = undefined;
+  controller = undefined;
 }
 
 function createWindow(): BrowserWindow {
@@ -1577,8 +1669,8 @@ function registerIpcHandlers(): void {
   });
   ipcMain.handle(IPC_CHANNELS.sendPrompt, async (event, raw) => {
     assertTrustedSender(event);
-    const { prompt } = sendPromptInputSchema.parse(raw);
-    return taskSubmissionResultSchema.parse(await controller?.sendPrompt(prompt));
+    const { prompt, mode } = sendPromptInputSchema.parse(raw);
+    return taskSubmissionResultSchema.parse(await controller?.sendPrompt(prompt, mode));
   });
   ipcMain.handle(IPC_CHANNELS.abortRun, async (event) => {
     assertTrustedSender(event);
@@ -1587,17 +1679,93 @@ function registerIpcHandlers(): void {
   ipcMain.handle(IPC_CHANNELS.listTasks, (event, raw) => {
     assertTrustedSender(event);
     const input = taskListInputSchema.parse(raw ?? {});
-    return taskRecordSchema.array().parse(controller?.listTasks(input) ?? []);
+    return taskSummarySchema.array().parse(
+      taskOrchestrator?.listTaskSummaries({
+        limit: input.limit,
+        ...(input.statuses ? { statuses: input.statuses } : {}),
+        ...(input.workspaceIds ? { workspaceIds: input.workspaceIds } : {}),
+        ...(input.query ? { query: input.query } : {}),
+      }) ?? [],
+    );
   });
   ipcMain.handle(IPC_CHANNELS.getTask, (event, raw) => {
     assertTrustedSender(event);
     const { taskId } = taskIdInputSchema.parse(raw);
-    return taskDetailSchema.nullable().parse(controller?.getTask(taskId) ?? null);
+    return taskDetailSchema.nullable().parse(taskOrchestrator?.getTask(taskId) ?? null);
   });
   ipcMain.handle(IPC_CHANNELS.cancelTask, async (event, raw) => {
     assertTrustedSender(event);
     const { taskId } = taskIdInputSchema.parse(raw);
-    return commandResultSchema.parse(await controller?.cancelTask(taskId));
+    return commandResultSchema.parse(await runTaskCommand(
+      () => taskOrchestrator?.cancelTask(taskId),
+      "任务不存在或不能取消",
+    ));
+  });
+  ipcMain.handle(IPC_CHANNELS.pauseTask, async (event, raw) => {
+    assertTrustedSender(event);
+    const { taskId } = taskIdInputSchema.parse(raw);
+    return commandResultSchema.parse(await runTaskCommand(
+      () => taskOrchestrator?.pauseTask(taskId),
+      "任务不存在或不能暂停",
+    ));
+  });
+  ipcMain.handle(IPC_CHANNELS.resumeTask, (event, raw) => {
+    assertTrustedSender(event);
+    const { taskId } = taskIdInputSchema.parse(raw);
+    return commandResultSchema.parse(runTaskCommandSync(
+      () => taskOrchestrator?.resumeTask(taskId),
+      "任务不存在或不能恢复",
+    ));
+  });
+  ipcMain.handle(IPC_CHANNELS.retryTask, (event, raw) => {
+    assertTrustedSender(event);
+    const { taskId } = taskIdInputSchema.parse(raw);
+    return commandResultSchema.parse(runTaskCommandSync(
+      () => taskOrchestrator?.retryTask(taskId),
+      "任务不存在或不能重试",
+    ));
+  });
+  ipcMain.handle(IPC_CHANNELS.promoteTask, (event, raw) => {
+    assertTrustedSender(event);
+    const { taskId } = taskIdInputSchema.parse(raw);
+    return commandResultSchema.parse(runTaskCommandSync(
+      () => taskOrchestrator?.promoteTask(taskId),
+      "任务不存在或不能转到后台",
+    ));
+  });
+  ipcMain.handle(IPC_CHANNELS.openTaskSession, async (event, raw) => {
+    assertTrustedSender(event);
+    const { taskId } = taskIdInputSchema.parse(raw);
+    const task = taskOrchestrator?.getTask(taskId)?.task;
+    if (!task?.sessionId) {
+      return commandResultSchema.parse({ ok: false, error: "任务尚未绑定会话" });
+    }
+    if (task.workspaceId !== "general" && !task.workspacePath) {
+      return commandResultSchema.parse({
+        ok: false,
+        error: "任务所属项目路径不可用，无法打开会话",
+      });
+    }
+    try {
+      const host = await getOrCreateController(task.workspacePath);
+      controller = host;
+      return commandResultSchema.parse(await host.openTaskSession(task.sessionId));
+    } catch (error) {
+      return commandResultSchema.parse({ ok: false, error: formatError(error) });
+    }
+  });
+  ipcMain.handle(IPC_CHANNELS.respondToTaskInput, async (event, raw) => {
+    assertTrustedSender(event);
+    const input = taskInputResponseSchema.parse(raw);
+    const task = taskOrchestrator?.getTask(input.taskId)?.task;
+    const host = task ? workspaceControllers.get(task.workspaceId) : undefined;
+    if (!task || !host || !await taskOrchestrator?.acquireResumeSlot(task.id)) {
+      return commandResultSchema.parse({ ok: false, error: "任务输入请求已失效" });
+    }
+    return commandResultSchema.parse(host.respondToTaskInput(
+      input.requestId,
+      input.value,
+    ));
   });
   ipcMain.handle(IPC_CHANNELS.newSession, async (event) => {
     assertTrustedSender(event);
@@ -1714,19 +1882,30 @@ function registerIpcHandlers(): void {
   });
   ipcMain.handle(IPC_CHANNELS.respondToApproval, async (event, raw) => {
     assertTrustedSender(event);
-    const input = approvalDecisionInputSchema.parse(raw);
-    return commandResultSchema.parse(
-      controller?.respondToApproval(input.requestId, input.decision)
-        ?? { ok: false, error: "Runtime 尚未就绪" },
-    );
+    const input = taskApprovalDecisionInputSchema.parse(raw);
+    const task = input.taskId
+      ? taskOrchestrator?.getTask(input.taskId)?.task
+      : undefined;
+    const host = task
+      ? workspaceControllers.get(task.workspaceId)
+      : controller;
+    if (task && !await taskOrchestrator?.acquireResumeSlot(task.id)) {
+      return commandResultSchema.parse({ ok: false, error: "审批请求已失效" });
+    }
+    return commandResultSchema.parse(host?.respondToApproval(
+      input.requestId,
+      input.decision,
+    ) ?? { ok: false, error: "Runtime 尚未就绪" });
   });
   ipcMain.handle(IPC_CHANNELS.revokeWorkspaceTrust, async (event) => {
     assertTrustedSender(event);
     const result = await controller?.revokeTrust()
       ?? { ok: false, error: "Runtime 尚未就绪" };
     if (result.ok) {
-      await controller?.dispose();
-      controller = await DesktopController.create();
+      const previous = controller;
+      if (previous) workspaceControllers.delete(previous.scopeId);
+      await previous?.dispose();
+      controller = await getOrCreateController(undefined);
     }
     return commandResultSchema.parse(result);
   });
@@ -1941,8 +2120,7 @@ function registerIpcHandlers(): void {
         });
     if (confirmation.response !== 1) return commandResultSchema.parse({ ok: true });
     const paths = getDekiPaths();
-    await controller?.dispose();
-    controller = undefined;
+    await shutdownDesktopState();
     try {
       await shell.trashItem(paths.root);
     } catch {
@@ -1994,11 +2172,10 @@ function registerIpcHandlers(): void {
         : category === "tasks"
           ? resolve(paths.tasksDatabase, "..")
           : paths.logsRoot;
-    await controller?.dispose();
-    controller = undefined;
+    await shutdownDesktopState();
     await moveToTrashOrBackup(target);
     await ensureDekiDirectories(paths);
-    controller = await DesktopController.create(workspace);
+    await initializeDesktopState(workspace);
     return commandResultSchema.parse({ ok: true });
   });
 }
@@ -2029,8 +2206,16 @@ async function switchToWorkspace(
   options: { trustSelectedWorkspace?: boolean } = {},
 ): Promise<CommandResult> {
   try {
-    await controller?.dispose();
-    controller = await DesktopController.create(workspace);
+    if (controller && controller.workspacePath !== workspace) {
+      const sessionId = controller.getState().sessionId;
+      const activeTask = sessionId
+        ? taskOrchestrator?.currentTaskForSession(controller.scopeId, sessionId)
+        : undefined;
+      if (activeTask?.kind === "interactive") {
+        taskOrchestrator?.promoteTask(activeTask.id);
+      }
+    }
+    controller = await getOrCreateController(workspace);
     if (
       workspace
       && options.trustSelectedWorkspace
@@ -2041,6 +2226,70 @@ async function switchToWorkspace(
     return { ok: true };
   } catch (error) {
     return { ok: false, error: formatError(error) };
+  }
+}
+
+function requireTaskOrchestrator(): TaskOrchestrator {
+  if (!taskOrchestrator) throw new Error("Task Orchestrator 尚未初始化");
+  return taskOrchestrator;
+}
+
+function controllerKey(workspace: string | undefined): string {
+  return workspace ? workspaceId(workspace) : "general";
+}
+
+async function getOrCreateController(
+  workspace: string | undefined,
+  options: { resumeLatest?: boolean } = {},
+): Promise<DesktopController> {
+  const key = controllerKey(workspace);
+  const existing = workspaceControllers.get(key);
+  if (existing) return existing;
+  const created = await DesktopController.create(workspace, {
+    ...options,
+    tasks: requireTaskOrchestrator(),
+  });
+  workspaceControllers.set(key, created);
+  taskOrchestrator?.start();
+  return created;
+}
+
+async function restoreQueuedWorkspaceHosts(): Promise<void> {
+  const queued = requireTaskOrchestrator().listTaskSummaries({
+    statuses: ["queued"],
+    limit: 500,
+  });
+  const workspaces = [...new Set(
+    queued.map((summary) => summary.task.workspacePath).filter(
+      (workspace): workspace is string => Boolean(workspace),
+    ),
+  )];
+  await Promise.allSettled(workspaces.map(async (workspace) => {
+    if (await isWorkspaceTrusted(getDekiPaths().configFile, workspace)) {
+      await getOrCreateController(workspace);
+    }
+  }));
+}
+
+async function runTaskCommand(
+  operation: () => Promise<boolean> | undefined,
+  error: string,
+): Promise<CommandResult> {
+  try {
+    return await operation() ? { ok: true } : { ok: false, error };
+  } catch (reason) {
+    return { ok: false, error: formatError(reason) };
+  }
+}
+
+function runTaskCommandSync(
+  operation: () => boolean | undefined,
+  error: string,
+): CommandResult {
+  try {
+    return operation() ? { ok: true } : { ok: false, error };
+  } catch (reason) {
+    return { ok: false, error: formatError(reason) };
   }
 }
 
@@ -2073,6 +2322,35 @@ function broadcastTaskEvent(raw: TaskEvent): void {
       window.webContents.send(IPC_CHANNELS.taskEvent, event);
     }
   }
+}
+
+function maybeNotifyTaskEvent(event: TaskEvent): void {
+  if (quitting) return;
+  const detail = taskOrchestrator?.getTask(event.taskId);
+  if (!detail || !Notification.isSupported()) return;
+  const task = detail.task;
+  const attention = event.type === "task.waiting_approval"
+    || event.type === "task.waiting_user";
+  const backgroundSuccess = event.type === "task.succeeded"
+    && task.kind === "background";
+  const abnormal = event.type === "task.failed" || event.type === "task.interrupted";
+  if (!attention && !backgroundSuccess && !abnormal) return;
+  const body = attention
+    ? "任务需要你的处理"
+    : event.type === "task.succeeded"
+      ? "后台任务已完成"
+      : event.type === "task.failed"
+        ? "任务执行失败"
+        : "任务已中断";
+  const notification = new Notification({ title: task.title, body });
+  notification.on("click", () => {
+    let window = BrowserWindow.getAllWindows()[0];
+    if (!window || window.isDestroyed()) window = createWindow();
+    window.show();
+    window.focus();
+    window.webContents.send(IPC_CHANNELS.openTask, task.id);
+  });
+  notification.show();
 }
 
 function broadcastSettings(raw: SettingsSnapshot): void {
@@ -2374,9 +2652,14 @@ app.on("window-all-closed", () => {
   }
 });
 
-app.on("before-quit", () => {
+app.on("before-quit", (event) => {
+  if (shutdownComplete) return;
+  event.preventDefault();
   quitting = true;
-  void controller?.dispose();
+  void shutdownDesktopState().finally(() => {
+    shutdownComplete = true;
+    app.quit();
+  });
 });
 
 app.on("activate", () => {

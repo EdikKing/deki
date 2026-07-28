@@ -8,6 +8,9 @@ import {
   taskEventSchema,
   taskListInputSchema,
   taskRecordSchema,
+  taskRequestRecordSchema,
+  taskSummarySchema,
+  taskInputResponseSchema,
   taskSubmissionResultSchema,
   updateSessionConfigurationInputSchema,
 } from "./index";
@@ -36,6 +39,13 @@ describe("shared IPC schemas", () => {
 
   it("rejects empty prompts", () => {
     expect(() => sendPromptInputSchema.parse({ prompt: "   " })).toThrow();
+    expect(sendPromptInputSchema.parse({ prompt: "分析项目" })).toMatchObject({
+      mode: "foreground",
+    });
+    expect(sendPromptInputSchema.parse({
+      prompt: "分析项目",
+      mode: "background",
+    }).mode).toBe("background");
   });
 
   it("validates task records, events, and submission results", () => {
@@ -62,6 +72,25 @@ describe("shared IPC schemas", () => {
       payload: {},
     }).sequence).toBe(1);
     expect(taskListInputSchema.parse({})).toEqual({ limit: 100 });
+    expect(taskSummarySchema.parse({
+      task,
+      pendingRequestCount: 0,
+    }).task.id).toBe(task.id);
+    expect(taskRequestRecordSchema.parse({
+      id: "request-1",
+      taskId: task.id,
+      runId: "25874e8e-00b8-4e39-9843-6ebda59f6ca7",
+      kind: "user_input",
+      status: "pending",
+      title: "选择方案",
+      payload: { options: ["A", "B"] },
+      createdAt: "2026-07-28T00:00:00.000Z",
+    }).status).toBe("pending");
+    expect(taskInputResponseSchema.parse({
+      taskId: task.id,
+      requestId: "request-1",
+      value: "A",
+    }).value).toBe("A");
     expect(() => taskListInputSchema.parse({ limit: 501 })).toThrow();
   });
 

@@ -105,6 +105,7 @@ export interface AgentPromptRunHandle {
   modelId?: string;
   completion: Promise<void>;
   cancel(): Promise<void>;
+  captureContext(): AgentPromptContext & { type: "agent-prompt" };
 }
 
 type ModelType = Model<any>;
@@ -160,6 +161,11 @@ export class DekiAgentRuntime {
   readonly #backgroundUnsubscribers = new Map<AgentSessionRuntime, () => void>();
   readonly #runContextsBySession = new Map<string, AgentExecutionContext>();
   readonly #runCancellers = new Map<string, () => Promise<void>>();
+  readonly #userInputRequests = new Map<string, {
+    execution: AgentExecutionContext;
+    resolve: (value: string) => void;
+    reject: (error: Error) => void;
+  }>();
   readonly #executionContext = new AsyncLocalStorage<AgentExecutionContext>();
 
   constructor(options: DekiAgentRuntimeOptions) {
@@ -308,6 +314,9 @@ export class DekiAgentRuntime {
         );
       }
     }
+    await this.#gateway.register(new TaskInteractionProvider(
+      (input, context) => this.#requestUserInput(input, context),
+    ));
 
     this.#modelRuntime = await ModelRuntime.create({
       credentials: new InMemoryCredentialStore(),
@@ -486,6 +495,17 @@ export class DekiAgentRuntime {
       ...(runtime.session.model?.id ? { modelId: runtime.session.model.id } : {}),
       completion,
       cancel,
+      captureContext: () => ({
+        type: "agent-prompt",
+        sourceSessionId: runtime.session.sessionId,
+        ...(runtime.session.sessionFile
+          ? { sourceSessionFile: runtime.session.sessionFile }
+          : {}),
+        ...(runtime.session.sessionManager.getLeafId()
+          ? { sourceEntryId: runtime.session.sessionManager.getLeafId()! }
+          : {}),
+        preferFork: true,
+      }),
     };
   }
 
@@ -873,6 +893,21 @@ export class DekiAgentRuntime {
     return this.#permissions?.respond(requestId, decision) ?? false;
   }
 
+  respondToTaskInput(requestId: string, value: string): boolean {
+    const pending = this.#userInputRequests.get(requestId);
+    if (!pending) return false;
+    this.#userInputRequests.delete(requestId);
+    this.#executionContext.run(pending.execution, () => {
+      this.#emit({
+        type: "user_input.resolved",
+        requestId,
+        value,
+      });
+    });
+    pending.resolve(value);
+    return true;
+  }
+
   async dispose(): Promise<void> {
     this.#sessionEvents.dispose();
     this.#permissions?.dispose();
@@ -891,6 +926,10 @@ export class DekiAgentRuntime {
     this.#runCancellers.clear();
     this.#sessionModels.clear();
     this.#sessionPermissionPolicies.clear();
+    for (const pending of this.#userInputRequests.values()) {
+      pending.reject(new Error("Runtime 已关闭"));
+    }
+    this.#userInputRequests.clear();
     await this.#gateway.dispose();
     await this.#options.mcpManager.dispose();
   }
@@ -1018,6 +1057,17 @@ export class DekiAgentRuntime {
         : {}),
       completion,
       cancel,
+      captureContext: () => ({
+        type: "agent-prompt",
+        sourceSessionId: background.session.sessionId,
+        ...(background.session.sessionFile
+          ? { sourceSessionFile: background.session.sessionFile }
+          : {}),
+        ...(background.session.sessionManager.getLeafId()
+          ? { sourceEntryId: background.session.sessionManager.getLeafId()! }
+          : {}),
+        preferFork: true,
+      }),
     };
   }
 
@@ -1131,7 +1181,7 @@ export class DekiAgentRuntime {
 
       const tools = this.#projectFeaturesEnabled()
         ? this.#gateway.listTools()
-        : [];
+        : this.#gateway.listTools().filter((tool) => tool.providerId === "interaction");
       this.#runtimeToolSignature = toolDefinitionSignature(tools);
       return {
         ...await createAgentSessionFromServices({
@@ -1139,9 +1189,7 @@ export class DekiAgentRuntime {
           sessionManager,
           ...(sessionStartEvent ? { sessionStartEvent } : {}),
           model: sessionModel,
-          tools: this.#projectFeaturesEnabled()
-            ? tools.map((tool) => tool.modelName)
-            : [],
+          tools: tools.map((tool) => tool.modelName),
           customTools: tools.map((tool) =>
             this.#toPiTool(tool, () => sessionManager.getSessionId())),
         }),
@@ -1280,7 +1328,9 @@ export class DekiAgentRuntime {
           workspace: this.#options.workspace,
           ...(signal ? { signal } : {}),
         };
-        const permissionControlled = tool.providerId !== "workspace" && tool.providerId !== "deki";
+        const permissionControlled = tool.providerId !== "workspace"
+          && tool.providerId !== "deki"
+          && tool.providerId !== "interaction";
         if (permissionControlled) {
           const readOnly = tool.readOnlyHint === true;
           const policy = this.#options.settings.mcp.toolPolicies[tool.internalName]
@@ -1332,6 +1382,41 @@ export class DekiAgentRuntime {
           : execute();
       },
     });
+  }
+
+  async #requestUserInput(
+    input: TaskInteractionInput,
+    context: ToolCallContext,
+  ): Promise<string> {
+    const execution = this.#executionContext.getStore();
+    if (!execution) throw new Error("用户输入 Tool 只能在任务运行中调用");
+    const requestId = context.callId;
+    const value = await new Promise<string>((resolve, reject) => {
+      const abort = () => {
+        this.#userInputRequests.delete(requestId);
+        const error = new Error("用户输入请求已取消");
+        error.name = "AbortError";
+        reject(error);
+      };
+      if (context.signal?.aborted) return abort();
+      context.signal?.addEventListener("abort", abort, { once: true });
+      this.#userInputRequests.set(requestId, {
+        execution,
+        resolve: (answer) => {
+          context.signal?.removeEventListener("abort", abort);
+          resolve(answer);
+        },
+        reject,
+      });
+      this.#emit({
+        type: "user_input.requested",
+        requestId,
+        title: input.question,
+        ...(input.description ? { description: input.description } : {}),
+        ...(input.options?.length ? { options: input.options } : {}),
+      });
+    });
+    return value;
   }
 
   #bindSession(session: AgentSessionRuntime["session"]): void {
@@ -1809,6 +1894,83 @@ class ProjectInfoProvider implements CapabilityProvider {
         }, null, 2),
       }],
       details: { readOnly: true },
+    };
+  }
+
+  async healthCheck() {
+    return { state: "ready" as const };
+  }
+
+  async dispose(): Promise<void> {}
+}
+
+interface TaskInteractionInput {
+  question: string;
+  description?: string;
+  options?: string[];
+}
+
+class TaskInteractionProvider implements CapabilityProvider {
+  readonly id = "interaction";
+  readonly #request: (
+    input: TaskInteractionInput,
+    context: ToolCallContext,
+  ) => Promise<string>;
+
+  constructor(
+    request: (
+      input: TaskInteractionInput,
+      context: ToolCallContext,
+    ) => Promise<string>,
+  ) {
+    this.#request = request;
+  }
+
+  async listTools(): Promise<ToolDefinition[]> {
+    return [{
+      name: "request_user_input",
+      description: "当继续任务必须由用户选择或补充信息时，暂停当前任务并请求用户回答。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          question: { type: "string", minLength: 1, maxLength: 500 },
+          description: { type: "string", maxLength: 10_000 },
+          options: {
+            type: "array",
+            items: { type: "string", minLength: 1, maxLength: 500 },
+            maxItems: 20,
+          },
+        },
+        required: ["question"],
+        additionalProperties: false,
+      },
+      readOnlyHint: true,
+      timeoutMs: 86_400_000,
+    }];
+  }
+
+  async callTool(
+    name: string,
+    input: unknown,
+    context: ToolCallContext,
+  ): Promise<ToolResult> {
+    if (name !== "request_user_input") throw new Error(`未知交互 Tool: ${name}`);
+    const raw = input as Partial<TaskInteractionInput>;
+    if (typeof raw.question !== "string" || !raw.question.trim()) {
+      throw new Error("question 不能为空");
+    }
+    const value = await this.#request({
+      question: raw.question.trim(),
+      ...(typeof raw.description === "string" && raw.description.trim()
+        ? { description: raw.description.trim() }
+        : {}),
+      ...(Array.isArray(raw.options)
+        ? { options: raw.options.filter((item): item is string => typeof item === "string") }
+        : {}),
+    }, context);
+    return {
+      content: [{ type: "text", text: value }],
+      details: { userProvided: true },
     };
   }
 

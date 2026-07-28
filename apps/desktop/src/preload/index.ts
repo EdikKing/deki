@@ -32,8 +32,10 @@ import {
   taskEventSchema,
   taskIdInputSchema,
   taskListInputSchema,
-  taskRecordSchema,
+  taskSummarySchema,
   taskSubmissionResultSchema,
+  promptSubmissionOptionsSchema,
+  taskInputResponseSchema,
   settingsPatchSchema,
   settingsScopeSchema,
   settingsSnapshotSchema,
@@ -67,9 +69,13 @@ const api: DekiDesktopApi = {
       await ipcRenderer.invoke(IPC_CHANNELS.trustWorkspace),
     );
   },
-  async sendPrompt(prompt) {
+  async sendPrompt(prompt, options) {
+    const parsedOptions = promptSubmissionOptionsSchema.parse(options ?? {});
     return taskSubmissionResultSchema.parse(
-      await ipcRenderer.invoke(IPC_CHANNELS.sendPrompt, { prompt }),
+      await ipcRenderer.invoke(IPC_CHANNELS.sendPrompt, {
+        prompt,
+        mode: parsedOptions.mode,
+      }),
     );
   },
   async abortRun() {
@@ -78,7 +84,7 @@ const api: DekiDesktopApi = {
     );
   },
   async listTasks(input) {
-    return taskRecordSchema.array().parse(
+    return taskSummarySchema.array().parse(
       await ipcRenderer.invoke(
         IPC_CHANNELS.listTasks,
         taskListInputSchema.parse(input ?? {}),
@@ -98,6 +104,54 @@ const api: DekiDesktopApi = {
       await ipcRenderer.invoke(
         IPC_CHANNELS.cancelTask,
         taskIdInputSchema.parse({ taskId }),
+      ),
+    );
+  },
+  async pauseTask(taskId) {
+    return commandResultSchema.parse(
+      await ipcRenderer.invoke(
+        IPC_CHANNELS.pauseTask,
+        taskIdInputSchema.parse({ taskId }),
+      ),
+    );
+  },
+  async resumeTask(taskId) {
+    return commandResultSchema.parse(
+      await ipcRenderer.invoke(
+        IPC_CHANNELS.resumeTask,
+        taskIdInputSchema.parse({ taskId }),
+      ),
+    );
+  },
+  async retryTask(taskId) {
+    return commandResultSchema.parse(
+      await ipcRenderer.invoke(
+        IPC_CHANNELS.retryTask,
+        taskIdInputSchema.parse({ taskId }),
+      ),
+    );
+  },
+  async promoteTask(taskId) {
+    return commandResultSchema.parse(
+      await ipcRenderer.invoke(
+        IPC_CHANNELS.promoteTask,
+        taskIdInputSchema.parse({ taskId }),
+      ),
+    );
+  },
+  async openTaskSession(taskId) {
+    return commandResultSchema.parse(
+      await ipcRenderer.invoke(
+        IPC_CHANNELS.openTaskSession,
+        taskIdInputSchema.parse({ taskId }),
+      ),
+    );
+  },
+  async respondToTaskInput(taskId, requestId, value) {
+    return commandResultSchema.parse(
+      await ipcRenderer.invoke(
+        IPC_CHANNELS.respondToTaskInput,
+        taskInputResponseSchema.parse({ taskId, requestId, value }),
       ),
     );
   },
@@ -244,11 +298,12 @@ const api: DekiDesktopApi = {
       ),
     );
   },
-  async respondToApproval(requestId, decision) {
+  async respondToApproval(requestId, decision, taskId) {
     return commandResultSchema.parse(
       await ipcRenderer.invoke(IPC_CHANNELS.respondToApproval, {
         requestId,
         decision,
+        ...(taskId ? { taskId } : {}),
       }),
     );
   },
@@ -466,6 +521,13 @@ const api: DekiDesktopApi = {
     };
     ipcRenderer.on(IPC_CHANNELS.taskEvent, handler);
     return () => ipcRenderer.removeListener(IPC_CHANNELS.taskEvent, handler);
+  },
+  subscribeOpenTask(listener) {
+    const wrapped = (_event: Electron.IpcRendererEvent, taskId: unknown) => {
+      if (typeof taskId === "string") listener(taskId);
+    };
+    ipcRenderer.on(IPC_CHANNELS.openTask, wrapped);
+    return () => ipcRenderer.removeListener(IPC_CHANNELS.openTask, wrapped);
   },
 };
 

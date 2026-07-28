@@ -309,6 +309,7 @@ export type TaskKind = z.infer<typeof taskKindSchema>;
 export const taskRecordSchema = z.object({
   id: z.string().uuid(),
   workspaceId: z.string().min(1),
+  workspacePath: z.string().min(1).optional(),
   rootTaskId: z.string().uuid(),
   parentTaskId: z.string().uuid().optional(),
   kind: taskKindSchema,
@@ -325,6 +326,32 @@ export const taskRecordSchema = z.object({
   completedAt: z.string().datetime().optional(),
 }).strict();
 export type TaskRecord = z.infer<typeof taskRecordSchema>;
+
+export const taskRequestKindSchema = z.enum(["approval", "user_input"]);
+export type TaskRequestKind = z.infer<typeof taskRequestKindSchema>;
+
+export const taskRequestStatusSchema = z.enum([
+  "pending",
+  "resolved",
+  "cancelled",
+  "expired",
+]);
+export type TaskRequestStatus = z.infer<typeof taskRequestStatusSchema>;
+
+export const taskRequestRecordSchema = z.object({
+  id: z.string().min(1),
+  taskId: z.string().uuid(),
+  runId: z.string().uuid(),
+  kind: taskRequestKindSchema,
+  status: taskRequestStatusSchema,
+  title: z.string().min(1).max(500),
+  description: z.string().max(10_000).optional(),
+  payload: z.record(z.string(), z.unknown()),
+  response: z.unknown().optional(),
+  createdAt: z.string().datetime(),
+  resolvedAt: z.string().datetime().optional(),
+}).strict();
+export type TaskRequestRecord = z.infer<typeof taskRequestRecordSchema>;
 
 export const runStatusSchema = z.enum([
   "queued",
@@ -390,6 +417,8 @@ export const taskEventTypeSchema = z.enum([
   "task.waiting_approval",
   "task.waiting_user",
   "task.paused",
+  "task.pause_requested",
+  "task.promoted",
   "task.resumed",
   "task.succeeded",
   "task.failed",
@@ -402,6 +431,8 @@ export const taskEventTypeSchema = z.enum([
   "run.cancelled",
   "run.interrupted",
   "artifact.created",
+  "user_input.requested",
+  "user_input.resolved",
 ]);
 export type TaskEventType = z.infer<typeof taskEventTypeSchema>;
 
@@ -422,8 +453,18 @@ export const taskDetailSchema = z.object({
   runs: z.array(runRecordSchema),
   artifacts: z.array(artifactRecordSchema),
   events: z.array(taskEventSchema),
+  requests: z.array(taskRequestRecordSchema).default([]),
 }).strict();
 export type TaskDetail = z.infer<typeof taskDetailSchema>;
+
+export const taskSummarySchema = z.object({
+  task: taskRecordSchema,
+  currentRun: runRecordSchema.optional(),
+  pendingRequestCount: z.number().int().nonnegative(),
+  resultSummary: z.string().optional(),
+  error: z.string().optional(),
+}).strict();
+export type TaskSummary = z.infer<typeof taskSummarySchema>;
 
 export const bootstrapStateSchema = z.object({
   workspace: z.string().optional(),
@@ -560,6 +601,20 @@ export const agentEventSchema = z.discriminatedUnion("type", [
   }),
   z.object({
     ...eventBase,
+    type: z.literal("user_input.requested"),
+    requestId: z.string(),
+    title: z.string(),
+    description: z.string().optional(),
+    options: z.array(z.string()).max(20).optional(),
+  }),
+  z.object({
+    ...eventBase,
+    type: z.literal("user_input.resolved"),
+    requestId: z.string(),
+    value: z.string(),
+  }),
+  z.object({
+    ...eventBase,
     type: z.literal("diff.available"),
     callId: z.string(),
     diff: z.string(),
@@ -586,7 +641,8 @@ export const trustWorkspaceInputSchema = z.object({
 
 export const sendPromptInputSchema = z.object({
   prompt: z.string().trim().min(1).max(100_000),
-});
+  mode: z.enum(["foreground", "background"]).default("foreground"),
+}).strict();
 
 export const rememberInputSchema = z.object({
   content: z.string().trim().min(1).max(10_000),
@@ -774,12 +830,28 @@ export type TaskSubmissionResult = z.infer<typeof taskSubmissionResultSchema>;
 
 export const taskListInputSchema = z.object({
   statuses: z.array(taskStatusSchema).max(taskStatusSchema.options.length).optional(),
+  workspaceIds: z.array(z.string().min(1)).max(100).optional(),
+  query: z.string().trim().max(500).optional(),
   limit: z.number().int().min(1).max(500).default(100),
 }).strict();
 export type TaskListInput = z.infer<typeof taskListInputSchema>;
 
 export const taskIdInputSchema = z.object({
   taskId: z.string().uuid(),
+}).strict();
+
+export const promptSubmissionOptionsSchema = z.object({
+  mode: z.enum(["foreground", "background"]).default("foreground"),
+}).strict();
+export type PromptSubmissionOptions = z.infer<typeof promptSubmissionOptionsSchema>;
+
+export const taskInputResponseSchema = taskIdInputSchema.extend({
+  requestId: z.string().min(1),
+  value: z.string().trim().min(1).max(100_000),
+}).strict();
+
+export const taskApprovalDecisionInputSchema = approvalDecisionInputSchema.extend({
+  taskId: z.string().uuid().optional(),
 }).strict();
 
 export const IPC_CHANNELS = {
@@ -793,6 +865,12 @@ export const IPC_CHANNELS = {
   listTasks: "deki:list-tasks",
   getTask: "deki:get-task",
   cancelTask: "deki:cancel-task",
+  pauseTask: "deki:pause-task",
+  resumeTask: "deki:resume-task",
+  retryTask: "deki:retry-task",
+  promoteTask: "deki:promote-task",
+  openTaskSession: "deki:open-task-session",
+  respondToTaskInput: "deki:respond-to-task-input",
   newSession: "deki:new-session",
   listSessions: "deki:list-sessions",
   getSessionHistory: "deki:get-session-history",
@@ -849,6 +927,7 @@ export const IPC_CHANNELS = {
   settingsChanged: "deki:settings-changed",
   agentEvent: "deki:agent-event",
   taskEvent: "deki:task-event",
+  openTask: "deki:open-task",
 } as const;
 
 export interface DekiDesktopApi {
@@ -857,11 +936,24 @@ export interface DekiDesktopApi {
   openWorkspace(workspace: string): Promise<CommandResult>;
   openGeneralChat(): Promise<CommandResult>;
   trustWorkspace(): Promise<CommandResult>;
-  sendPrompt(prompt: string): Promise<TaskSubmissionResult>;
+  sendPrompt(
+    prompt: string,
+    options?: Partial<PromptSubmissionOptions>,
+  ): Promise<TaskSubmissionResult>;
   abortRun(): Promise<CommandResult>;
-  listTasks(input?: Partial<TaskListInput>): Promise<TaskRecord[]>;
+  listTasks(input?: Partial<TaskListInput>): Promise<TaskSummary[]>;
   getTask(taskId: string): Promise<TaskDetail | null>;
   cancelTask(taskId: string): Promise<CommandResult>;
+  pauseTask(taskId: string): Promise<CommandResult>;
+  resumeTask(taskId: string): Promise<CommandResult>;
+  retryTask(taskId: string): Promise<CommandResult>;
+  promoteTask(taskId: string): Promise<CommandResult>;
+  openTaskSession(taskId: string): Promise<CommandResult>;
+  respondToTaskInput(
+    taskId: string,
+    requestId: string,
+    value: string,
+  ): Promise<CommandResult>;
   newSession(): Promise<CommandResult>;
   listSessions(query?: string): Promise<SessionSummary[]>;
   getSessionHistory(): Promise<ConversationMessage[]>;
@@ -895,6 +987,7 @@ export interface DekiDesktopApi {
   respondToApproval(
     requestId: string,
     decision: "allow_once" | "allow_session" | "allow_project" | "deny",
+    taskId?: string,
   ): Promise<CommandResult>;
   revokeWorkspaceTrust(): Promise<CommandResult>;
   exportDiagnostics(): Promise<CommandResult>;
@@ -935,6 +1028,7 @@ export interface DekiDesktopApi {
   subscribeSettings(listener: (settings: SettingsSnapshot) => void): () => void;
   subscribeAgentEvents(listener: (event: AgentEvent) => void): () => void;
   subscribeTaskEvents(listener: (event: TaskEvent) => void): () => void;
+  subscribeOpenTask(listener: (taskId: string) => void): () => void;
 }
 
 export interface ToolDefinition {

@@ -11,7 +11,7 @@ const createdAt = "2026-01-01T00:00:00.000Z";
 
 mkdirSync(root, { recursive: true });
 
-for (const version of [1, 2, 3, 4]) {
+for (const version of [1, 2, 3, 4, 5]) {
   const path = join(root, `tasks-v${version}.db`);
   rmSync(path, { force: true });
   const database = new DatabaseSync(path);
@@ -20,6 +20,7 @@ for (const version of [1, 2, 3, 4]) {
   if (version >= 2) migrateToV2(database);
   if (version >= 3) migrateToV3(database);
   if (version >= 4) migrateToV4(database);
+  if (version >= 5) migrateToV5(database);
   seedVersionData(database, version);
   database.exec(`PRAGMA user_version = ${version}`);
   database.close();
@@ -129,6 +130,47 @@ function migrateToV4(database) {
     ALTER TABLE plans ADD COLUMN replan_reason TEXT;
     ALTER TABLE plans ADD COLUMN affected_step_ids_json TEXT NOT NULL DEFAULT '[]';
     ALTER TABLE plans ADD COLUMN replan_evidence_json TEXT NOT NULL DEFAULT '[]';
+  `);
+}
+
+function migrateToV5(database) {
+  database.exec(`
+    CREATE TABLE worker_delegations (
+      id TEXT PRIMARY KEY,
+      parent_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      parent_run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+      tool_call_id TEXT NOT NULL,
+      status TEXT NOT NULL,
+      context_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      completed_at TEXT,
+      UNIQUE(parent_run_id, tool_call_id)
+    );
+    CREATE TABLE worker_delegation_tasks (
+      delegation_id TEXT NOT NULL REFERENCES worker_delegations(id) ON DELETE CASCADE,
+      task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      PRIMARY KEY(delegation_id, task_id)
+    );
+    CREATE TABLE worker_results (
+      task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+      result_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY(task_id, run_id)
+    );
+    CREATE TABLE task_budgets (
+      task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+      budget_json TEXT NOT NULL,
+      workers INTEGER NOT NULL DEFAULT 0,
+      duration_ms INTEGER NOT NULL DEFAULT 0,
+      input_tokens INTEGER NOT NULL DEFAULT 0,
+      output_tokens INTEGER NOT NULL DEFAULT 0,
+      tool_calls INTEGER NOT NULL DEFAULT 0,
+      warning_emitted INTEGER NOT NULL DEFAULT 0,
+      exceeded INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX worker_delegations_parent_idx
+      ON worker_delegations(parent_task_id, status, created_at);
   `);
 }
 

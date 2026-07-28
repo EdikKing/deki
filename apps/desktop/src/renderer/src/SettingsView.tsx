@@ -291,7 +291,7 @@ export function SettingsView(props: {
               setError={setError}
             />
           )}
-          {section === "agent" && <AgentSettings value={value} source={source} zh={zh} update={update} />}
+          {section === "agent" && <AgentSettings value={value} source={source} zh={zh} update={update} providers={providers} />}
           {section === "workspace" && (
             <WorkspaceSettings
               value={value}
@@ -817,12 +817,24 @@ function ProviderManager(props: {
   </div>;
 }
 
-function AgentSettings({ value, source, zh, update }: SettingsComponentProps) {
+function AgentSettings({ value, source, zh, update, providers }: SettingsComponentProps & {
+  providers: RedactedModelProvider[];
+}) {
+  const modelOptions = providers.filter((provider) => provider.enabled !== false).flatMap((provider) => provider.models.map((model) => ({
+    value: `${provider.id}/${model.id}`,
+    label: `${model.name ?? model.id} · ${provider.name ?? provider.id}`,
+  })));
   return <>
     <Toggle title={zh ? "自动命名会话" : "Auto-name sessions"} path="agent.autoNameSessions" checked={value.agent.autoNameSessions} source={source} onChange={(autoNameSessions) => update({ agent: { autoNameSessions } })} />
     <Toggle title={zh ? "上下文压缩" : "Context compaction"} path="agent.compactionEnabled" checked={value.agent.compactionEnabled} source={source} onChange={(compactionEnabled) => update({ agent: { compactionEnabled } })} />
     <Range title={zh ? "压缩触发阈值（Tokens）" : "Compaction threshold (tokens)"} path="agent.compactionThreshold" value={value.agent.compactionThreshold} min={1000} max={1000000} step={1000} source={source} onChange={(compactionThreshold) => update({ agent: { compactionThreshold } })} />
     <Range title={zh ? "最大并发运行数" : "Maximum concurrent runs"} path="agent.maxConcurrentRuns" value={value.agent.maxConcurrentRuns} min={1} max={8} source={source} onChange={(maxConcurrentRuns) => update({ agent: { maxConcurrentRuns } })} />
+    <Range title={zh ? "每个任务最多 Worker" : "Maximum workers per task"} path="agent.workerMaxPerRoot" value={value.agent.workerMaxPerRoot} min={1} max={4} source={source} onChange={(workerMaxPerRoot) => update({ agent: { workerMaxPerRoot } })} />
+    <Range title={zh ? "Worker 超时（秒）" : "Worker timeout (seconds)"} path="agent.workerTimeoutMs" value={Math.round(value.agent.workerTimeoutMs / 1000)} min={10} max={3600} step={10} source={source} onChange={(seconds) => update({ agent: { workerTimeoutMs: seconds * 1000 } })} />
+    <Range title={zh ? "Worker 输入 Token 上限" : "Worker input token limit"} path="agent.workerMaxInputTokens" value={value.agent.workerMaxInputTokens} min={1000} max={1000000} step={1000} source={source} onChange={(workerMaxInputTokens) => update({ agent: { workerMaxInputTokens } })} />
+    <Range title={zh ? "Worker 输出 Token 上限" : "Worker output token limit"} path="agent.workerMaxOutputTokens" value={value.agent.workerMaxOutputTokens} min={256} max={262144} step={256} source={source} onChange={(workerMaxOutputTokens) => update({ agent: { workerMaxOutputTokens } })} />
+    <Range title={zh ? "Worker Tool 调用上限" : "Worker tool-call limit"} path="agent.workerMaxToolCalls" value={value.agent.workerMaxToolCalls} min={1} max={1000} source={source} onChange={(workerMaxToolCalls) => update({ agent: { workerMaxToolCalls } })} />
+    <Setting title={zh ? "Worker 模型" : "Worker model"} source={source("agent.workerModel")}><select value={value.agent.workerModel} onChange={(event) => void update({ agent: { workerModel: event.target.value } })}><option value="">{zh ? "继承主 Agent" : "Inherit main agent"}</option>{modelOptions.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select></Setting>
     <Toggle title={zh ? "显示思考摘要" : "Show thinking summary"} path="agent.showThinkingSummary" checked={value.agent.showThinkingSummary} source={source} onChange={(showThinkingSummary) => update({ agent: { showThinkingSummary } })} />
     <Range title={zh ? "会话保留天数" : "Session retention days"} path="agent.sessionRetentionDays" value={value.agent.sessionRetentionDays} min={1} max={3650} source={source} onChange={(sessionRetentionDays) => update({ agent: { sessionRetentionDays } })} />
   </>;

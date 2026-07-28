@@ -18,7 +18,7 @@ afterEach(async () => {
 });
 
 describe("TaskStore", () => {
-  it.each([1, 2, 3, 4])(
+  it.each([1, 2, 3, 4, 5])(
     "opens and migrates the real v%s database fixture repeatedly",
     async (version) => {
       const databasePath = await createDatabasePath();
@@ -94,7 +94,7 @@ describe("TaskStore", () => {
 
     const verified = new DatabaseSync(databasePath);
     expect((verified.prepare("PRAGMA user_version").get() as { user_version: number }).user_version)
-      .toBe(4);
+      .toBe(5);
     const taskColumns = verified.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
     const planColumns = verified.prepare("PRAGMA table_info(plans)").all() as Array<{ name: string }>;
     expect(taskColumns.map((column) => column.name)).toContain("delivery_mode");
@@ -137,7 +137,7 @@ describe("TaskStore", () => {
 
     const verified = new DatabaseSync(databasePath);
     expect((verified.prepare("PRAGMA user_version").get() as { user_version: number }).user_version)
-      .toBe(4);
+      .toBe(5);
     expect(verified.prepare(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'plans'",
     ).get()).toBeTruthy();
@@ -566,6 +566,126 @@ describe("TaskStore", () => {
     expect(store.getTask(paused.id)?.status).toBe("queued");
     store.close();
   });
+
+  it("creates a Worker batch atomically and persists its tree, budgets, and result", async () => {
+    const store = await createStore();
+    const parent = store.createTask({
+      workspaceId: "workspace-a",
+      workspacePath: "/projects/alpha",
+      kind: "background",
+      title: "父任务",
+      goal: "检查实现",
+      execution: promptExecution(true),
+    });
+    const parentRun = store.createRun(parent.id);
+    store.bindRun(parent.id, parentRun.id, { sessionId: "parent-session" });
+
+    const delegation = store.delegateWorkers({
+      parentTaskId: parent.id,
+      parentRunId: parentRun.id,
+      toolCallId: "delegate-1",
+      sourceSessionId: "parent-session",
+      budget: workerBudget(),
+      requests: [{
+        profile: "explorer",
+        objective: "定位调度入口",
+        successCriteria: ["列出入口文件"],
+        constraints: ["只读"],
+        knownFacts: [],
+        fileHints: ["src"],
+        symbolHints: ["TaskOrchestrator"],
+      }, {
+        profile: "reviewer",
+        objective: "审查并发风险",
+        successCriteria: ["给出风险清单"],
+        constraints: ["只读"],
+        knownFacts: [],
+        fileHints: [],
+        symbolHints: [],
+      }],
+    });
+
+    expect(store.getTask(parent.id)?.status).toBe("waiting_workers");
+    expect(store.getTaskDetail(parent.id)?.runs[0]?.status).toBe("waiting_workers");
+    expect(delegation.workerTasks).toHaveLength(2);
+    expect(delegation.workerTasks.every((task) =>
+      task.parentTaskId === parent.id && task.rootTaskId === parent.id)).toBe(true);
+    expect(store.getTaskDetail(parent.id)).toMatchObject({
+      budget: workerBudget(),
+      budgetUsage: { workers: 2 },
+    });
+
+    const worker = delegation.workerTasks[0]!;
+    const run = store.createRun(worker.id);
+    store.bindRun(worker.id, run.id, { sessionId: "worker-session" });
+    expect(() => store.saveWorkerResult(worker.id, run.id, {
+      ...workerResult("越界证据"),
+      findings: [{
+        claim: "越界证据",
+        confidence: 0.5,
+        evidence: [{ kind: "file", path: "../secret.txt" }],
+      }],
+    })).toThrow("工作区相对路径");
+    store.saveWorkerResult(worker.id, run.id, workerResult("找到调度入口"));
+    expect(store.updateRunUsage(worker.id, run.id, {
+      durationMs: 1_000,
+      inputTokens: 51_200,
+      outputTokens: 10,
+      toolCalls: 1,
+    })).toMatchObject({ warningEmitted: true, exceeded: false });
+    store.updateRunUsage(worker.id, run.id, {
+      durationMs: 2_000,
+      inputTokens: 51_201,
+      outputTokens: 10,
+      toolCalls: 1,
+    });
+    expect(store.getTaskDetail(worker.id)?.events.filter(
+      (event) => event.type === "budget.warning",
+    )).toHaveLength(1);
+    expect(store.updateRunUsage(worker.id, run.id, {
+      durationMs: 3_000,
+      inputTokens: 64_000,
+      outputTokens: 10,
+      toolCalls: 1,
+    })).toMatchObject({ exceeded: true });
+    expect(store.getTaskBudget(parent.id)?.usage.exceeded).toBe(true);
+    expect(() => store.saveWorkerResult(worker.id, run.id, workerResult("重复")))
+      .toThrow();
+    store.finishRun(worker.id, run.id, "succeeded");
+    expect(store.getTaskDetail(worker.id)?.workerResult?.summary).toBe("找到调度入口");
+    expect(store.getTaskDetail(parent.id)?.children).toHaveLength(2);
+    expect(store.listTaskSummaries({ query: "找到调度入口" }).map(
+      (summary) => summary.task.id,
+    )).toContain(parent.id);
+    store.close();
+  });
+
+  it("rejects recursive and over-budget Worker delegation without partial writes", async () => {
+    const store = await createStore();
+    const parent = store.createTask({
+      workspaceId: "workspace-a",
+      kind: "background",
+      title: "父任务",
+      goal: "检查",
+      execution: promptExecution(true),
+    });
+    const parentRun = store.createRun(parent.id);
+    store.bindRun(parent.id, parentRun.id, { sessionId: "parent-session" });
+    expect(() => store.delegateWorkers({
+      parentTaskId: parent.id,
+      parentRunId: parentRun.id,
+      toolCallId: "too-many",
+      sourceSessionId: "parent-session",
+      budget: { ...workerBudget(), maxWorkers: 1 },
+      requests: [
+        workerRequest("explorer", "一"),
+        workerRequest("reviewer", "二"),
+      ],
+    })).toThrow("最多允许 1 个 Worker");
+    expect(store.getTask(parent.id)?.status).toBe("running");
+    expect(store.getTaskDetail(parent.id)?.children).toHaveLength(0);
+    store.close();
+  });
 });
 
 describe("TaskOrchestrator", () => {
@@ -714,6 +834,106 @@ describe("TaskOrchestrator", () => {
     await settle();
     expect(handles).toHaveLength(2);
     handles.forEach((handle) => handle.resolve());
+    await settle();
+    await orchestrator.dispose();
+  });
+
+  it("releases the parent slot while two Workers run and resumes with structured results", async () => {
+    const store = await createStore();
+    const parentHandle = deferredHandle("parent-session");
+    const workerHandles = new Map<string, ReturnType<typeof deferredHandle>>();
+    const orchestrator = new TaskOrchestrator({
+      store,
+      workspaceId: "workspace-a",
+      concurrency: 2,
+      executor: async ({ task }) => {
+        if (task.kind !== "worker") return parentHandle;
+        const handle = deferredHandle(`worker-${task.id}`);
+        workerHandles.set(task.id, handle);
+        return handle;
+      },
+    });
+    orchestrator.start();
+    const parent = orchestrator.submitPrompt({
+      title: "并行调查",
+      prompt: "并行调查",
+      kind: "background",
+      execution: promptExecution(true),
+    });
+    await settle();
+    const parentRunId = store.getTask(parent.id)!.currentRunId!;
+    const resultsPromise = orchestrator.delegateWorkers({
+      parentTaskId: parent.id,
+      parentRunId,
+      toolCallId: "delegate-workers",
+      sourceSessionId: "parent-session",
+      budget: workerBudget(),
+      requests: [
+        workerRequest("explorer", "定位代码"),
+        workerRequest("reviewer", "审查风险"),
+      ],
+    });
+    await settle();
+
+    expect(orchestrator.activeRunCount).toBe(2);
+    expect(store.getTask(parent.id)?.status).toBe("waiting_workers");
+    expect(workerHandles.size).toBe(2);
+    for (const [taskId, handle] of workerHandles) {
+      const runId = store.getTask(taskId)!.currentRunId!;
+      orchestrator.saveWorkerResult(taskId, runId, workerResult(`完成 ${taskId}`));
+      handle.resolve();
+    }
+    await settle();
+
+    const results = await resultsPromise;
+    expect(results).toHaveLength(2);
+    expect(results.every((entry) => entry.status === "succeeded" && entry.result)).toBe(true);
+    expect(store.getTask(parent.id)?.status).toBe("running");
+    expect(orchestrator.activeRunCount).toBe(1);
+    parentHandle.resolve();
+    await settle();
+    expect(store.getTask(parent.id)?.status).toBe("succeeded");
+    await orchestrator.dispose();
+  });
+
+  it("fails a Worker that ends without a structured result", async () => {
+    const store = await createStore();
+    const parentHandle = deferredHandle("parent-session");
+    let workerHandle: ReturnType<typeof deferredHandle> | undefined;
+    const orchestrator = new TaskOrchestrator({
+      store,
+      workspaceId: "workspace-a",
+      concurrency: 1,
+      executor: async ({ task }) => {
+        if (task.kind !== "worker") return parentHandle;
+        workerHandle = deferredHandle("worker-session");
+        return workerHandle;
+      },
+    });
+    orchestrator.start();
+    const parent = orchestrator.submitPrompt({
+      title: "父任务",
+      prompt: "父任务",
+      kind: "background",
+      execution: promptExecution(true),
+    });
+    await settle();
+    const resultsPromise = orchestrator.delegateWorkers({
+      parentTaskId: parent.id,
+      parentRunId: store.getTask(parent.id)!.currentRunId!,
+      toolCallId: "missing-result",
+      sourceSessionId: "parent-session",
+      budget: workerBudget(),
+      requests: [workerRequest("explorer", "调查")],
+    });
+    await settle();
+    workerHandle!.resolve();
+    const results = await resultsPromise;
+    expect(results[0]).toMatchObject({
+      status: "failed",
+      error: "Worker 未提交结构化结果",
+    });
+    parentHandle.resolve();
     await settle();
     await orchestrator.dispose();
   });
@@ -1334,6 +1554,46 @@ function promptExecution(preferFork = false) {
     sourceSessionFile: "/tmp/source.jsonl",
     sourceEntryId: "entry-1",
     preferFork,
+  };
+}
+
+function workerBudget() {
+  return {
+    maxWorkers: 2,
+    maxDurationMs: 300_000,
+    maxInputTokens: 64_000,
+    maxOutputTokens: 16_000,
+    maxToolCalls: 50,
+  };
+}
+
+function workerRequest(
+  profile: "explorer" | "tester" | "reviewer",
+  objective: string,
+) {
+  return {
+    profile,
+    objective,
+    successCriteria: [`完成${objective}`],
+    constraints: ["只读"],
+    knownFacts: [],
+    fileHints: [],
+    symbolHints: [],
+  };
+}
+
+function workerResult(summary: string) {
+  return {
+    summary,
+    findings: [{
+      claim: summary,
+      confidence: 0.9,
+      evidence: [{ kind: "file" as const, path: "src/index.ts", lineStart: 1 }],
+    }],
+    artifacts: [],
+    risks: [],
+    unresolved: [],
+    recommendedNextActions: [],
   };
 }
 

@@ -47,6 +47,10 @@ import {
   type ToolDefinition,
   type ToolResult,
   type UpdateSessionConfigurationInput,
+  type WorkerProfileId,
+  type WorkerRequest,
+  type WorkerResult,
+  type WorkerResultEnvelope,
 } from "@deki-ai/shared";
 import { ToolGateway, type GatewayTool } from "@deki-ai/tool-gateway";
 
@@ -99,6 +103,20 @@ export interface DekiAgentRuntimeOptions {
       evidence?: string[];
     }, context: ToolCallContext): Promise<unknown>;
   };
+  workerTools?: {
+    delegate(
+      requests: WorkerRequest[],
+      context: ToolCallContext,
+    ): Promise<WorkerResultEnvelope[]>;
+    submitResult(
+      result: WorkerResult,
+      context: ToolCallContext,
+    ): Promise<WorkerResult>;
+    runTest(
+      target: string,
+      context: ToolCallContext,
+    ): Promise<unknown>;
+  };
   resumeLatest?: boolean;
 }
 
@@ -133,9 +151,11 @@ export interface AgentPromptContext {
   sourceSessionFile?: string;
   sourceEntryId?: string;
   preferFork: boolean;
-  interactionMode?: "act" | "plan" | "plan-execution";
+  interactionMode?: "act" | "plan" | "plan-execution" | "worker";
   planId?: string;
   planRevision?: number;
+  workerProfile?: WorkerProfileId;
+  workerContext?: import("@deki-ai/shared").WorkerContextPackage;
 }
 
 export interface AgentPromptRunHandle {
@@ -147,6 +167,11 @@ export interface AgentPromptRunHandle {
   completion: Promise<void>;
   cancel(): Promise<void>;
   captureContext(): AgentPromptContext & { type: "agent-prompt" };
+  captureUsage(): {
+    inputTokens: number;
+    outputTokens: number;
+    toolCallCount: number;
+  };
 }
 
 type ModelType = Model<any>;
@@ -159,9 +184,10 @@ interface AgentExecutionContext {
   sessionId: string;
   taskId: string;
   runId: string;
-  interactionMode: "act" | "plan" | "plan-execution";
+  interactionMode: "act" | "plan" | "plan-execution" | "worker";
   planId?: string;
   planRevision?: number;
+  workerProfile?: WorkerProfileId;
 }
 
 export class AgentSessionEventSubscription {
@@ -320,6 +346,10 @@ export class DekiAgentRuntime {
       await this.#gateway.register(new ProjectInfoProvider(this.#options.workspace));
       if (this.#options.planTools) {
         await this.#gateway.register(new PlanToolsProvider(this.#options.planTools));
+      }
+      if (this.#options.workerTools) {
+        await this.#gateway.register(new WorkerToolsProvider(this.#options.workerTools));
+        await this.#gateway.register(new TestToolsProvider(this.#options.workerTools));
       }
 
       if (this.#options.settings.mcp.startEnabledServers) {
@@ -635,6 +665,14 @@ export class DekiAgentRuntime {
           ? { planRevision: input.context.planRevision }
           : {}),
       }),
+      captureUsage: () => {
+        const stats = runtime.session.getSessionStats();
+        return {
+          inputTokens: stats.tokens.input,
+          outputTokens: stats.tokens.output,
+          toolCallCount: 0,
+        };
+      },
     };
   }
 
@@ -1099,25 +1137,60 @@ export class DekiAgentRuntime {
     const createRuntime = this.#createRuntimeFactory;
     const sourceFile = input.context.sourceSessionFile;
     if (!createRuntime) throw new Error("Agent Runtime 尚未就绪");
+    const workerMode = input.context.interactionMode === "worker";
+    if (workerMode && (!input.context.workerProfile || !input.context.workerContext)) {
+      throw new Error("Worker 缺少 Profile 或最小上下文包");
+    }
     const sessionDirectory = join(
       this.#options.paths.sessionsRoot,
       this.#options.scopeId,
+      ...(workerMode ? ["workers"] : []),
     );
-    if (!sourceFile) {
+    if (!workerMode && !sourceFile) {
       throw new Error("源会话尚未持久化，不能创建并发分支");
     }
-    try {
-      await access(sourceFile);
-    } catch {
-      throw new Error("任务恢复失败：最新会话文件已不存在");
+    if (!workerMode) {
+      try {
+        await access(sourceFile!);
+      } catch {
+        throw new Error("任务恢复失败：最新会话文件已不存在");
+      }
     }
-    const sessionManager = SessionManager.forkFrom(
-      sourceFile,
-      this.#options.workspace,
-      sessionDirectory,
-      { parentSession: sourceFile },
-    );
-    if (input.context.sourceEntryId) {
+    const sessionManager = workerMode
+      ? SessionManager.create(this.#options.workspace, sessionDirectory)
+      : SessionManager.forkFrom(
+        sourceFile!,
+        this.#options.workspace,
+        sessionDirectory,
+        { parentSession: sourceFile! },
+      );
+    if (workerMode) {
+      sessionManager.appendCustomEntry("deki.worker-context", {
+        version: 1,
+        profile: input.context.workerProfile,
+        context: input.context.workerContext,
+      });
+      const sourceSession = this.#sessionById(input.context.sourceSessionId);
+      const configuredWorkerModel = this.#options.settings.agent.workerModel
+        ? this.#models.find((model) =>
+          `${model.provider}/${model.id}` === this.#options.settings.agent.workerModel)
+        : undefined;
+      const inheritedModel = configuredWorkerModel
+        ?? this.#sessionModels.get(input.context.sourceSessionId)
+        ?? sourceSession?.model
+        ?? this.#selectedModel;
+      if (inheritedModel) {
+        sessionManager.appendModelChange(inheritedModel.provider, inheritedModel.id);
+      }
+      sessionManager.appendThinkingLevelChange(
+        sourceSession?.thinkingLevel
+          ?? this.#options.settings.models.thinkingLevel,
+      );
+      sessionManager.appendCustomEntry("deki.permission-policies", {
+        version: 1,
+        policies: this.#permissionPoliciesForSession(input.context.sourceSessionId),
+      });
+    } else if (input.context.sourceEntryId) {
       if (!sessionManager.getEntry(input.context.sourceEntryId)) {
         throw new Error("任务恢复失败：最新会话位置已不存在");
       }
@@ -1141,6 +1214,9 @@ export class DekiAgentRuntime {
       taskId: input.taskId,
       runId: input.runId,
       interactionMode: input.context.interactionMode ?? "act",
+      ...(input.context.workerProfile
+        ? { workerProfile: input.context.workerProfile }
+        : {}),
       ...(input.context.planId ? { planId: input.context.planId } : {}),
       ...(input.context.planRevision
         ? { planRevision: input.context.planRevision }
@@ -1159,9 +1235,20 @@ export class DekiAgentRuntime {
       if (translated) {
         this.#emitForSession(background.session, translated, execution);
       }
+      if (event.type === "message_end") {
+        const stats = background.session.getSessionStats();
+        this.#emitForSession(background.session, {
+          type: "usage.updated",
+          inputTokens: stats.tokens.input,
+          outputTokens: stats.tokens.output,
+          toolCallCount: 0,
+        }, execution);
+      }
     });
     this.#backgroundUnsubscribers.set(background, unsubscribe);
-    const memories = this.#recallMemories(input.prompt, background.session.sessionId);
+    const memories = workerMode
+      ? []
+      : this.#recallMemories(input.prompt, background.session.sessionId);
     if (memories.length > 0) {
       await background.session.sendCustomMessage({
         customType: "deki.memory.recall",
@@ -1236,11 +1323,25 @@ export class DekiAgentRuntime {
           : {}),
         preferFork: true,
         interactionMode: input.context.interactionMode ?? "act",
+        ...(input.context.workerProfile
+          ? { workerProfile: input.context.workerProfile }
+          : {}),
+        ...(input.context.workerContext
+          ? { workerContext: input.context.workerContext }
+          : {}),
         ...(input.context.planId ? { planId: input.context.planId } : {}),
         ...(input.context.planRevision
           ? { planRevision: input.context.planRevision }
           : {}),
       }),
+      captureUsage: () => {
+        const stats = background.session.getSessionStats();
+        return {
+          inputTokens: stats.tokens.input,
+          outputTokens: stats.tokens.output,
+          toolCallCount: 0,
+        };
+      },
     };
   }
 
@@ -1259,14 +1360,21 @@ export class DekiAgentRuntime {
       sessionManager: SessionManager;
       sessionStartEvent?: Parameters<typeof createAgentSessionFromServices>[0]["sessionStartEvent"];
     }) => {
-      const recalled = this.#recallMemories("", sessionManager.getSessionId());
+      const workerProfile = readWorkerProfile(sessionManager);
+      const recalled = workerProfile
+        ? []
+        : this.#recallMemories("", sessionManager.getSessionId());
       this.#recalledMemories = recalled;
+      const workerModel = this.#options.settings.agent.workerModel
+        ? this.#models.find((model) =>
+          `${model.provider}/${model.id}` === this.#options.settings.agent.workerModel)
+        : undefined;
       const sessionModel = resolveSessionModel(
         this.#models,
         sessionManager,
-        selectedModel,
+        workerModel ?? selectedModel,
       );
-      const contextFiles = this.#projectFeaturesEnabled()
+      const contextFiles = this.#projectFeaturesEnabled() && !workerProfile
         ? await loadConfiguredContextFiles(
             cwd,
             this.#options.settings.workspace.contextFiles,
@@ -1300,12 +1408,12 @@ export class DekiAgentRuntime {
         modelRuntime,
         settingsManager,
         resourceLoaderOptions: {
-          noContextFiles: !this.#projectFeaturesEnabled(),
-          noExtensions: !this.#projectFeaturesEnabled(),
-          noPromptTemplates: !this.#projectFeaturesEnabled(),
-          noSkills: !this.#projectFeaturesEnabled(),
-          noThemes: !this.#projectFeaturesEnabled(),
-          additionalSkillPaths: this.#projectFeaturesEnabled()
+          noContextFiles: !this.#projectFeaturesEnabled() || Boolean(workerProfile),
+          noExtensions: !this.#projectFeaturesEnabled() || Boolean(workerProfile),
+          noPromptTemplates: !this.#projectFeaturesEnabled() || Boolean(workerProfile),
+          noSkills: !this.#projectFeaturesEnabled() || Boolean(workerProfile),
+          noThemes: !this.#projectFeaturesEnabled() || Boolean(workerProfile),
+          additionalSkillPaths: this.#projectFeaturesEnabled() && !workerProfile
             ? [
                 join(cwd, ".deki", "skills"),
                 join(cwd, ".agents", "skills"),
@@ -1321,7 +1429,7 @@ export class DekiAgentRuntime {
             ),
           }),
           agentsFilesOverride: (current) => ({
-            agentsFiles: dedupeContextFiles([
+            agentsFiles: workerProfile ? [] : dedupeContextFiles([
               ...current.agentsFiles.filter((file) =>
                 !matchesContextIgnore(file.path, this.#options.settings.workspace.contextIgnore)),
               ...contextFiles,
@@ -1352,9 +1460,26 @@ export class DekiAgentRuntime {
         this.#addDiagnostic(diagnostic.message, diagnostic.type);
       }
 
-      const tools = this.#projectFeaturesEnabled()
+      const availableTools = this.#projectFeaturesEnabled()
         ? this.#gateway.listTools()
         : this.#gateway.listTools().filter((tool) => tool.providerId === "interaction");
+      const tools = workerProfile
+        ? availableTools.filter((tool) =>
+          (
+            tool.providerId === "worker"
+            && tool.providerToolName === "submit_result"
+          )
+          || (
+            tool.providerId === "test"
+            && workerProfile === "tester"
+          )
+          || (
+            tool.providerToolName !== "bash"
+            && (tool.effect === "read"
+              || tool.effect === "network-read"
+              || tool.readOnlyHint === true)
+          ))
+        : availableTools;
       this.#runtimeToolSignature = toolDefinitionSignature(tools);
       return {
         ...await createAgentSessionFromServices({
@@ -1522,13 +1647,18 @@ export class DekiAgentRuntime {
           ...(executionContext?.runId ? { runId: executionContext.runId } : {}),
           ...(executionContext?.planId ? { planId: executionContext.planId } : {}),
           interactionMode: executionContext?.interactionMode ?? "act",
+          ...(executionContext?.workerProfile
+            ? { workerProfile: executionContext.workerProfile }
+            : {}),
           ...(signal ? { signal } : {}),
         };
         this.#gateway.assertAllowed(tool.modelName, params, context);
         const permissionControlled = tool.providerId !== "workspace"
           && tool.providerId !== "deki"
           && tool.providerId !== "interaction"
-          && tool.providerId !== "plan";
+          && tool.providerId !== "plan"
+          && tool.providerId !== "worker"
+          && tool.providerId !== "test";
         if (permissionControlled) {
           const readOnly = tool.readOnlyHint === true;
           const policy = this.#options.settings.mcp.toolPolicies[tool.internalName]
@@ -1633,6 +1763,15 @@ export class DekiAgentRuntime {
     const translated = translatePiAgentEvent(event);
     if (translated && session) {
       this.#emitForSession(session, translated);
+    }
+    if (event.type === "message_end" && session) {
+      const stats = session.getSessionStats();
+      this.#emitForSession(session, {
+        type: "usage.updated",
+        inputTokens: stats.tokens.input,
+        outputTokens: stats.tokens.output,
+        toolCallCount: 0,
+      });
     }
   }
 
@@ -2054,6 +2193,20 @@ export function toolDefinitionSignature(
   );
 }
 
+function readWorkerProfile(
+  manager: Pick<SessionManager, "getBranch">,
+): WorkerProfileId | undefined {
+  const entry = [...manager.getBranch()].reverse().find(
+    (candidate) => candidate.type === "custom"
+      && candidate.customType === "deki.worker-context",
+  );
+  if (entry?.type !== "custom" || !isRecord(entry.data)) return undefined;
+  const profile = entry.data.profile;
+  return profile === "explorer" || profile === "tester" || profile === "reviewer"
+    ? profile
+    : undefined;
+}
+
 class ProjectInfoProvider implements CapabilityProvider {
   readonly id = "deki";
   readonly #workspace: string;
@@ -2232,6 +2385,239 @@ class PlanToolsProvider implements CapabilityProvider {
     } else {
       throw new Error(`未知 Plan Tool: ${name}`);
     }
+    return {
+      content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      details: result,
+    };
+  }
+
+  async healthCheck() {
+    return { state: "ready" as const };
+  }
+
+  async dispose(): Promise<void> {}
+}
+
+type WorkerToolHandlers = NonNullable<DekiAgentRuntimeOptions["workerTools"]>;
+
+class WorkerToolsProvider implements CapabilityProvider {
+  readonly id = "worker";
+  readonly #handlers: WorkerToolHandlers;
+
+  constructor(handlers: WorkerToolHandlers) {
+    this.#handlers = handlers;
+  }
+
+  async listTools(): Promise<ToolDefinition[]> {
+    const requestSchema = {
+      type: "object",
+      properties: {
+        profile: { type: "string", enum: ["explorer", "tester", "reviewer"] },
+        objective: { type: "string", minLength: 1, maxLength: 100_000 },
+        successCriteria: {
+          type: "array",
+          items: { type: "string", minLength: 1, maxLength: 5_000 },
+          minItems: 1,
+          maxItems: 30,
+        },
+        constraints: { type: "array", items: { type: "string" }, maxItems: 100 },
+        knownFacts: { type: "array", items: { type: "string" }, maxItems: 100 },
+        fileHints: { type: "array", items: { type: "string" }, maxItems: 100 },
+        symbolHints: { type: "array", items: { type: "string" }, maxItems: 100 },
+        plan: {
+          type: "object",
+          properties: {
+            planId: { type: "string", format: "uuid" },
+            revision: { type: "integer", minimum: 1 },
+            stepId: { type: "string", minLength: 1, maxLength: 100 },
+          },
+          required: ["planId", "revision"],
+          additionalProperties: false,
+        },
+      },
+      required: ["profile", "objective", "successCriteria"],
+      additionalProperties: false,
+    };
+    const evidenceSchema = {
+      oneOf: [
+        {
+          type: "object",
+          properties: {
+            kind: { const: "file" },
+            path: { type: "string" },
+            lineStart: { type: "integer", minimum: 1 },
+            lineEnd: { type: "integer", minimum: 1 },
+            excerpt: { type: "string" },
+          },
+          required: ["kind", "path"],
+          additionalProperties: false,
+        },
+        {
+          type: "object",
+          properties: {
+            kind: { const: "command" },
+            target: { type: "string" },
+            exitCode: { type: "integer" },
+            outputArtifactId: { type: "string", format: "uuid" },
+          },
+          required: ["kind", "target", "exitCode"],
+          additionalProperties: false,
+        },
+        {
+          type: "object",
+          properties: {
+            kind: { const: "artifact" },
+            artifactId: { type: "string", format: "uuid" },
+            description: { type: "string" },
+          },
+          required: ["kind", "artifactId"],
+          additionalProperties: false,
+        },
+        {
+          type: "object",
+          properties: {
+            kind: { const: "url" },
+            url: { type: "string", format: "uri" },
+            description: { type: "string" },
+          },
+          required: ["kind", "url"],
+          additionalProperties: false,
+        },
+      ],
+    };
+    return [
+      {
+        name: "delegate",
+        description: "将两个以内互相独立的只读调查任务并行派发给 Worker。",
+        inputSchema: {
+          type: "object",
+          properties: {
+            requests: {
+              type: "array",
+              items: requestSchema,
+              minItems: 1,
+              maxItems: 2,
+            },
+          },
+          required: ["requests"],
+          additionalProperties: false,
+        },
+        effect: "plan-control",
+        timeoutMs: 3_600_000,
+      },
+      {
+        name: "submit_result",
+        description: "提交当前 Worker 的最终结构化调查结果；Worker 结束前必须调用。",
+        inputSchema: {
+          type: "object",
+          properties: {
+            summary: { type: "string", minLength: 1, maxLength: 20_000 },
+            findings: {
+              type: "array",
+              maxItems: 100,
+              items: {
+                type: "object",
+                properties: {
+                  claim: { type: "string", minLength: 1 },
+                  confidence: { type: "number", minimum: 0, maximum: 1 },
+                  evidence: { type: "array", items: evidenceSchema, maxItems: 100 },
+                },
+                required: ["claim", "confidence", "evidence"],
+                additionalProperties: false,
+              },
+            },
+            artifacts: {
+              type: "array",
+              items: { type: "string", format: "uuid" },
+              maxItems: 100,
+            },
+            risks: { type: "array", items: { type: "string" }, maxItems: 100 },
+            unresolved: { type: "array", items: { type: "string" }, maxItems: 100 },
+            recommendedNextActions: {
+              type: "array",
+              items: { type: "string" },
+              maxItems: 100,
+            },
+          },
+          required: [
+            "summary",
+            "findings",
+            "artifacts",
+            "risks",
+            "unresolved",
+            "recommendedNextActions",
+          ],
+          additionalProperties: false,
+        },
+        effect: "plan-control",
+      },
+    ];
+  }
+
+  async callTool(
+    name: string,
+    input: unknown,
+    context: ToolCallContext,
+  ): Promise<ToolResult> {
+    let result: unknown;
+    if (name === "delegate") {
+      const value = input as { requests: WorkerRequest[] };
+      result = await this.#handlers.delegate(value.requests, context);
+    } else if (name === "submit_result") {
+      result = await this.#handlers.submitResult(input as WorkerResult, context);
+    } else {
+      throw new Error(`未知 Worker Tool: ${name}`);
+    }
+    return {
+      content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      details: result,
+    };
+  }
+
+  async healthCheck() {
+    return { state: "ready" as const };
+  }
+
+  async dispose(): Promise<void> {}
+}
+
+class TestToolsProvider implements CapabilityProvider {
+  readonly id = "test";
+  readonly #handlers: WorkerToolHandlers;
+
+  constructor(handlers: WorkerToolHandlers) {
+    this.#handlers = handlers;
+  }
+
+  async listTools(): Promise<ToolDefinition[]> {
+    return [{
+      name: "run",
+      description: "在临时只读来源副本中运行项目已声明的 test/lint/typecheck 脚本。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          target: { type: "string", minLength: 1, maxLength: 200 },
+        },
+        required: ["target"],
+        additionalProperties: false,
+      },
+      effect: "read",
+      timeoutMs: 600_000,
+    }];
+  }
+
+  async callTool(
+    name: string,
+    input: unknown,
+    context: ToolCallContext,
+  ): Promise<ToolResult> {
+    if (name !== "run") throw new Error(`未知 Test Tool: ${name}`);
+    if (context.workerProfile !== "tester") {
+      throw new Error("只有 Tester Worker 可以运行测试");
+    }
+    const target = (input as { target?: unknown }).target;
+    if (typeof target !== "string" || !target.trim()) throw new Error("target 不能为空");
+    const result = await this.#handlers.runTest(target.trim(), context);
     return {
       content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
       details: result,

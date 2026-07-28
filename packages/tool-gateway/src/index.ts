@@ -269,11 +269,45 @@ export class PlanModePolicyError extends Error {
   }
 }
 
+export class WorkerModePolicyError extends Error {
+  readonly code = "WORKER_MODE_READ_ONLY";
+  readonly toolName: string;
+
+  constructor(toolName: string) {
+    super(`只读 Worker 不允许调用该工具：${toolName}`);
+    this.name = "WorkerModePolicyError";
+    this.toolName = toolName;
+  }
+}
+
 function assertToolAllowed(
   tool: GatewayTool,
   _input: unknown,
   context: ToolCallContext,
 ): void {
+  if (context.interactionMode === "worker") {
+    if (
+      tool.providerId === "worker"
+      && tool.providerToolName === "submit_result"
+    ) return;
+    if (
+      tool.providerId === "test"
+      && context.workerProfile === "tester"
+      && tool.effect === "read"
+    ) return;
+    if (tool.providerToolName === "bash" || tool.effect === "write") {
+      throw new WorkerModePolicyError(tool.modelName);
+    }
+    if (tool.providerId.startsWith("mcp") && tool.readOnlyHint !== true) {
+      throw new WorkerModePolicyError(tool.modelName);
+    }
+    if (
+      tool.effect === "read"
+      || tool.effect === "network-read"
+      || tool.readOnlyHint === true
+    ) return;
+    throw new WorkerModePolicyError(tool.modelName);
+  }
   if (context.interactionMode !== "plan") return;
   if (tool.providerToolName === "bash") {
     throw new PlanModePolicyError(tool.modelName);

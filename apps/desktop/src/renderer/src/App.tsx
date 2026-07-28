@@ -184,6 +184,7 @@ export function App() {
         statuses: [
           "waiting_approval",
           "waiting_user",
+          "waiting_workers",
           "queued",
           "paused",
           "interrupted",
@@ -191,9 +192,12 @@ export function App() {
         limit: 500,
       });
       setTaskAttentionCount(rows.filter((item) =>
-        item.task.status === "waiting_approval"
-        || item.task.status === "waiting_user"
-        || !item.runnable
+        !item.task.parentTaskId
+        && (
+          item.task.status === "waiting_approval"
+          || item.task.status === "waiting_user"
+          || !item.runnable
+        )
       ).length);
     };
     void refreshAttention();

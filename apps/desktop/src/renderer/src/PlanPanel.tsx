@@ -4,6 +4,8 @@ import type {
   PlanRevisionRecord,
   PlanStep,
   PlanStepState,
+  TaskSummary,
+  WorkerResult,
 } from "@deki-ai/shared";
 
 interface PlanPanelProps {
@@ -21,6 +23,10 @@ export function PlanPanel(props: PlanPanelProps) {
     Math.max(1, detail.plan.currentRevision - 1),
   );
   const [afterRevision, setAfterRevision] = useState(detail.plan.currentRevision);
+  const [stepWorkers, setStepWorkers] = useState<Array<{
+    summary: TaskSummary;
+    result?: WorkerResult;
+  }>>([]);
   const revision = detail.revisions.find(
     (candidate) => candidate.revision === detail.plan.currentRevision,
   );
@@ -39,6 +45,32 @@ export function PlanPanel(props: PlanPanelProps) {
     setAfterRevision(detail.plan.currentRevision);
     setBeforeRevision(Math.max(1, detail.plan.currentRevision - 1));
   }, [detail.plan.id, detail.plan.currentRevision]);
+  useEffect(() => {
+    let cancelled = false;
+    const refreshWorkers = async () => {
+      if (!detail.plan.executionTaskId) {
+        if (!cancelled) setStepWorkers([]);
+        return;
+      }
+      const execution = await window.deki.getTask(detail.plan.executionTaskId);
+      const workers = await Promise.all((execution?.children ?? []).map(async (summary) => {
+        const worker = await window.deki.getTask(summary.task.id);
+        return {
+          summary,
+          ...(worker?.workerResult ? { result: worker.workerResult } : {}),
+        };
+      }));
+      if (!cancelled) setStepWorkers(workers);
+    };
+    void refreshWorkers();
+    const unsubscribe = window.deki.subscribeTaskEvents(() => {
+      void refreshWorkers();
+    });
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, [detail.plan.executionTaskId]);
   const revisionDelta = useMemo(() => {
     const before = detail.revisions.find(
       (candidate) => candidate.revision === beforeRevision,
@@ -136,6 +168,8 @@ export function PlanPanel(props: PlanPanelProps) {
                 index={index}
                 step={step}
                 {...(states.get(step.id) ? { state: states.get(step.id)! } : {})}
+                workers={stepWorkers.filter((worker) =>
+                  worker.summary.workerPlanStepId === step.id)}
                 zh={zh}
               />
             ))}
@@ -378,6 +412,7 @@ function PlanStepRow(props: {
   index: number;
   step: NonNullable<PlanDetail["revisions"][number]>["steps"][number];
   state?: PlanStepState;
+  workers: Array<{ summary: TaskSummary; result?: WorkerResult }>;
   zh: boolean;
 }) {
   const status = props.state?.status ?? "pending";
@@ -400,6 +435,19 @@ function PlanStepRow(props: {
       {props.step.validation.map((item) => <p key={item}>✓ {item}</p>)}
       {props.state?.summary && <p>{props.state.summary}</p>}
       {props.state?.reason && <p className="error">{props.state.reason}</p>}
+      {props.workers.length > 0 && (
+        <div className="plan-step-workers">
+          <strong>{props.zh ? "关联 Worker" : "Workers"}</strong>
+          {props.workers.map(({ summary, result }) => (
+            <p key={summary.task.id}>
+              {summary.task.assignedProfile ?? "Worker"}
+              {" · "}
+              {summary.task.status}
+              {result?.summary ? ` · ${result.summary}` : ""}
+            </p>
+          ))}
+        </div>
+      )}
     </details>
   );
 }

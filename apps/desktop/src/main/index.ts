@@ -1,7 +1,21 @@
 import { existsSync } from "node:fs";
-import { appendFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
-import { delimiter, isAbsolute, join, normalize, resolve, sep } from "node:path";
-import { homedir } from "node:os";
+import { spawn } from "node:child_process";
+import {
+  appendFile,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readlink,
+  readdir,
+  rename,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
+import { delimiter, dirname, isAbsolute, join, normalize, resolve, sep } from "node:path";
+import { homedir, tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import {
   app,
@@ -17,6 +31,7 @@ import {
 } from "electron";
 import electronUpdater from "electron-updater";
 import { DekiAgentRuntime } from "@deki-ai/agent-runtime";
+import { AgentSupervisor } from "@deki-ai/agent-supervisor";
 import { GitCheckpointManager } from "@deki-ai/git-checkpoint";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import {
@@ -118,6 +133,8 @@ import {
   type TaskListInput,
   type TaskSubmissionResult,
   type UpdateSessionConfigurationInput,
+  workerRequestSchema,
+  workerResultSchema,
 } from "@deki-ai/shared";
 
 protocol.registerSchemesAsPrivileged([{
@@ -132,6 +149,7 @@ protocol.registerSchemesAsPrivileged([{
 let controller: DesktopController | undefined;
 let taskStore: TaskStore | undefined;
 let taskOrchestrator: TaskOrchestrator | undefined;
+let agentSupervisor: AgentSupervisor | undefined;
 const workspaceControllers = new Map<string, DesktopController>();
 let quitting = false;
 let shutdownComplete = false;
@@ -616,14 +634,14 @@ class DesktopController {
       ? renderPlanExecutionPrompt(taskStore?.getPlan(input.task.planId), input.task.goal)
       : input.execution.interactionMode === "plan"
         ? renderPlanningPrompt(input.task.goal, input.execution.planId, taskStore)
+        : input.task.kind === "worker" && input.execution.workerContext
+          ? renderWorkerPrompt(
+            input.execution.workerProfile!,
+            input.execution.workerContext,
+          )
         : input.execution.continuation
-      ? [
-          "继续完成此前任务。先检查当前会话和工作区状态，不要重复已经完成的步骤，",
-          "也不要盲目重放可能产生副作用的工具调用。",
-          "",
-          `原始目标：${input.task.goal}`,
-        ].join("\n")
-      : input.task.goal;
+          ? renderTaskContinuation(input.task, taskStore)
+          : input.task.goal;
     const handle = await runtime.startPrompt({
       taskId: input.task.id,
       runId: input.run.id,
@@ -641,6 +659,12 @@ class DesktopController {
         ...(input.execution.planId ? { planId: input.execution.planId } : {}),
         ...(input.execution.planRevision
           ? { planRevision: input.execution.planRevision }
+          : {}),
+        ...(input.execution.workerProfile
+          ? { workerProfile: input.execution.workerProfile }
+          : {}),
+        ...(input.execution.workerContext
+          ? { workerContext: input.execution.workerContext }
           : {}),
       },
     });
@@ -1590,6 +1614,85 @@ class DesktopController {
             return { accepted: Boolean(request), reason: input.reason };
           },
         },
+        workerTools: {
+          delegate: async (requests, context) => {
+            if (
+              context.interactionMode === "worker"
+              || !context.taskId
+              || !context.runId
+              || !context.sessionId
+            ) {
+              throw new Error("只有主 Agent 可以派发 Worker");
+            }
+            const parsed = workerRequestSchema.array().min(1).max(2).parse(requests);
+            const settings = this.#settings.snapshot().effective.agent;
+            return this.#tasks.delegateWorkers({
+              parentTaskId: context.taskId,
+              parentRunId: context.runId,
+              toolCallId: context.callId,
+              requests: parsed,
+              sourceSessionId: context.sessionId,
+              deliveryMode: taskStore?.getDeliveryMode(context.taskId) ?? "background",
+              budget: {
+                maxWorkers: settings.workerMaxPerRoot,
+                maxDurationMs: settings.workerTimeoutMs,
+                maxInputTokens: settings.workerMaxInputTokens,
+                maxOutputTokens: settings.workerMaxOutputTokens,
+                maxToolCalls: settings.workerMaxToolCalls,
+              },
+            });
+          },
+          submitResult: async (result, context) => {
+            if (
+              context.interactionMode !== "worker"
+              || !context.taskId
+              || !context.runId
+            ) {
+              throw new Error("worker.submit_result 只能由 Worker 调用");
+            }
+            return this.#tasks.saveWorkerResult(
+              context.taskId,
+              context.runId,
+              workerResultSchema.parse(result),
+            );
+          },
+          runTest: async (target, context) => {
+            if (
+              context.interactionMode !== "worker"
+              || context.workerProfile !== "tester"
+              || !context.taskId
+              || !context.runId
+            ) {
+              throw new Error("只有当前 Tester Worker 可以运行受控测试");
+            }
+            const result = await runWorkerTestInSnapshot(
+              this.#runtimeWorkspace,
+              target,
+              this.#settings.snapshot().effective.agent.workerTimeoutMs,
+              (testResult) => taskStore!.createArtifact({
+                taskId: context.taskId!,
+                runId: context.runId!,
+                kind: "test-result",
+                title: `Tester: ${target}`,
+                content: testResult.output,
+                metadata: {
+                  target,
+                  exitCode: testResult.exitCode,
+                  durationMs: testResult.durationMs,
+                  timedOut: testResult.timedOut,
+                  isolatedCopy: true,
+                },
+              }).id,
+            );
+            return {
+              target,
+              exitCode: result.exitCode,
+              durationMs: result.durationMs,
+              timedOut: result.timedOut,
+              artifactId: result.artifactId,
+            };
+          },
+        },
         onEvent: (event) => {
           this.#tasks.handleAgentEvent(event);
           broadcastEvent(event);
@@ -1808,6 +1911,7 @@ async function initializeDesktopState(
   ]) {
     taskStore.backfillWorkspacePath(workspaceId(knownWorkspace), knownWorkspace);
   }
+  agentSupervisor = new AgentSupervisor();
   taskOrchestrator = new TaskOrchestrator({
     store: taskStore,
     concurrency: 1,
@@ -1826,10 +1930,11 @@ async function initializeDesktopState(
     executor: async (input) => {
       const host = workspaceControllers.get(input.task.workspaceId);
       if (!host) throw new Error("任务所属工作区尚未加载");
-      return host.executeTask({
+      const handle = await host.executeTask({
         ...input,
         execution: input.execution as PromptExecutionInput,
       });
+      return agentSupervisor!.track(input.task, input.run, handle);
     },
     onEvent: (event) => {
       broadcastTaskEvent(event);
@@ -1848,6 +1953,7 @@ async function initializeDesktopState(
 
 async function shutdownDesktopState(): Promise<void> {
   await taskOrchestrator?.dispose({ closeStore: false });
+  await agentSupervisor?.dispose();
   await Promise.allSettled(
     [...workspaceControllers.values()].map((host) => host.dispose()),
   );
@@ -1855,6 +1961,7 @@ async function shutdownDesktopState(): Promise<void> {
   taskStore?.close();
   taskStore = undefined;
   taskOrchestrator = undefined;
+  agentSupervisor = undefined;
   controller = undefined;
 }
 
@@ -2637,6 +2744,7 @@ async function getOrCreateController(
     tasks: requireTaskOrchestrator(),
   });
   workspaceControllers.set(key, created);
+  agentSupervisor?.registerWorkspace(key);
   taskOrchestrator?.start();
   return created;
 }
@@ -2756,6 +2864,10 @@ function maybeNotifyTaskEvent(event: TaskEvent): void {
   const detail = taskOrchestrator?.getTask(event.taskId);
   if (!detail || !Notification.isSupported()) return;
   const task = detail.task;
+  // Worker lifecycle is surfaced through the parent Agent Tree. Only the root
+  // task owns desktop notifications, otherwise a two-worker batch can produce
+  // three notifications for one user action.
+  if (task.kind === "worker") return;
   const deliveryMode = taskStore?.getDeliveryMode(task.id) ?? "foreground";
   if (
     event.type === "task.succeeded"
@@ -2861,6 +2973,254 @@ function renderPlanningPrompt(
   ].join("\n\n");
 }
 
+function renderWorkerPrompt(
+  profile: import("@deki-ai/shared").WorkerProfileId,
+  context: import("@deki-ai/shared").WorkerContextPackage,
+): string {
+  const role = profile === "explorer"
+    ? "Explorer：搜索代码并收集可验证证据"
+    : profile === "tester"
+      ? "Tester：分析测试，并仅通过受控测试工具在临时副本验证"
+      : "Reviewer：审查实现、安全和回归风险";
+  return [
+    `你是只读 ${role}。`,
+    "不得修改真实工作区，不得调用 Bash、写入、删除、安装依赖或 Git 写操作。",
+    "只处理给定子任务，不要尝试创建其他 Worker，也不要假装已经执行未运行的验证。",
+    "完成调查后必须调用 worker__submit_result 提交结构化结果；证据必须能定位到文件、命令、Artifact 或 URL。",
+    `上下文包：${JSON.stringify(context)}`,
+  ].join("\n\n");
+}
+
+function renderTaskContinuation(
+  task: import("@deki-ai/shared").TaskRecord,
+  store: TaskStore | undefined,
+): string {
+  const workers = store?.getTaskDetail(task.id)?.children ?? [];
+  const persistedResults = workers.flatMap((worker) => {
+    const detail = store?.getTaskDetail(worker.task.id);
+    return detail?.workerResult
+      ? [{
+          taskId: worker.task.id,
+          profile: worker.task.assignedProfile,
+          status: worker.task.status,
+          result: detail.workerResult,
+        }]
+      : [];
+  });
+  return [
+    "继续完成此前任务。先检查当前会话和工作区状态，不要重复已经完成的步骤，",
+    "也不要盲目重放可能产生副作用的工具调用。",
+    "此前的 Worker 派发不会自动重放；只把下面已持久化的结构化结果作为证据使用。",
+    persistedResults.length > 0
+      ? `已有 Worker 结果：${JSON.stringify(persistedResults)}`
+      : "当前没有已完成并持久化的 Worker 结果。",
+    `原始目标：${task.goal}`,
+  ].join("\n\n");
+}
+
+async function runWorkerTestInSnapshot(
+  workspace: string,
+  target: string,
+  timeoutMs: number,
+  persistResult: (result: {
+    output: string;
+    exitCode: number;
+    durationMs: number;
+    timedOut: boolean;
+  }) => string | Promise<string>,
+): Promise<{
+  output: string;
+  exitCode: number;
+  durationMs: number;
+  timedOut: boolean;
+  artifactId: string;
+}> {
+  const manifestPath = join(workspace, "package.json");
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+    scripts?: Record<string, string>;
+  };
+  if (
+    !/^(?:test(?::[A-Za-z0-9_.-]+)?|lint|typecheck)$/.test(target)
+    || typeof manifest.scripts?.[target] !== "string"
+  ) {
+    throw new Error("Tester 只能运行项目已声明的 test、lint 或 typecheck 脚本");
+  }
+  const size = await directorySizeForWorker(workspace);
+  if (size > 2 * 1024 * 1024 * 1024) {
+    throw new Error("工作区超过 2 GiB，无法创建安全测试副本");
+  }
+  const snapshotRoot = await mkdtemp(join(tmpdir(), "deki-worker-test-"));
+  const snapshot = join(snapshotRoot, "workspace");
+  const startedAt = Date.now();
+  try {
+    await cloneWorkerWorkspace(workspace, snapshot, workspace);
+    const executable = existsSync(join(workspace, "pnpm-lock.yaml"))
+      ? process.platform === "win32" ? "pnpm.cmd" : "pnpm"
+      : existsSync(join(workspace, "yarn.lock"))
+        ? process.platform === "win32" ? "yarn.cmd" : "yarn"
+        : existsSync(join(workspace, "bun.lockb"))
+          ? process.platform === "win32" ? "bun.exe" : "bun"
+          : process.platform === "win32" ? "npm.cmd" : "npm";
+    const home = join(snapshotRoot, "home");
+    const temporary = join(snapshotRoot, "tmp");
+    await Promise.all([
+      mkdir(home, { recursive: true }),
+      mkdir(temporary, { recursive: true }),
+    ]);
+    const environment = Object.fromEntries(
+      ["PATH", "SystemRoot", "WINDIR", "PATHEXT", "COMSPEC", "LANG", "LC_ALL", "TERM"]
+        .flatMap((key) => process.env[key] ? [[key, process.env[key]!]] : []),
+    );
+    const output = await new Promise<{
+      text: string;
+      exitCode: number;
+      timedOut: boolean;
+    }>(
+      (resolveRun, rejectRun) => {
+        const child = spawn(executable, ["run", target], {
+          cwd: snapshot,
+          shell: false,
+          env: {
+            ...environment,
+            HOME: home,
+            USERPROFILE: home,
+            TMPDIR: temporary,
+            TEMP: temporary,
+            TMP: temporary,
+            CI: "1",
+            NO_COLOR: "1",
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        let text = "";
+        const append = (chunk: Buffer) => {
+          text = `${text}${chunk.toString("utf8")}`.slice(-1_000_000);
+        };
+        child.stdout.on("data", append);
+        child.stderr.on("data", append);
+        let timedOut = false;
+        let forceKill: NodeJS.Timeout | undefined;
+        const timer = setTimeout(() => {
+          timedOut = true;
+          append(Buffer.from(`\nTester 运行超过 ${timeoutMs}ms，已终止。\n`));
+          child.kill("SIGTERM");
+          forceKill = setTimeout(() => child.kill("SIGKILL"), 2_000);
+        }, timeoutMs);
+        child.once("error", (error) => {
+          clearTimeout(timer);
+          if (forceKill) clearTimeout(forceKill);
+          rejectRun(error);
+        });
+        child.once("close", (code) => {
+          clearTimeout(timer);
+          if (forceKill) clearTimeout(forceKill);
+          resolveRun({ text, exitCode: timedOut ? -1 : code ?? -1, timedOut });
+        });
+      },
+    );
+    const result = {
+      output: output.text,
+      exitCode: output.exitCode,
+      durationMs: Date.now() - startedAt,
+      timedOut: output.timedOut,
+    };
+    const artifactId = await persistResult(result);
+    return { ...result, artifactId };
+  } finally {
+    await rm(snapshotRoot, { recursive: true, force: true });
+  }
+}
+
+async function directorySizeForWorker(root: string): Promise<number> {
+  let total = 0;
+  const visit = async (directory: string): Promise<void> => {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      if (entry.name === ".git") continue;
+      const path = join(directory, entry.name);
+      if (entry.isSymbolicLink()) continue;
+      if (entry.isDirectory()) await visit(path);
+      else if (entry.isFile()) total += (await stat(path)).size;
+      if (total > 2 * 1024 * 1024 * 1024) return;
+    }
+  };
+  await visit(root);
+  return total;
+}
+
+async function cloneWorkerWorkspace(
+  source: string,
+  destination: string,
+  workspaceRoot: string,
+): Promise<void> {
+  await mkdir(destination, { recursive: true });
+  for (const entry of await readdir(source, { withFileTypes: true })) {
+    if (entry.name === ".git") continue;
+    const sourcePath = join(source, entry.name);
+    const destinationPath = join(destination, entry.name);
+    const info = await lstat(sourcePath);
+    if (info.isSymbolicLink()) {
+      const target = await readlink(sourcePath);
+      if (isAbsolute(target)) {
+        throw new Error(`Tester 快照拒绝绝对符号链接：${sourcePath}`);
+      }
+      const resolvedTarget = resolve(dirname(sourcePath), target);
+      if (!isPathInside(workspaceRoot, resolvedTarget)) {
+        throw new Error(`Tester 快照拒绝指向工作区外的符号链接：${sourcePath}`);
+      }
+      await symlink(target, destinationPath);
+      continue;
+    }
+    if (info.isDirectory()) {
+      await cloneWorkerWorkspace(sourcePath, destinationPath, workspaceRoot);
+      continue;
+    }
+    if (!info.isFile()) continue;
+    try {
+      await cloneWorkerFile(sourcePath, destinationPath);
+    } catch (error) {
+      throw new Error(
+        `无法为 Tester 创建写时复制快照：${sourcePath}（${formatError(error)}）`,
+        { cause: error },
+      );
+    }
+  }
+}
+
+async function cloneWorkerFile(source: string, destination: string): Promise<void> {
+  const args = process.platform === "darwin"
+    ? ["-c", source, destination]
+    : process.platform === "linux"
+      ? ["--reflink=always", "--", source, destination]
+      : undefined;
+  if (!args) throw new Error("当前平台不支持安全的写时复制 Tester 快照");
+  await new Promise<void>((resolveClone, rejectClone) => {
+    const child = spawn("cp", args, {
+      shell: false,
+      env: Object.fromEntries(
+        ["PATH", "SystemRoot", "WINDIR"]
+          .flatMap((key) => process.env[key] ? [[key, process.env[key]!]] : []),
+      ),
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    let errorText = "";
+    child.stderr.on("data", (chunk: Buffer) => {
+      errorText = `${errorText}${chunk.toString("utf8")}`.slice(-8_000);
+    });
+    child.once("error", rejectClone);
+    child.once("close", (code) => {
+      if (code === 0) resolveClone();
+      else rejectClone(new Error(errorText.trim() || `cp exited with ${code ?? -1}`));
+    });
+  });
+}
+
+function isPathInside(root: string, candidate: string): boolean {
+  const normalizedRoot = resolve(root);
+  const normalizedCandidate = resolve(candidate);
+  return normalizedCandidate === normalizedRoot
+    || normalizedCandidate.startsWith(`${normalizedRoot}${sep}`);
+}
+
 function renderPlanExecutionPrompt(
   detail: PlanDetail | undefined,
   fallbackGoal: string,
@@ -2875,6 +3235,7 @@ function renderPlanExecutionPrompt(
   return [
     "执行下面已由用户批准的计划。严格按依赖顺序串行执行，一次只执行一个步骤。",
     "开始步骤前调用 plan__update_step 标记 running；完成后标记 completed 并提供摘要和证据。",
+    "如需只读 Worker 协助，worker__delegate 请求必须携带当前 planId、revision 和 stepId，以便结论关联到步骤。",
     "若关键假设失效、风险显著变化或步骤无法完成，调用 plan__request_replan，不要自行改写计划。",
     "恢复执行时先检查工作区和会话实际状态，不要重复已完成步骤，也不要盲目重放有副作用的调用。",
     `planId=${detail.plan.id}`,

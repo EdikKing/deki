@@ -280,6 +280,140 @@ test("runs a real Plan revision and replan flow through an OpenAI-compatible fix
 
 // Playwright requires an object-destructured fixtures parameter.
 // eslint-disable-next-line no-empty-pattern
+test("runs two real read-only Workers and renders their Agent Tree", async ({}) => {
+  const temporaryHome = await mkdtemp(resolve(tmpdir(), "deki-electron-worker-flow-"));
+  const workspace = await mkdtemp(resolve(tmpdir(), "deki-electron-worker-workspace-"));
+  const modelServer = await startFixtureModelServer();
+  await seedChineseSettings(temporaryHome, { agent: { maxConcurrentRuns: 2 } });
+  await seedFixtureModel(temporaryHome, modelServer.baseUrl);
+  await writeFile(join(workspace, "README.md"), "worker fixture\n");
+  await execFileAsync("git", ["init"], { cwd: workspace });
+  await execFileAsync("git", ["add", "README.md"], { cwd: workspace });
+  await execFileAsync("git", [
+    "-c", "user.name=Deki Test",
+    "-c", "user.email=deki@example.com",
+    "commit", "-m", "fixture",
+  ], { cwd: workspace });
+  const beforeStatus = await gitWorkspaceSnapshot(workspace);
+  const electronApp = await electron.launch({
+    executablePath: electronPath,
+    args: createElectronArguments(temporaryHome, "--workspace", workspace),
+    env: createTestEnvironment(temporaryHome),
+  });
+
+  try {
+    const window = await electronApp.firstWindow();
+    await window.getByRole("button", { name: /信任并继续|Trust and continue/ }).click();
+    await expect(
+      window.locator(".composer-card").getByRole("button", { name: "选择模型" }),
+    ).toContainText("Fixture Model");
+    const submission = await window.evaluate(
+      () => (globalThis as unknown as { deki: DekiDesktopApi }).deki.sendPrompt(
+        "测试多 Agent 只读调查",
+        { mode: "background", interactionMode: "act" },
+      ),
+    );
+    expect(submission.ok, JSON.stringify(submission)).toBe(true);
+    await window.getByTestId("open-task-center").click();
+    const row = window.locator(".task-row").filter({ hasText: "测试多 Agent 只读调查" });
+    await expect(row).toContainText("2/2", { timeout: 20_000 });
+    await row.click();
+    await expect(window.locator(".task-status-pill")).toHaveText("已完成", {
+      timeout: 20_000,
+    });
+    const tree = window.getByRole("heading", { name: "Agent Tree" }).locator("..");
+    await expect(tree).toContainText("explorer");
+    await expect(tree).toContainText("reviewer");
+    await tree.getByRole("button", { name: /explorer/ }).click();
+    await expect(window.getByText("Fixture Explorer finding").first()).toBeVisible();
+    await row.click();
+    await tree.getByRole("button", { name: /reviewer/ }).click();
+    await expect(window.getByText("Fixture Reviewer finding").first()).toBeVisible();
+
+    const detail = await window.evaluate(async () => {
+      const api = (globalThis as unknown as { deki: DekiDesktopApi }).deki;
+      const summary = (await api.listTasks({
+        query: "测试多 Agent 只读调查",
+        limit: 10,
+      })).find((candidate) => candidate.task.kind === "background");
+      return summary ? api.getTask(summary.task.id) : null;
+    });
+    expect(detail?.children).toHaveLength(2);
+    expect(detail?.children.every((child) => child.task.kind === "worker")).toBe(true);
+    expect(modelServer.maxWorkerConcurrency).toBeGreaterThanOrEqual(2);
+    expect(await gitWorkspaceSnapshot(workspace)).toEqual(beforeStatus);
+  } finally {
+    await electronApp.close();
+    await modelServer.close();
+    await rm(temporaryHome, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+// Playwright requires an object-destructured fixtures parameter.
+// eslint-disable-next-line no-empty-pattern
+test("runs Tester only in a temporary snapshot and persists its log Artifact", async ({}) => {
+  const temporaryHome = await mkdtemp(resolve(tmpdir(), "deki-electron-tester-flow-"));
+  const workspace = await mkdtemp(resolve(tmpdir(), "deki-electron-tester-workspace-"));
+  const modelServer = await startFixtureModelServer();
+  await seedChineseSettings(temporaryHome, { agent: { maxConcurrentRuns: 2 } });
+  await seedFixtureModel(temporaryHome, modelServer.baseUrl);
+  await writeFile(join(workspace, "package.json"), JSON.stringify({
+    name: "tester-fixture",
+    private: true,
+    scripts: {
+      test: "node -e \"require('fs').writeFileSync('tester-output.txt','copy only'); console.log('tester ok')\"",
+    },
+  }));
+  await execFileAsync("git", ["init"], { cwd: workspace });
+  await execFileAsync("git", ["add", "package.json"], { cwd: workspace });
+  await execFileAsync("git", [
+    "-c", "user.name=Deki Test",
+    "-c", "user.email=deki@example.com",
+    "commit", "-m", "fixture",
+  ], { cwd: workspace });
+  const beforeStatus = await gitWorkspaceSnapshot(workspace);
+  const electronApp = await electron.launch({
+    executablePath: electronPath,
+    args: createElectronArguments(temporaryHome, "--workspace", workspace),
+    env: createTestEnvironment(temporaryHome),
+  });
+
+  try {
+    const window = await electronApp.firstWindow();
+    await window.getByRole("button", { name: /信任并继续|Trust and continue/ }).click();
+    await expect(
+      window.locator(".composer-card").getByRole("button", { name: "选择模型" }),
+    ).toContainText("Fixture Model");
+    const submission = await window.evaluate(
+      () => (globalThis as unknown as { deki: DekiDesktopApi }).deki.sendPrompt(
+        "测试 Tester Worker 临时副本",
+        { mode: "background", interactionMode: "act" },
+      ),
+    );
+    expect(submission.ok, JSON.stringify(submission)).toBe(true);
+    await window.getByTestId("open-task-center").click();
+    const row = window.locator(".task-row").filter({ hasText: "测试 Tester Worker 临时副本" });
+    await expect(row).toContainText("1/1", { timeout: 20_000 });
+    await row.click();
+    await window.getByRole("heading", { name: "Agent Tree" }).locator("..")
+      .getByRole("button", { name: /tester/ }).click();
+    await expect(window.getByText("Fixture Tester finding").first()).toBeVisible();
+    await window.getByRole("button", { name: /Tester: test/ }).click();
+    const preview = window.getByRole("dialog", { name: "Tester: test" });
+    await expect(preview).toContainText("tester ok");
+    await expect(readFile(join(workspace, "tester-output.txt"), "utf8")).rejects.toThrow();
+    expect(await gitWorkspaceSnapshot(workspace)).toEqual(beforeStatus);
+  } finally {
+    await electronApp.close();
+    await modelServer.close();
+    await rm(temporaryHome, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+// Playwright requires an object-destructured fixtures parameter.
+// eslint-disable-next-line no-empty-pattern
 test("resumes real background approval and user-input tasks", async ({}) => {
   const temporaryHome = await mkdtemp(resolve(tmpdir(), "deki-electron-waiting-flow-"));
   const workspace = await mkdtemp(resolve(tmpdir(), "deki-electron-waiting-workspace-"));
@@ -829,7 +963,10 @@ function createTestEnvironment(temporaryHome: string) {
   };
 }
 
-async function seedChineseSettings(temporaryHome: string) {
+async function seedChineseSettings(
+  temporaryHome: string,
+  extraSettings: Record<string, unknown> = {},
+) {
   const root = join(temporaryHome, ".deki");
   await mkdir(root, { recursive: true });
   await writeFile(join(root, "settings.json"), JSON.stringify({
@@ -837,6 +974,7 @@ async function seedChineseSettings(temporaryHome: string) {
     revision: 1,
     settings: {
       general: { locale: "zh-CN" },
+      ...extraSettings,
     },
   }));
 }
@@ -890,10 +1028,13 @@ async function seedFixtureModel(temporaryHome: string, baseUrl: string) {
 async function startFixtureModelServer(): Promise<{
   baseUrl: string;
   userPrompts: string[];
+  readonly maxWorkerConcurrency: number;
   close(): Promise<void>;
 }> {
   const userPrompts: string[] = [];
   let callSequence = 0;
+  let activeWorkerCalls = 0;
+  let maxWorkerConcurrency = 0;
   const server: Server = createServer(async (request, response) => {
     if (request.method === "GET" && request.url?.endsWith("/models")) {
       response.setHeader("content-type", "application/json");
@@ -919,6 +1060,13 @@ async function startFixtureModelServer(): Promise<{
     const currentTurn = messages.slice(Math.max(0, lastUserIndex));
     const userPrompt = messageText(messages[lastUserIndex]);
     if (userPrompt) userPrompts.push(userPrompt);
+    const workerCall = userPrompt.includes("你是只读")
+      && userPrompt.includes("上下文包");
+    if (workerCall) {
+      activeWorkerCalls += 1;
+      maxWorkerConcurrency = Math.max(maxWorkerConcurrency, activeWorkerCalls);
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+    }
     const calledTools = currentTurn.flatMap((message) => {
       if (message.role !== "assistant" || !Array.isArray(message.tool_calls)) return [];
       return message.tool_calls.flatMap((call) => {
@@ -926,7 +1074,9 @@ async function startFixtureModelServer(): Promise<{
         return typeof call.function.name === "string" ? [call.function.name] : [];
       });
     });
-    const completion = fixtureCompletion(userPrompt, calledTools);
+    const toolOutputs = currentTurn.flatMap((message) =>
+      message.role === "tool" ? [messageText(message)] : []);
+    const completion = fixtureCompletion(userPrompt, calledTools, toolOutputs);
     response.writeHead(200, {
       "content-type": "text/event-stream",
       "cache-control": "no-cache",
@@ -962,12 +1112,16 @@ async function startFixtureModelServer(): Promise<{
       writeChunk({}, "stop");
     }
     response.end("data: [DONE]\n\n");
+    if (workerCall) activeWorkerCalls -= 1;
   });
   await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
   const address = server.address() as AddressInfo;
   return {
     baseUrl: `http://127.0.0.1:${address.port}/v1`,
     userPrompts,
+    get maxWorkerConcurrency() {
+      return maxWorkerConcurrency;
+    },
     close: () => new Promise<void>((resolveClose, reject) => {
       server.close((error) => error ? reject(error) : resolveClose());
     }),
@@ -977,10 +1131,121 @@ async function startFixtureModelServer(): Promise<{
 function fixtureCompletion(
   prompt: string,
   calledTools: string[],
+  toolOutputs: string[] = [],
 ): {
   text: string;
   tool?: { name: string; arguments: Record<string, unknown> };
 } {
+  if (prompt.includes("测试多 Agent 只读调查")) {
+    if (calledTools.includes("worker__delegate")) {
+      return { text: "Worker findings synthesized." };
+    }
+    return {
+      text: "",
+      tool: {
+        name: "worker__delegate",
+        arguments: {
+          requests: [{
+            profile: "explorer",
+            objective: "定位 README 与任务入口",
+            successCriteria: ["提供文件证据"],
+            constraints: ["只读"],
+            knownFacts: ["这是 Electron fixture"],
+            fileHints: ["README.md"],
+            symbolHints: [],
+          }, {
+            profile: "reviewer",
+            objective: "审查只读边界",
+            successCriteria: ["提供风险结论"],
+            constraints: ["只读"],
+            knownFacts: ["不得修改工作区"],
+            fileHints: ["README.md"],
+            symbolHints: [],
+          }],
+        },
+      },
+    };
+  }
+  if (prompt.includes("你是只读 Explorer")) {
+    if (calledTools.includes("worker__submit_result")) {
+      return { text: "Explorer result submitted." };
+    }
+    return {
+      text: "",
+      tool: {
+        name: "worker__submit_result",
+        arguments: fixtureWorkerResult("Fixture Explorer finding"),
+      },
+    };
+  }
+  if (prompt.includes("你是只读 Reviewer")) {
+    if (calledTools.includes("worker__submit_result")) {
+      return { text: "Reviewer result submitted." };
+    }
+    return {
+      text: "",
+      tool: {
+        name: "worker__submit_result",
+        arguments: fixtureWorkerResult("Fixture Reviewer finding"),
+      },
+    };
+  }
+  if (prompt.includes("测试 Tester Worker 临时副本")) {
+    if (calledTools.includes("worker__delegate")) {
+      return { text: "Tester finding synthesized." };
+    }
+    return {
+      text: "",
+      tool: {
+        name: "worker__delegate",
+        arguments: {
+          requests: [{
+            profile: "tester",
+            objective: "在临时副本运行 test 脚本",
+            successCriteria: ["保存测试日志 Artifact"],
+            constraints: ["不得修改真实工作区"],
+            knownFacts: ["package.json 声明 test"],
+            fileHints: ["package.json"],
+            symbolHints: [],
+          }],
+        },
+      },
+    };
+  }
+  if (prompt.includes("你是只读 Tester")) {
+    if (!calledTools.includes("test__run")) {
+      return {
+        text: "",
+        tool: { name: "test__run", arguments: { target: "test" } },
+      };
+    }
+    if (!calledTools.includes("worker__submit_result")) {
+      const artifactId = toolOutputs.join("\n")
+        .match(/[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/i)?.[0]
+        ?? "";
+      return {
+        text: "",
+        tool: {
+          name: "worker__submit_result",
+          arguments: {
+            ...fixtureWorkerResult("Fixture Tester finding"),
+            artifacts: [artifactId],
+            findings: [{
+              claim: "Fixture Tester finding",
+              confidence: 0.99,
+              evidence: [{
+                kind: "command",
+                target: "test",
+                exitCode: 0,
+                outputArtifactId: artifactId,
+              }],
+            }],
+          },
+        },
+      };
+    }
+    return { text: "Tester result submitted." };
+  }
   if (prompt.includes("测试后台审批")) {
     if (calledTools.includes("workspace__delete")) return { text: "Approval completed." };
     return {
@@ -1088,6 +1353,26 @@ function fixtureCompletion(
     return { text: "Plan execution completed." };
   }
   return { text: "Fixture response." };
+}
+
+function fixtureWorkerResult(claim: string) {
+  return {
+    summary: claim,
+    findings: [{
+      claim,
+      confidence: 0.95,
+      evidence: [{
+        kind: "file",
+        path: "README.md",
+        lineStart: 1,
+        excerpt: "worker fixture",
+      }],
+    }],
+    artifacts: [],
+    risks: [],
+    unresolved: [],
+    recommendedNextActions: ["由主 Agent 综合结论"],
+  };
 }
 
 function fixturePlanStep() {

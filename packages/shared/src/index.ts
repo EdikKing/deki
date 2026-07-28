@@ -55,6 +55,12 @@ const agentSettingsSchema = z.object({
   compactionEnabled: z.boolean(),
   compactionThreshold: z.number().int(),
   maxConcurrentRuns: z.number().int(),
+  workerMaxPerRoot: z.number().int(),
+  workerTimeoutMs: z.number().int(),
+  workerMaxInputTokens: z.number().int(),
+  workerMaxOutputTokens: z.number().int(),
+  workerMaxToolCalls: z.number().int(),
+  workerModel: z.string(),
   showThinkingSummary: z.boolean(),
   sessionRetentionDays: z.number().int(),
 }).strict();
@@ -290,6 +296,7 @@ export const taskStatusSchema = z.enum([
   "running",
   "waiting_approval",
   "waiting_user",
+  "waiting_workers",
   "paused",
   "succeeded",
   "failed",
@@ -469,6 +476,7 @@ export const runStatusSchema = z.enum([
   "running",
   "waiting_approval",
   "waiting_user",
+  "waiting_workers",
   "succeeded",
   "failed",
   "cancelled",
@@ -519,6 +527,116 @@ export const artifactRecordSchema = z.object({
 }).strict();
 export type ArtifactRecord = z.infer<typeof artifactRecordSchema>;
 
+export const workerProfileIdSchema = z.enum(["explorer", "tester", "reviewer"]);
+export type WorkerProfileId = z.infer<typeof workerProfileIdSchema>;
+
+export const taskBudgetSchema = z.object({
+  maxWorkers: z.number().int().min(1).max(4),
+  maxDurationMs: z.number().int().min(10_000).max(3_600_000),
+  maxInputTokens: z.number().int().min(1_000).max(10_000_000),
+  maxOutputTokens: z.number().int().min(256).max(1_000_000),
+  maxToolCalls: z.number().int().min(1).max(1_000),
+}).strict();
+export type TaskBudget = z.infer<typeof taskBudgetSchema>;
+
+export const taskBudgetUsageSchema = z.object({
+  workers: z.number().int().nonnegative(),
+  durationMs: z.number().int().nonnegative(),
+  inputTokens: z.number().int().nonnegative(),
+  outputTokens: z.number().int().nonnegative(),
+  toolCalls: z.number().int().nonnegative(),
+  warningEmitted: z.boolean().default(false),
+  exceeded: z.boolean().default(false),
+}).strict();
+export type TaskBudgetUsage = z.infer<typeof taskBudgetUsageSchema>;
+
+export const workerEvidenceSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("file"),
+    path: z.string().min(1).max(2_000),
+    lineStart: z.number().int().positive().optional(),
+    lineEnd: z.number().int().positive().optional(),
+    excerpt: z.string().max(10_000).optional(),
+  }).strict(),
+  z.object({
+    kind: z.literal("command"),
+    target: z.string().min(1).max(500),
+    exitCode: z.number().int(),
+    outputArtifactId: z.string().uuid().optional(),
+  }).strict(),
+  z.object({
+    kind: z.literal("artifact"),
+    artifactId: z.string().uuid(),
+    description: z.string().max(2_000).optional(),
+  }).strict(),
+  z.object({
+    kind: z.literal("url"),
+    url: z.string().url().max(4_000),
+    description: z.string().max(2_000).optional(),
+  }).strict(),
+]);
+export type WorkerEvidence = z.infer<typeof workerEvidenceSchema>;
+
+export const workerFindingSchema = z.object({
+  claim: z.string().min(1).max(10_000),
+  confidence: z.number().min(0).max(1),
+  evidence: z.array(workerEvidenceSchema).max(100),
+}).strict();
+export type WorkerFinding = z.infer<typeof workerFindingSchema>;
+
+export const workerResultSchema = z.object({
+  summary: z.string().min(1).max(20_000),
+  findings: z.array(workerFindingSchema).max(100),
+  artifacts: z.array(z.string().uuid()).max(100),
+  risks: z.array(z.string().max(5_000)).max(100),
+  unresolved: z.array(z.string().max(5_000)).max(100),
+  recommendedNextActions: z.array(z.string().max(5_000)).max(100),
+}).strict();
+export type WorkerResult = z.infer<typeof workerResultSchema>;
+
+export const workerContextPackageSchema = z.object({
+  rootTaskId: z.string().uuid(),
+  parentTaskId: z.string().uuid(),
+  workerTaskId: z.string().uuid(),
+  objective: z.string().min(1).max(100_000),
+  successCriteria: z.array(z.string().min(1).max(5_000)).min(1).max(30),
+  constraints: z.array(z.string().max(5_000)).max(100),
+  knownFacts: z.array(z.string().max(5_000)).max(100),
+  fileHints: z.array(z.string().max(2_000)).max(100),
+  symbolHints: z.array(z.string().max(500)).max(100),
+  plan: z.object({
+    planId: z.string().uuid(),
+    revision: z.number().int().positive(),
+    stepId: z.string().min(1).max(100).optional(),
+  }).strict().optional(),
+  budget: taskBudgetSchema,
+}).strict();
+export type WorkerContextPackage = z.infer<typeof workerContextPackageSchema>;
+
+export const workerRequestSchema = z.object({
+  profile: workerProfileIdSchema,
+  objective: z.string().min(1).max(100_000),
+  successCriteria: z.array(z.string().min(1).max(5_000)).min(1).max(30),
+  constraints: z.array(z.string().max(5_000)).max(100).default([]),
+  knownFacts: z.array(z.string().max(5_000)).max(100).default([]),
+  fileHints: z.array(z.string().max(2_000)).max(100).default([]),
+  symbolHints: z.array(z.string().max(500)).max(100).default([]),
+  plan: z.object({
+    planId: z.string().uuid(),
+    revision: z.number().int().positive(),
+    stepId: z.string().min(1).max(100).optional(),
+  }).strict().optional(),
+}).strict();
+export type WorkerRequest = z.infer<typeof workerRequestSchema>;
+
+export const workerResultEnvelopeSchema = z.object({
+  task: taskRecordSchema,
+  status: taskStatusSchema,
+  result: workerResultSchema.optional(),
+  error: z.string().optional(),
+}).strict();
+export type WorkerResultEnvelope = z.infer<typeof workerResultEnvelopeSchema>;
+
 export const taskEventTypeSchema = z.enum([
   "task.created",
   "task.queued",
@@ -526,6 +644,7 @@ export const taskEventTypeSchema = z.enum([
   "task.progress",
   "task.waiting_approval",
   "task.waiting_user",
+  "task.waiting_workers",
   "task.paused",
   "task.pause_requested",
   "task.promoted",
@@ -543,6 +662,10 @@ export const taskEventTypeSchema = z.enum([
   "artifact.created",
   "user_input.requested",
   "user_input.resolved",
+  "worker.delegated",
+  "worker.result_received",
+  "budget.warning",
+  "budget.exceeded",
 ]);
 export type TaskEventType = z.infer<typeof taskEventTypeSchema>;
 
@@ -570,16 +693,6 @@ export const taskPlanContextSchema = z.object({
 }).strict();
 export type TaskPlanContext = z.infer<typeof taskPlanContextSchema>;
 
-export const taskDetailSchema = z.object({
-  task: taskRecordSchema,
-  runs: z.array(runRecordSchema),
-  artifacts: z.array(artifactRecordSchema),
-  events: z.array(taskEventSchema),
-  requests: z.array(taskRequestRecordSchema).default([]),
-  planContext: taskPlanContextSchema.optional(),
-}).strict();
-export type TaskDetail = z.infer<typeof taskDetailSchema>;
-
 export const taskSummarySchema = z.object({
   task: taskRecordSchema,
   currentRun: runRecordSchema.optional(),
@@ -593,8 +706,26 @@ export const taskSummarySchema = z.object({
     "runtime_unavailable",
   ]).optional(),
   planContext: taskPlanContextSchema.optional(),
+  workerCount: z.number().int().nonnegative().default(0),
+  completedWorkerCount: z.number().int().nonnegative().default(0),
+  workerPlanStepId: z.string().min(1).max(100).optional(),
+  budgetUsage: taskBudgetUsageSchema.optional(),
 }).strict();
 export type TaskSummary = z.infer<typeof taskSummarySchema>;
+
+export const taskDetailSchema = z.object({
+  task: taskRecordSchema,
+  runs: z.array(runRecordSchema),
+  artifacts: z.array(artifactRecordSchema),
+  events: z.array(taskEventSchema),
+  requests: z.array(taskRequestRecordSchema).default([]),
+  planContext: taskPlanContextSchema.optional(),
+  children: z.array(taskSummarySchema).default([]),
+  workerResult: workerResultSchema.optional(),
+  budget: taskBudgetSchema.optional(),
+  budgetUsage: taskBudgetUsageSchema.optional(),
+}).strict();
+export type TaskDetail = z.infer<typeof taskDetailSchema>;
 
 export const planDetailSchema = z.object({
   plan: planRecordSchema,
@@ -680,6 +811,13 @@ export const agentEventSchema = z.discriminatedUnion("type", [
   z.object({
     ...eventBase,
     type: z.literal("message.completed"),
+  }),
+  z.object({
+    ...eventBase,
+    type: z.literal("usage.updated"),
+    inputTokens: z.number().int().nonnegative(),
+    outputTokens: z.number().int().nonnegative(),
+    toolCallCount: z.number().int().nonnegative(),
   }),
   z.object({
     ...eventBase,
@@ -1264,7 +1402,8 @@ export interface ToolCallContext {
   taskId?: string;
   runId?: string;
   planId?: string;
-  interactionMode?: "act" | "plan" | "plan-execution";
+  interactionMode?: "act" | "plan" | "plan-execution" | "worker";
+  workerProfile?: WorkerProfileId;
   signal?: AbortSignal;
 }
 

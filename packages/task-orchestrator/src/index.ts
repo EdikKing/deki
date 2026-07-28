@@ -15,6 +15,12 @@ import {
   taskRecordSchema,
   taskRequestRecordSchema,
   taskSummarySchema,
+  taskBudgetSchema,
+  taskBudgetUsageSchema,
+  workerContextPackageSchema,
+  workerProfileIdSchema,
+  workerRequestSchema,
+  workerResultSchema,
   type AgentEvent,
   type ArtifactKind,
   type ArtifactRecord,
@@ -39,6 +45,13 @@ import {
   type TaskRequestRecord,
   type TaskStatus,
   type TaskSummary,
+  type TaskBudget,
+  type TaskBudgetUsage,
+  type WorkerContextPackage,
+  type WorkerProfileId,
+  type WorkerRequest,
+  type WorkerResult,
+  type WorkerResultEnvelope,
 } from "@deki-ai/shared";
 import { z } from "zod";
 
@@ -49,10 +62,12 @@ export const promptExecutionInputSchema = z.object({
   sourceEntryId: z.string().min(1).optional(),
   preferFork: z.boolean(),
   continuation: z.boolean().optional(),
-  interactionMode: z.enum(["act", "plan", "plan-execution"]).optional(),
+  interactionMode: z.enum(["act", "plan", "plan-execution", "worker"]).optional(),
   planId: z.string().uuid().optional(),
   planRevision: z.number().int().positive().optional(),
   deliveryMode: z.enum(["foreground", "background"]).optional(),
+  workerProfile: workerProfileIdSchema.optional(),
+  workerContext: workerContextPackageSchema.optional(),
 }).strict();
 export type PromptExecutionInput = z.infer<typeof promptExecutionInputSchema>;
 export type TaskExecutionInput = PromptExecutionInput;
@@ -75,6 +90,27 @@ export interface PlanRevisionTaskInput {
   execution: PromptExecutionInput;
 }
 
+export interface WorkerDelegationInput {
+  parentTaskId: string;
+  parentRunId: string;
+  toolCallId: string;
+  requests: WorkerRequest[];
+  budget: TaskBudget;
+  sourceSessionId: string;
+  deliveryMode?: "foreground" | "background";
+}
+
+export interface WorkerDelegation {
+  id: string;
+  parentTaskId: string;
+  parentRunId: string;
+  toolCallId: string;
+  status: "running" | "completed" | "cancelled" | "interrupted";
+  workerTasks: TaskRecord[];
+  createdAt: string;
+  completedAt?: string;
+}
+
 interface ValidatedReplan {
   plan: PlanRecord;
   revision: PlanRevisionRecord;
@@ -89,6 +125,11 @@ export interface TaskExecutionHandle {
   completion: Promise<void>;
   cancel(): Promise<void>;
   captureContext?(): PromptExecutionInput;
+  captureUsage?(): {
+    inputTokens: number;
+    outputTokens: number;
+    toolCallCount: number;
+  };
 }
 
 export type TaskExecutor = (input: {
@@ -148,6 +189,36 @@ interface ArtifactRow {
   content: string | null;
   metadata_json: string;
   created_at: string;
+}
+
+interface WorkerResultRow {
+  task_id: string;
+  run_id: string;
+  result_json: string;
+  created_at: string;
+}
+
+interface TaskBudgetRow {
+  task_id: string;
+  budget_json: string;
+  workers: number;
+  duration_ms: number;
+  input_tokens: number;
+  output_tokens: number;
+  tool_calls: number;
+  warning_emitted: number;
+  exceeded: number;
+}
+
+interface WorkerDelegationRow {
+  id: string;
+  parent_task_id: string;
+  parent_run_id: string;
+  tool_call_id: string;
+  status: string;
+  context_json: string;
+  created_at: string;
+  completed_at: string | null;
 }
 
 interface EventRow {
@@ -231,9 +302,10 @@ interface PlanEventRow {
 const taskTransitions: Record<TaskStatus, ReadonlySet<TaskStatus>> = {
   queued: new Set(["running", "paused", "cancelled"]),
   running: new Set([
-    "waiting_approval", "waiting_user", "paused", "succeeded",
+    "waiting_approval", "waiting_user", "waiting_workers", "paused", "succeeded",
     "failed", "cancelled", "interrupted",
   ]),
+  waiting_workers: new Set(["running", "paused", "cancelled", "interrupted"]),
   waiting_approval: new Set(["running", "paused", "cancelled", "interrupted"]),
   waiting_user: new Set(["running", "paused", "cancelled", "interrupted"]),
   paused: new Set(["queued", "cancelled"]),
@@ -247,9 +319,10 @@ const runTransitions: Record<RunStatus, ReadonlySet<RunStatus>> = {
   queued: new Set(["starting", "cancelled"]),
   starting: new Set(["running", "failed", "cancelled", "interrupted"]),
   running: new Set([
-    "waiting_approval", "waiting_user", "succeeded",
+    "waiting_approval", "waiting_user", "waiting_workers", "succeeded",
     "failed", "cancelled", "interrupted",
   ]),
+  waiting_workers: new Set(["running", "cancelled", "interrupted"]),
   waiting_approval: new Set(["running", "cancelled", "interrupted"]),
   waiting_user: new Set(["running", "cancelled", "interrupted"]),
   succeeded: new Set(),
@@ -369,12 +442,22 @@ export class TaskStore {
     const requests = this.#database.prepare(
       "SELECT * FROM task_requests WHERE task_id = ? ORDER BY created_at ASC",
     ).all(id) as unknown as RequestRow[];
+    const childRows = this.#database.prepare(`
+      SELECT * FROM tasks WHERE parent_task_id = ?
+      ORDER BY created_at ASC
+    `).all(id) as unknown as TaskRow[];
+    const budget = this.getTaskBudget(id);
     return taskDetailSchema.parse({
       task,
       runs: runs.map(rowToRun),
       artifacts: artifacts.map(rowToArtifact),
       events: events.map(rowToEvent),
       requests: requests.map(rowToRequest),
+      children: childRows.map((row) => this.#summaryFor(rowToTask(row))),
+      ...(task.kind === "worker"
+        ? { workerResult: this.getWorkerResult(task.id) }
+        : {}),
+      ...(budget ? { budget: budget.budget, budgetUsage: budget.usage } : {}),
       ...(task.planId ? { planContext: this.#planContextFor(task.planId) } : {}),
     });
   }
@@ -404,9 +487,21 @@ export class TaskStore {
           SELECT 1 FROM runs
           WHERE runs.task_id = tasks.id
             AND (runs.result_summary LIKE ? OR runs.error LIKE ?)
+        ) OR EXISTS (
+          SELECT 1 FROM worker_results
+          WHERE worker_results.task_id = tasks.id
+            AND worker_results.result_json LIKE ?
+        ) OR EXISTS (
+          SELECT 1 FROM tasks child
+          LEFT JOIN worker_results child_result ON child_result.task_id = child.id
+          WHERE child.parent_task_id = tasks.id
+            AND (
+              child.title LIKE ? OR child.goal LIKE ?
+              OR child_result.result_json LIKE ?
+            )
         )
       )`);
-      values.push(query, query, query, query);
+      values.push(query, query, query, query, query, query, query, query);
     }
     const rows = this.#database.prepare(`
       SELECT * FROM tasks
@@ -454,6 +549,518 @@ export class TaskStore {
       "SELECT delivery_mode FROM tasks WHERE id = ?",
     ).get(id) as { delivery_mode: string } | undefined;
     return row?.delivery_mode === "background" ? "background" : "foreground";
+  }
+
+  delegateWorkers(input: WorkerDelegationInput): WorkerDelegation {
+    const parent = this.#requireTask(input.parentTaskId);
+    const parentRun = this.#requireRun(input.parentRunId);
+    if (parent.kind === "worker") throw new Error("Worker 不能继续创建 Worker");
+    if (
+      parent.currentRunId !== parentRun.id
+      || parent.status !== "running"
+      || parentRun.status !== "running"
+    ) {
+      throw new Error("只能从当前运行中的父任务派发 Worker");
+    }
+    if (input.requests.length < 1 || input.requests.length > 2) {
+      throw new Error("每次必须派发 1～2 个 Worker");
+    }
+    const requests = input.requests.map((request) => workerRequestSchema.parse(request));
+    const budget = taskBudgetSchema.parse(input.budget);
+    const existing = this.#database.prepare(`
+      SELECT COUNT(*) AS count FROM tasks
+      WHERE root_task_id = ? AND kind = 'worker'
+    `).get(parent.rootTaskId) as { count: number };
+    if (existing.count + requests.length > budget.maxWorkers) {
+      throw new Error(`根任务最多允许 ${budget.maxWorkers} 个 Worker`);
+    }
+    const duplicate = this.#database.prepare(`
+      SELECT id FROM worker_delegations
+      WHERE parent_run_id = ? AND tool_call_id = ?
+    `).get(parentRun.id, input.toolCallId) as { id: string } | undefined;
+    if (duplicate) throw new Error("该 Worker 派发请求已经存在");
+
+    const delegationId = randomUUID();
+    const now = new Date().toISOString();
+    const workerTasks: TaskRecord[] = [];
+    this.#transaction((events) => {
+      this.#database.prepare(`
+        INSERT INTO worker_delegations (
+          id, parent_task_id, parent_run_id, tool_call_id, status,
+          context_json, created_at, completed_at
+        ) VALUES (?, ?, ?, ?, 'running', ?, ?, NULL)
+      `).run(
+        delegationId,
+        parent.id,
+        parentRun.id,
+        input.toolCallId,
+        JSON.stringify({ requests }),
+        now,
+      );
+      this.#database.prepare(`
+        INSERT INTO task_budgets (
+          task_id, budget_json, workers, duration_ms, input_tokens,
+          output_tokens, tool_calls, warning_emitted, exceeded
+        ) VALUES (?, ?, 0, 0, 0, 0, 0, 0, 0)
+        ON CONFLICT(task_id) DO NOTHING
+      `).run(parent.rootTaskId, JSON.stringify(budget));
+
+      for (const request of requests) {
+        const workerTaskId = randomUUID();
+        const workerPlanId = request.plan?.planId ?? parent.planId;
+        const context: WorkerContextPackage = workerContextPackageSchema.parse({
+          rootTaskId: parent.rootTaskId,
+          parentTaskId: parent.id,
+          workerTaskId,
+          objective: request.objective,
+          successCriteria: request.successCriteria,
+          constraints: request.constraints,
+          knownFacts: request.knownFacts,
+          fileHints: request.fileHints,
+          symbolHints: request.symbolHints,
+          ...(request.plan ? { plan: request.plan } : {}),
+          budget,
+        });
+        const task = this.#insertTask({
+          id: workerTaskId,
+          workspaceId: parent.workspaceId,
+          ...(parent.workspacePath ? { workspacePath: parent.workspacePath } : {}),
+          kind: "worker",
+          title: `${workerProfileLabel(request.profile)}：${request.objective.slice(0, 120)}`,
+          goal: request.objective,
+          parentTaskId: parent.id,
+          rootTaskId: parent.rootTaskId,
+          assignedProfile: request.profile,
+          priority: parent.priority,
+          ...(workerPlanId ? { planId: workerPlanId } : {}),
+          execution: {
+            type: "agent-prompt",
+            sourceSessionId: input.sourceSessionId,
+            preferFork: true,
+            interactionMode: "worker",
+            workerProfile: request.profile,
+            workerContext: context,
+            deliveryMode: input.deliveryMode ?? "background",
+          },
+        }, events);
+        this.#database.prepare(`
+          INSERT INTO task_budgets (
+            task_id, budget_json, workers, duration_ms, input_tokens,
+            output_tokens, tool_calls, warning_emitted, exceeded
+          ) VALUES (?, ?, 0, 0, 0, 0, 0, 0, 0)
+        `).run(task.id, JSON.stringify(budget));
+        this.#database.prepare(`
+          INSERT INTO worker_delegation_tasks (delegation_id, task_id)
+          VALUES (?, ?)
+        `).run(delegationId, task.id);
+        workerTasks.push(task);
+      }
+      this.#database.prepare(`
+        UPDATE task_budgets SET workers = workers + ?
+        WHERE task_id = ?
+      `).run(workerTasks.length, parent.rootTaskId);
+      this.#database.prepare(
+        "UPDATE tasks SET status = 'waiting_workers', updated_at = ? WHERE id = ?",
+      ).run(now, parent.id);
+      this.#database.prepare(
+        "UPDATE runs SET status = 'waiting_workers' WHERE id = ? AND task_id = ?",
+      ).run(parentRun.id, parent.id);
+      events.push(this.#appendEvent(
+        parent.id,
+        "worker.delegated",
+        {
+          delegationId,
+          workerTaskIds: workerTasks.map((task) => task.id),
+          profiles: workerTasks.map((task) => task.assignedProfile),
+        },
+        parentRun.id,
+        parent.sessionId,
+      ));
+      events.push(this.#appendEvent(
+        parent.id,
+        "task.waiting_workers",
+        { delegationId, workerTaskIds: workerTasks.map((task) => task.id) },
+        parentRun.id,
+        parent.sessionId,
+      ));
+    });
+    return {
+      id: delegationId,
+      parentTaskId: parent.id,
+      parentRunId: parentRun.id,
+      toolCallId: input.toolCallId,
+      status: "running",
+      workerTasks,
+      createdAt: now,
+    };
+  }
+
+  getWorkerResult(taskId: string, runId?: string): WorkerResult | undefined {
+    const row = this.#database.prepare(`
+      SELECT * FROM worker_results
+      WHERE task_id = ? ${runId ? "AND run_id = ?" : ""}
+      ORDER BY created_at DESC LIMIT 1
+    `).get(...(runId ? [taskId, runId] : [taskId])) as unknown as
+      | WorkerResultRow
+      | undefined;
+    return row ? workerResultSchema.parse(JSON.parse(row.result_json)) : undefined;
+  }
+
+  saveWorkerResult(taskId: string, runId: string, result: WorkerResult): WorkerResult {
+    const task = this.#requireTask(taskId);
+    const run = this.#requireRun(runId);
+    if (task.kind !== "worker" || run.taskId !== task.id || task.currentRunId !== run.id) {
+      throw new Error("Worker Result 与当前 Worker Run 不匹配");
+    }
+    const parsed = workerResultSchema.parse(result);
+    const artifactIds = new Set(parsed.artifacts);
+    for (const finding of parsed.findings) {
+      for (const evidence of finding.evidence) {
+        if (evidence.kind === "file" && !isSafeWorkspaceRelativePath(evidence.path)) {
+          throw new Error(`Worker 文件证据必须是工作区相对路径: ${evidence.path}`);
+        }
+        if (evidence.kind === "artifact") artifactIds.add(evidence.artifactId);
+        if (evidence.kind === "command" && evidence.outputArtifactId) {
+          artifactIds.add(evidence.outputArtifactId);
+        }
+      }
+    }
+    for (const artifactId of artifactIds) {
+      const artifact = this.#database.prepare(
+        "SELECT task_id FROM artifacts WHERE id = ?",
+      ).get(artifactId) as { task_id: string } | undefined;
+      if (!artifact || artifact.task_id !== task.id) {
+        throw new Error(`Worker Result 引用了不属于当前 Worker 的 Artifact: ${artifactId}`);
+      }
+    }
+    const now = new Date().toISOString();
+    this.#transaction((events) => {
+      this.#database.prepare(`
+        INSERT INTO worker_results (task_id, run_id, result_json, created_at)
+        VALUES (?, ?, ?, ?)
+      `).run(task.id, run.id, JSON.stringify(parsed), now);
+      events.push(this.#appendEvent(
+        task.id,
+        "worker.result_received",
+        { findingCount: parsed.findings.length },
+        run.id,
+        task.sessionId,
+      ));
+    });
+    return parsed;
+  }
+
+  updateRunUsage(
+    taskId: string,
+    runId: string,
+    usage: Pick<TaskBudgetUsage, "inputTokens" | "outputTokens" | "toolCalls" | "durationMs">,
+  ): TaskBudgetUsage | undefined {
+    const task = this.#requireTask(taskId);
+    const run = this.#requireRun(runId);
+    if (run.taskId !== task.id) throw new Error("Run 不属于该 Task");
+    const budgetRow = this.#database.prepare(
+      "SELECT * FROM task_budgets WHERE task_id = ?",
+    ).get(task.id) as unknown as TaskBudgetRow | undefined;
+    this.#database.prepare(`
+      UPDATE runs SET input_tokens = ?, output_tokens = ?, tool_call_count = ?
+      WHERE id = ? AND task_id = ?
+    `).run(
+      usage.inputTokens,
+      usage.outputTokens,
+      usage.toolCalls,
+      run.id,
+      task.id,
+    );
+    if (!budgetRow || task.kind !== "worker") return undefined;
+    const budget = taskBudgetSchema.parse(JSON.parse(budgetRow.budget_json));
+    const aggregate = this.#database.prepare(`
+      SELECT
+        COALESCE(SUM(input_tokens), 0) AS input_tokens,
+        COALESCE(SUM(output_tokens), 0) AS output_tokens,
+        COALESCE(SUM(tool_call_count), 0) AS tool_calls
+      FROM runs WHERE task_id = ?
+    `).get(task.id) as {
+      input_tokens: number;
+      output_tokens: number;
+      tool_calls: number;
+    };
+    const previousDurationMs = (
+      this.#database.prepare(`
+        SELECT started_at, finished_at FROM runs
+        WHERE task_id = ? AND id <> ? AND started_at IS NOT NULL AND finished_at IS NOT NULL
+      `).all(task.id, run.id) as Array<{
+        started_at: string;
+        finished_at: string;
+      }>
+    ).reduce((total, previous) => total + Math.max(
+      0,
+      Date.parse(previous.finished_at) - Date.parse(previous.started_at),
+    ), 0);
+    const next = taskBudgetUsageSchema.parse({
+      workers: budgetRow.workers,
+      durationMs: previousDurationMs + usage.durationMs,
+      inputTokens: aggregate.input_tokens,
+      outputTokens: aggregate.output_tokens,
+      toolCalls: aggregate.tool_calls,
+      warningEmitted: Boolean(budgetRow.warning_emitted),
+      exceeded: Boolean(budgetRow.exceeded),
+    });
+    const ratio = Math.max(
+      next.durationMs / budget.maxDurationMs,
+      next.inputTokens / budget.maxInputTokens,
+      next.outputTokens / budget.maxOutputTokens,
+      next.toolCalls / budget.maxToolCalls,
+    );
+    const warning = ratio >= 0.8;
+    const exceeded = ratio >= 1;
+    const shouldWarn = warning && !next.warningEmitted;
+    const shouldExceed = exceeded && !next.exceeded;
+    let rootWarning = false;
+    let rootExceeded = false;
+    this.#transaction((events) => {
+      this.#database.prepare(`
+        UPDATE task_budgets
+        SET duration_ms = ?, input_tokens = ?, output_tokens = ?, tool_calls = ?,
+            warning_emitted = MAX(warning_emitted, ?), exceeded = MAX(exceeded, ?)
+        WHERE task_id = ?
+      `).run(
+        next.durationMs,
+        next.inputTokens,
+        next.outputTokens,
+        next.toolCalls,
+        warning ? 1 : 0,
+        exceeded ? 1 : 0,
+        task.id,
+      );
+      if (shouldWarn) {
+        events.push(this.#appendEvent(
+          task.id,
+          "budget.warning",
+          { ratio },
+          run.id,
+          task.sessionId,
+        ));
+      }
+      if (shouldExceed) {
+        events.push(this.#appendEvent(
+          task.id,
+          "budget.exceeded",
+          { ratio },
+          run.id,
+          task.sessionId,
+        ));
+      }
+      this.#database.prepare(`
+        UPDATE task_budgets
+        SET duration_ms = (
+              SELECT COALESCE(SUM(duration_ms), 0) FROM task_budgets child
+              JOIN tasks ON tasks.id = child.task_id
+              WHERE tasks.root_task_id = ? AND tasks.kind = 'worker'
+            ),
+            input_tokens = (
+              SELECT COALESCE(SUM(input_tokens), 0) FROM runs
+              JOIN tasks ON tasks.id = runs.task_id
+              WHERE tasks.root_task_id = ? AND tasks.kind = 'worker'
+            ),
+            output_tokens = (
+              SELECT COALESCE(SUM(output_tokens), 0) FROM runs
+              JOIN tasks ON tasks.id = runs.task_id
+              WHERE tasks.root_task_id = ? AND tasks.kind = 'worker'
+            ),
+            tool_calls = (
+              SELECT COALESCE(SUM(tool_call_count), 0) FROM runs
+              JOIN tasks ON tasks.id = runs.task_id
+              WHERE tasks.root_task_id = ? AND tasks.kind = 'worker'
+            )
+        WHERE task_id = ?
+      `).run(
+        task.rootTaskId,
+        task.rootTaskId,
+        task.rootTaskId,
+        task.rootTaskId,
+        task.rootTaskId,
+      );
+      if (task.rootTaskId !== task.id) {
+        const rootRow = this.#database.prepare(
+          "SELECT * FROM task_budgets WHERE task_id = ?",
+        ).get(task.rootTaskId) as unknown as TaskBudgetRow | undefined;
+        if (rootRow) {
+          const rootRatio = Math.max(
+            rootRow.duration_ms / budget.maxDurationMs,
+            rootRow.input_tokens / budget.maxInputTokens,
+            rootRow.output_tokens / budget.maxOutputTokens,
+            rootRow.tool_calls / budget.maxToolCalls,
+          );
+          rootWarning = rootRatio >= 0.8;
+          rootExceeded = rootRatio >= 1;
+          this.#database.prepare(`
+            UPDATE task_budgets
+            SET warning_emitted = MAX(warning_emitted, ?),
+                exceeded = MAX(exceeded, ?)
+            WHERE task_id = ?
+          `).run(rootWarning ? 1 : 0, rootExceeded ? 1 : 0, task.rootTaskId);
+          if (rootWarning && !rootRow.warning_emitted) {
+            events.push(this.#appendEvent(
+              task.rootTaskId,
+              "budget.warning",
+              { ratio: rootRatio, workerTaskId: task.id },
+              run.id,
+              task.sessionId,
+            ));
+          }
+          if (rootExceeded && !rootRow.exceeded) {
+            events.push(this.#appendEvent(
+              task.rootTaskId,
+              "budget.exceeded",
+              { ratio: rootRatio, workerTaskId: task.id },
+              run.id,
+              task.sessionId,
+            ));
+          }
+        }
+      }
+    });
+    return {
+      ...next,
+      warningEmitted: warning || rootWarning,
+      exceeded: exceeded || rootExceeded,
+    };
+  }
+
+  getTaskBudget(taskId: string): {
+    budget: TaskBudget;
+    usage: TaskBudgetUsage;
+  } | undefined {
+    const row = this.#database.prepare(
+      "SELECT * FROM task_budgets WHERE task_id = ?",
+    ).get(taskId) as unknown as TaskBudgetRow | undefined;
+    if (!row) return undefined;
+    return {
+      budget: taskBudgetSchema.parse(JSON.parse(row.budget_json)),
+      usage: taskBudgetUsageSchema.parse({
+        workers: row.workers,
+        durationMs: row.duration_ms,
+        inputTokens: row.input_tokens,
+        outputTokens: row.output_tokens,
+        toolCalls: row.tool_calls,
+        warningEmitted: Boolean(row.warning_emitted),
+        exceeded: Boolean(row.exceeded),
+      }),
+    };
+  }
+
+  tryCompleteWorkerDelegation(workerTaskId: string): {
+    parentTaskId: string;
+    parentRunId: string;
+    delegationId: string;
+    results: WorkerResultEnvelope[];
+  } | undefined {
+    const delegation = this.#database.prepare(`
+      SELECT d.* FROM worker_delegations d
+      JOIN worker_delegation_tasks dt ON dt.delegation_id = d.id
+      WHERE dt.task_id = ? AND d.status = 'running'
+    `).get(workerTaskId) as unknown as WorkerDelegationRow | undefined;
+    if (!delegation) return undefined;
+    const rows = this.#database.prepare(`
+      SELECT t.* FROM tasks t
+      JOIN worker_delegation_tasks dt ON dt.task_id = t.id
+      WHERE dt.delegation_id = ?
+      ORDER BY t.created_at ASC
+    `).all(delegation.id) as unknown as TaskRow[];
+    const tasks = rows.map(rowToTask);
+    if (tasks.some((task) => !isTerminalTaskStatus(task.status))) return undefined;
+    const results: WorkerResultEnvelope[] = tasks.map((task) => {
+      const latestRun = this.#database.prepare(`
+        SELECT * FROM runs WHERE task_id = ? ORDER BY attempt DESC LIMIT 1
+      `).get(task.id) as unknown as RunRow | undefined;
+      const result = this.getWorkerResult(task.id, latestRun?.id);
+      return {
+        task,
+        status: task.status,
+        ...(result ? { result } : {}),
+        ...(latestRun?.error ? { error: latestRun.error } : {}),
+      };
+    });
+    const parent = this.#requireTask(delegation.parent_task_id);
+    const parentRun = this.#requireRun(delegation.parent_run_id);
+    const now = new Date().toISOString();
+    this.#transaction((events) => {
+      this.#database.prepare(`
+        UPDATE worker_delegations
+        SET status = 'completed', completed_at = ?
+        WHERE id = ? AND status = 'running'
+      `).run(now, delegation.id);
+      events.push(this.#appendEvent(
+        parent.id,
+        "worker.result_received",
+        {
+          delegationId: delegation.id,
+          workers: results.map((entry) => ({
+            taskId: entry.task.id,
+            status: entry.status,
+          })),
+        },
+        parentRun.id,
+        parent.sessionId,
+      ));
+    });
+    return {
+      parentTaskId: parent.id,
+      parentRunId: parentRun.id,
+      delegationId: delegation.id,
+      results,
+    };
+  }
+
+  resumeAfterWorkers(
+    parentTaskId: string,
+    parentRunId: string,
+    delegationId: string,
+  ): void {
+    const parent = this.#requireTask(parentTaskId);
+    const run = this.#requireRun(parentRunId);
+    if (parent.status !== "waiting_workers" || run.status !== "waiting_workers") {
+      throw new Error("父任务已不再等待 Worker");
+    }
+    const delegation = this.#database.prepare(`
+      SELECT id FROM worker_delegations
+      WHERE id = ? AND parent_task_id = ? AND parent_run_id = ? AND status = 'completed'
+    `).get(
+      delegationId,
+      parent.id,
+      run.id,
+    ) as { id: string } | undefined;
+    if (!delegation) throw new Error("Worker 派发尚未完成");
+    const now = new Date().toISOString();
+    this.#transaction((events) => {
+      this.#database.prepare(
+        "UPDATE tasks SET status = 'running', updated_at = ? WHERE id = ?",
+      ).run(now, parent.id);
+      this.#database.prepare(
+        "UPDATE runs SET status = 'running' WHERE id = ? AND task_id = ?",
+      ).run(run.id, parent.id);
+      events.push(this.#appendEvent(
+        parent.id,
+        "task.resumed",
+        { from: "waiting_workers", delegationId },
+        run.id,
+        parent.sessionId,
+      ));
+    });
+  }
+
+  listDescendantTasks(taskId: string): TaskRecord[] {
+    const rows = this.#database.prepare(`
+      WITH RECURSIVE descendants(id) AS (
+        SELECT id FROM tasks WHERE parent_task_id = ?
+        UNION ALL
+        SELECT tasks.id FROM tasks
+        JOIN descendants ON tasks.parent_task_id = descendants.id
+      )
+      SELECT tasks.* FROM tasks JOIN descendants ON tasks.id = descendants.id
+      ORDER BY tasks.created_at DESC
+    `).all(taskId) as unknown as TaskRow[];
+    return rows.map(rowToTask);
   }
 
   getLatestPlanningTask(planId: string): TaskRecord | undefined {
@@ -637,7 +1244,9 @@ export class TaskStore {
       : undefined;
     if (
       executionTask
-      && ["running", "waiting_approval", "waiting_user"].includes(executionTask.status)
+      && ["running", "waiting_approval", "waiting_user", "waiting_workers"].includes(
+        executionTask.status,
+      )
     ) {
       throw new Error("计划执行任务仍在运行，必须先精确暂停");
     }
@@ -1162,7 +1771,9 @@ export class TaskStore {
 
   requestPause(taskId: string): void {
     const task = this.#requireTask(taskId);
-    if (!["running", "waiting_approval", "waiting_user"].includes(task.status)) {
+    if (!["running", "waiting_approval", "waiting_user", "waiting_workers"].includes(
+      task.status,
+    )) {
       throw new Error("任务当前不能暂停");
     }
     this.#transaction((events) => {
@@ -1629,7 +2240,7 @@ export class TaskStore {
   recoverInterrupted(): number {
     const tasks = this.#database.prepare(`
       SELECT * FROM tasks
-      WHERE status IN ('running', 'waiting_approval', 'waiting_user')
+      WHERE status IN ('running', 'waiting_approval', 'waiting_user', 'waiting_workers')
       ORDER BY created_at ASC
     `).all() as unknown as TaskRow[];
     for (const row of tasks) {
@@ -1643,7 +2254,8 @@ export class TaskStore {
             SET status = 'interrupted', finished_at = ?,
                 error = COALESCE(error, '应用在任务运行期间退出')
             WHERE id = ? AND status IN (
-              'queued', 'starting', 'running', 'waiting_approval', 'waiting_user'
+              'queued', 'starting', 'running', 'waiting_approval', 'waiting_user',
+              'waiting_workers'
             )
           `).run(now, runId);
           events.push(this.#appendEvent(
@@ -1692,7 +2304,7 @@ export class TaskStore {
   countActive(): number {
     const row = this.#database.prepare(`
       SELECT COUNT(*) AS count FROM tasks
-      WHERE status IN ('running', 'waiting_approval', 'waiting_user')
+      WHERE status IN ('running', 'waiting_approval', 'waiting_user', 'waiting_workers')
     `).get() as { count: number };
     return row.count;
   }
@@ -1701,7 +2313,10 @@ export class TaskStore {
     const row = this.#database.prepare(`
       SELECT 1 AS found FROM tasks
       WHERE workspace_id = ? AND session_id = ?
-        AND status IN ('queued', 'running', 'waiting_approval', 'waiting_user', 'paused')
+        AND status IN (
+          'queued', 'running', 'waiting_approval', 'waiting_user',
+          'waiting_workers', 'paused'
+        )
       LIMIT 1
     `).get(workspaceId, sessionId) as { found: number } | undefined;
     return row !== undefined;
@@ -1719,12 +2334,28 @@ export class TaskStore {
     const latestRun = currentRun ?? this.#database.prepare(`
       SELECT * FROM runs WHERE task_id = ? ORDER BY attempt DESC LIMIT 1
     `).get(task.id) as unknown as RunRow | undefined;
+    const workers = this.#database.prepare(`
+      SELECT
+        COUNT(*) AS count,
+        COALESCE(SUM(CASE WHEN status IN (
+          'succeeded', 'failed', 'cancelled', 'interrupted'
+        ) THEN 1 ELSE 0 END), 0) AS completed
+      FROM tasks WHERE parent_task_id = ? AND kind = 'worker'
+    `).get(task.id) as { count: number; completed: number };
+    const budget = this.getTaskBudget(task.id);
+    const workerPlanStepId = task.kind === "worker"
+      ? this.getExecution(task.id).workerContext?.plan?.stepId
+      : undefined;
     return taskSummarySchema.parse({
       task,
       ...(currentRun ? { currentRun: rowToRun(currentRun) } : {}),
       pendingRequestCount: this.pendingRequestCount(task.id),
       ...(latestRun?.result_summary ? { resultSummary: latestRun.result_summary } : {}),
       ...(latestRun?.error ? { error: latestRun.error } : {}),
+      workerCount: workers.count,
+      completedWorkerCount: workers.completed,
+      ...(workerPlanStepId ? { workerPlanStepId } : {}),
+      ...(budget ? { budgetUsage: budget.usage } : {}),
       ...(task.planId ? { planContext: this.#planContextFor(task.planId) } : {}),
     });
   }
@@ -1794,7 +2425,8 @@ export class TaskStore {
       SELECT * FROM tasks
       WHERE plan_id = ? AND kind = 'planning'
         AND status IN (
-          'queued', 'running', 'waiting_approval', 'waiting_user', 'paused'
+          'queued', 'running', 'waiting_approval', 'waiting_user',
+          'waiting_workers', 'paused'
         )
       ORDER BY created_at DESC, rowid DESC
       LIMIT 1
@@ -1912,6 +2544,7 @@ export class TaskStore {
   }
 
   #insertTask(input: {
+    id?: string;
     workspaceId: string;
     workspacePath?: string;
     kind: TaskKind;
@@ -1920,20 +2553,25 @@ export class TaskStore {
     execution: TaskExecutionInput;
     priority?: number;
     planId?: string;
+    parentTaskId?: string;
+    rootTaskId?: string;
+    assignedProfile?: string;
   }, events: TaskEvent[]): TaskRecord {
-    const id = randomUUID();
+    const id = input.id ?? randomUUID();
     const now = new Date().toISOString();
     const task = taskRecordSchema.parse({
       id,
       workspaceId: input.workspaceId,
       ...(input.workspacePath ? { workspacePath: input.workspacePath } : {}),
-      rootTaskId: id,
+      rootTaskId: input.rootTaskId ?? id,
+      ...(input.parentTaskId ? { parentTaskId: input.parentTaskId } : {}),
       kind: input.kind,
       title: input.title.trim(),
       goal: input.goal.trim(),
       status: "queued",
       priority: input.priority ?? 0,
       ...(input.planId ? { planId: input.planId } : {}),
+      ...(input.assignedProfile ? { assignedProfile: input.assignedProfile } : {}),
       createdAt: now,
       updatedAt: now,
     });
@@ -1942,17 +2580,19 @@ export class TaskStore {
         id, workspace_id, workspace_path, root_task_id, parent_task_id, kind,
         title, goal, status, priority, session_id, plan_id, current_run_id,
         assigned_profile, execution_json, delivery_mode, created_at, updated_at, completed_at
-      ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, 'queued', ?, NULL, ?, NULL, NULL, ?, ?, ?, ?, NULL)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, NULL, ?, NULL, ?, ?, ?, ?, ?, NULL)
     `).run(
       task.id,
       task.workspaceId,
       task.workspacePath ?? null,
       task.rootTaskId,
+      task.parentTaskId ?? null,
       task.kind,
       task.title,
       task.goal,
       task.priority,
       task.planId ?? null,
+      task.assignedProfile ?? null,
       JSON.stringify(promptExecutionInputSchema.parse(input.execution)),
       promptExecutionInputSchema.parse(input.execution).deliveryMode ?? "foreground",
       task.createdAt,
@@ -2220,7 +2860,44 @@ export class TaskStore {
         );
         CREATE INDEX plan_events_plan_sequence_idx
           ON plan_events(plan_id, sequence);
-        PRAGMA user_version = 4;
+        CREATE TABLE worker_delegations (
+          id TEXT PRIMARY KEY,
+          parent_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          parent_run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+          tool_call_id TEXT NOT NULL,
+          status TEXT NOT NULL,
+          context_json TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          completed_at TEXT,
+          UNIQUE(parent_run_id, tool_call_id)
+        );
+        CREATE INDEX worker_delegations_parent_idx
+          ON worker_delegations(parent_task_id, created_at);
+        CREATE TABLE worker_delegation_tasks (
+          delegation_id TEXT NOT NULL REFERENCES worker_delegations(id) ON DELETE CASCADE,
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          PRIMARY KEY(delegation_id, task_id),
+          UNIQUE(task_id)
+        );
+        CREATE TABLE worker_results (
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+          result_json TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          PRIMARY KEY(task_id, run_id)
+        );
+        CREATE TABLE task_budgets (
+          task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+          budget_json TEXT NOT NULL,
+          workers INTEGER NOT NULL DEFAULT 0,
+          duration_ms INTEGER NOT NULL DEFAULT 0,
+          input_tokens INTEGER NOT NULL DEFAULT 0,
+          output_tokens INTEGER NOT NULL DEFAULT 0,
+          tool_calls INTEGER NOT NULL DEFAULT 0,
+          warning_emitted INTEGER NOT NULL DEFAULT 0,
+          exceeded INTEGER NOT NULL DEFAULT 0
+        );
+        PRAGMA user_version = 5;
         COMMIT;
       `);
       return;
@@ -2332,6 +3009,50 @@ export class TaskStore {
         COMMIT;
       `);
     }
+    if (version <= 4) {
+      this.#database.exec(`
+        BEGIN;
+        CREATE TABLE worker_delegations (
+          id TEXT PRIMARY KEY,
+          parent_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          parent_run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+          tool_call_id TEXT NOT NULL,
+          status TEXT NOT NULL,
+          context_json TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          completed_at TEXT,
+          UNIQUE(parent_run_id, tool_call_id)
+        );
+        CREATE INDEX worker_delegations_parent_idx
+          ON worker_delegations(parent_task_id, created_at);
+        CREATE TABLE worker_delegation_tasks (
+          delegation_id TEXT NOT NULL REFERENCES worker_delegations(id) ON DELETE CASCADE,
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          PRIMARY KEY(delegation_id, task_id),
+          UNIQUE(task_id)
+        );
+        CREATE TABLE worker_results (
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+          result_json TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          PRIMARY KEY(task_id, run_id)
+        );
+        CREATE TABLE task_budgets (
+          task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+          budget_json TEXT NOT NULL,
+          workers INTEGER NOT NULL DEFAULT 0,
+          duration_ms INTEGER NOT NULL DEFAULT 0,
+          input_tokens INTEGER NOT NULL DEFAULT 0,
+          output_tokens INTEGER NOT NULL DEFAULT 0,
+          tool_calls INTEGER NOT NULL DEFAULT 0,
+          warning_emitted INTEGER NOT NULL DEFAULT 0,
+          exceeded INTEGER NOT NULL DEFAULT 0
+        );
+        PRAGMA user_version = 5;
+        COMMIT;
+      `);
+    }
   }
 }
 
@@ -2349,6 +3070,12 @@ interface ActiveExecution {
   rejectReplan: ((error: Error) => void) | undefined;
   slotHeld: boolean;
   summary: string;
+  startedAt: number;
+  toolCallCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  budgetExceeded: string | undefined;
+  budgetTimer: ReturnType<typeof setTimeout> | undefined;
   completion: Promise<void>;
 }
 
@@ -2356,6 +3083,15 @@ interface ResumeWaiter {
   taskId: string;
   requestId: string;
   resolve: (lease: ResumeLease | null) => void;
+}
+
+interface WorkerCompletionWaiter {
+  delegationId: string;
+  parentTaskId: string;
+  parentRunId: string;
+  results: WorkerResultEnvelope[];
+  resolve: (results: WorkerResultEnvelope[]) => void;
+  reject: (error: Error) => void;
 }
 
 export interface ResumeLease {
@@ -2381,6 +3117,8 @@ export class TaskOrchestrator {
   readonly #onEvent: ((event: TaskEvent) => void) | undefined;
   readonly #active = new Map<string, ActiveExecution>();
   readonly #resumeWaiters: ResumeWaiter[] = [];
+  readonly #workerWaiters = new Map<string, WorkerCompletionWaiter>();
+  readonly #workerReady: WorkerCompletionWaiter[] = [];
   #concurrency: number;
   #started = false;
   #paused = false;
@@ -2411,7 +3149,10 @@ export class TaskOrchestrator {
       });
     this.#isWorkspaceAvailable = (task) => this.#workspaceAvailability(task).runnable;
     this.#onEvent = options.onEvent;
-    this.#unsubscribe = this.#store.subscribe((event) => this.#onEvent?.(event));
+    this.#unsubscribe = this.#store.subscribe((event) => {
+      this.#onEvent?.(event);
+      this.#handleWorkerTaskEvent(event);
+    });
     if (options.recoverOnStart !== false) this.#store.recoverInterrupted();
   }
 
@@ -2458,6 +3199,36 @@ export class TaskOrchestrator {
     return task;
   }
 
+  delegateWorkers(input: WorkerDelegationInput): Promise<WorkerResultEnvelope[]> {
+    if (this.#disposed) throw new Error("Task Orchestrator 已释放");
+    const active = this.#active.get(input.parentTaskId);
+    if (!active || active.runId !== input.parentRunId) {
+      throw new Error("父任务当前没有活动 Run");
+    }
+    const delegation = this.#store.delegateWorkers(input);
+    const promise = new Promise<WorkerResultEnvelope[]>((resolve, reject) => {
+      this.#workerWaiters.set(delegation.id, {
+        delegationId: delegation.id,
+        parentTaskId: delegation.parentTaskId,
+        parentRunId: delegation.parentRunId,
+        results: [],
+        resolve,
+        reject,
+      });
+    });
+    this.#releaseSlot(active);
+    this.#drain();
+    return promise;
+  }
+
+  saveWorkerResult(
+    taskId: string,
+    runId: string,
+    result: WorkerResult,
+  ): WorkerResult {
+    return this.#store.saveWorkerResult(taskId, runId, result);
+  }
+
   listTaskSummaries(options: {
     statuses?: TaskStatus[];
     workspaceIds?: string[];
@@ -2501,7 +3272,7 @@ export class TaskOrchestrator {
     const sessionId = maybeSessionId ?? workspaceIdOrSessionId;
     if (!workspaceId) return undefined;
     return this.#store.listTasks(workspaceId, {
-      statuses: ["running", "waiting_approval", "waiting_user"],
+      statuses: ["running", "waiting_approval", "waiting_user", "waiting_workers"],
       limit: 500,
     }).find((task) => task.sessionId === sessionId);
   }
@@ -2511,6 +3282,17 @@ export class TaskOrchestrator {
   }
 
   async cancelTask(taskId: string): Promise<boolean> {
+    const task = this.#store.getTask(taskId);
+    if (!task) return false;
+    if (isTerminalTaskStatus(task.status)) return true;
+    const descendants = this.#store.listDescendantTasks(taskId)
+      .filter((candidate) => !isTerminalTaskStatus(candidate.status));
+    await Promise.allSettled(descendants.map((candidate) =>
+      this.#cancelSingleTask(candidate.id)));
+    return this.#cancelSingleTask(taskId);
+  }
+
+  async #cancelSingleTask(taskId: string): Promise<boolean> {
     const task = this.#store.getTask(taskId);
     if (!task) return false;
     if (isTerminalTaskStatus(task.status)) return true;
@@ -2528,6 +3310,17 @@ export class TaskOrchestrator {
   }
 
   async pauseTask(taskId: string): Promise<boolean> {
+    const task = this.#store.getTask(taskId);
+    if (!task) return false;
+    if (task.status === "paused") return true;
+    const descendants = this.#store.listDescendantTasks(taskId)
+      .filter((candidate) => !isTerminalTaskStatus(candidate.status));
+    await Promise.allSettled(descendants.map((candidate) =>
+      this.#pauseSingleTask(candidate.id)));
+    return this.#pauseSingleTask(taskId);
+  }
+
+  async #pauseSingleTask(taskId: string): Promise<boolean> {
     const task = this.#store.getTask(taskId);
     if (!task) return false;
     if (task.status === "paused") return true;
@@ -2553,7 +3346,9 @@ export class TaskOrchestrator {
     const executionTask = detail.executionTask;
     if (
       executionTask
-      && ["running", "waiting_approval", "waiting_user"].includes(executionTask.status)
+      && ["running", "waiting_approval", "waiting_user", "waiting_workers"].includes(
+        executionTask.status,
+      )
     ) {
       return this.#requestActivePlanPause(executionTask.id, {
         planId,
@@ -2688,12 +3483,21 @@ export class TaskOrchestrator {
       active.summary = `${active.summary}${event.delta}`.slice(-20_000);
       return;
     }
+    if (event.type === "usage.updated") {
+      this.#updateActiveUsage(
+        active,
+        event.inputTokens,
+        event.outputTokens,
+        event.toolCallCount,
+      );
+      return;
+    }
     if (
       (event.type === "message.completed" || event.type === "tool.completed")
       && active.handle?.captureContext
     ) {
       this.#store.updateExecution(taskId, active.handle.captureContext());
-      return;
+      if (event.type === "message.completed") return;
     }
     if (event.type === "diff.available") {
       this.#store.createArtifact({
@@ -2705,6 +3509,15 @@ export class TaskOrchestrator {
         metadata: { callId: event.callId },
       });
       return;
+    }
+    if (event.type === "tool.completed") {
+      active.toolCallCount += 1;
+      this.#updateActiveUsage(
+        active,
+        active.inputTokens,
+        active.outputTokens,
+        active.toolCallCount,
+      );
     }
     if (event.type === "approval.requested") {
       this.#store.createRequest({
@@ -2772,6 +3585,10 @@ export class TaskOrchestrator {
     });
     await Promise.allSettled(completions);
     for (const waiter of this.#resumeWaiters.splice(0)) waiter.resolve(null);
+    const workerError = new Error("Task Orchestrator 已释放");
+    for (const waiter of this.#workerWaiters.values()) waiter.reject(workerError);
+    for (const waiter of this.#workerReady.splice(0)) waiter.reject(workerError);
+    this.#workerWaiters.clear();
     this.#unsubscribe?.();
     this.#unsubscribe = undefined;
     if (options.closeStore !== false) this.#store.close();
@@ -2801,12 +3618,72 @@ export class TaskOrchestrator {
     };
   }
 
+  #updateActiveUsage(
+    active: ActiveExecution,
+    inputTokens: number,
+    outputTokens: number,
+    toolCallCount: number,
+  ): void {
+    active.inputTokens = Math.max(active.inputTokens, inputTokens);
+    active.outputTokens = Math.max(active.outputTokens, outputTokens);
+    active.toolCallCount = Math.max(active.toolCallCount, toolCallCount);
+    const usage = this.#store.updateRunUsage(active.taskId, active.runId, {
+      inputTokens: active.inputTokens,
+      outputTokens: active.outputTokens,
+      toolCalls: active.toolCallCount,
+      durationMs: Math.max(0, Date.now() - active.startedAt),
+    });
+    if (!usage?.exceeded || active.budgetExceeded) return;
+    active.budgetExceeded = "Worker 已达到硬预算上限";
+    active.controller.abort();
+    void active.handle?.cancel().catch(() => undefined);
+  }
+
   #heldSlots(): number {
     return [...this.#active.values()].filter((active) => active.slotHeld).length;
   }
 
+  #handleWorkerTaskEvent(event: TaskEvent): void {
+    if (![
+      "task.succeeded",
+      "task.failed",
+      "task.cancelled",
+      "task.interrupted",
+    ].includes(event.type)) return;
+    const task = this.#store.getTask(event.taskId);
+    if (task?.kind !== "worker") return;
+    const completed = this.#store.tryCompleteWorkerDelegation(task.id);
+    if (!completed) return;
+    const waiter = this.#workerWaiters.get(completed.delegationId);
+    if (!waiter) return;
+    this.#workerWaiters.delete(completed.delegationId);
+    waiter.results = completed.results;
+    this.#workerReady.push(waiter);
+    this.#drain();
+  }
+
   #drain(): void {
     if (!this.#started || this.#paused || this.#disposed) return;
+    while (this.#heldSlots() < this.#concurrency && this.#workerReady.length) {
+      const waiter = this.#workerReady.shift()!;
+      const active = this.#active.get(waiter.parentTaskId);
+      if (!active || active.runId !== waiter.parentRunId) {
+        waiter.reject(new Error("父任务已停止，无法恢复 Worker 结果"));
+        continue;
+      }
+      try {
+        active.slotHeld = true;
+        this.#store.resumeAfterWorkers(
+          waiter.parentTaskId,
+          waiter.parentRunId,
+          waiter.delegationId,
+        );
+        waiter.resolve(waiter.results);
+      } catch (error) {
+        active.slotHeld = false;
+        waiter.reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    }
     while (this.#heldSlots() < this.#concurrency && this.#resumeWaiters.length) {
       const waiter = this.#resumeWaiters.shift()!;
       const active = this.#active.get(waiter.taskId);
@@ -2845,6 +3722,12 @@ export class TaskOrchestrator {
         rejectReplan: undefined,
         slotHeld: true,
         summary: "",
+        startedAt: Date.now(),
+        toolCallCount: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        budgetExceeded: undefined,
+        budgetTimer: undefined,
         completion: Promise.resolve(),
       };
       this.#active.set(task.id, active);
@@ -2871,6 +3754,22 @@ export class TaskOrchestrator {
         ...(handle.modelProvider ? { modelProvider: handle.modelProvider } : {}),
         ...(handle.modelId ? { modelId: handle.modelId } : {}),
       });
+      const workerBudget = task.kind === "worker"
+        ? this.#store.getTaskBudget(task.id)?.budget
+        : undefined;
+      if (workerBudget) {
+        active.budgetTimer = setTimeout(() => {
+          active.budgetExceeded = "Worker 已达到运行时间上限";
+          this.#updateActiveUsage(
+            active,
+            active.inputTokens,
+            active.outputTokens,
+            active.toolCallCount,
+          );
+          active.controller.abort();
+          void active.handle?.cancel().catch(() => undefined);
+        }, workerBudget.maxDurationMs);
+      }
       if (active.cancelRequested || active.interruptRequested || active.pauseRequested) {
         await handle.cancel().catch(() => undefined);
       }
@@ -2878,12 +3777,25 @@ export class TaskOrchestrator {
       if (handle.captureContext) {
         this.#store.updateExecution(task.id, handle.captureContext());
       }
+      if (handle.captureUsage) {
+        const usage = handle.captureUsage();
+        this.#updateActiveUsage(
+          active,
+          usage.inputTokens,
+          usage.outputTokens,
+          usage.toolCallCount,
+        );
+      }
       if (active.pauseRequested && !active.cancelRequested && !active.interruptRequested) {
         this.#finishPausedExecution(active, task, run);
       } else {
         if (task.kind === "planning" && !this.#store.getPlanForPlanningTask(task.id)) {
           throw new Error("Planning Task 未提交结构化计划");
         }
+        if (task.kind === "worker" && !this.#store.getWorkerResult(task.id, run.id)) {
+          throw new Error("Worker 未提交结构化结果");
+        }
+        if (active.budgetExceeded) throw new Error(active.budgetExceeded);
         this.#store.finishRun(
           task.id,
           run.id,
@@ -2917,17 +3829,33 @@ export class TaskOrchestrator {
               : "failed",
           active.cancelRequested || active.interruptRequested
             ? undefined
-            : formatError(error),
+            : active.budgetExceeded ?? formatError(error),
           summarize(active.summary),
         );
       }
     } finally {
+      if (active.budgetTimer) clearTimeout(active.budgetTimer);
       if (active.rejectReplan) {
         active.rejectReplan(new Error("重新规划请求未能完成"));
         active.rejectReplan = undefined;
         active.resolveReplan = undefined;
       }
       this.#active.delete(task.id);
+      for (const [delegationId, waiter] of this.#workerWaiters) {
+        if (waiter.parentTaskId !== task.id) continue;
+        this.#workerWaiters.delete(delegationId);
+        waiter.reject(new Error(
+          active.pauseRequested
+            ? "父任务已暂停；恢复时将从已持久化的 Worker 结果继续"
+            : "父任务已停止",
+        ));
+      }
+      for (let index = this.#workerReady.length - 1; index >= 0; index -= 1) {
+        const waiter = this.#workerReady[index]!;
+        if (waiter.parentTaskId !== task.id) continue;
+        this.#workerReady.splice(index, 1);
+        waiter.reject(new Error("父任务已停止"));
+      }
       for (const waiter of this.#resumeWaiters.filter((item) => item.taskId === task.id)) {
         waiter.resolve(null);
       }
@@ -3161,6 +4089,13 @@ export function validatePlanSteps(steps: PlanStep[]): void {
   for (const id of ids) visit(id);
 }
 
+function isSafeWorkspaceRelativePath(path: string): boolean {
+  const normalized = path.replaceAll("\\", "/");
+  return !normalized.startsWith("/")
+    && !/^[a-z]:\//i.test(normalized)
+    && !normalized.split("/").includes("..");
+}
+
 function isTerminalTaskStatus(status: TaskStatus): boolean {
   return status === "succeeded"
     || status === "failed"
@@ -3182,6 +4117,12 @@ function normalizeConcurrency(value: number): number {
 function summarize(value: string): string | undefined {
   const trimmed = value.trim();
   return trimmed ? trimmed.slice(-4_000) : undefined;
+}
+
+function workerProfileLabel(profile: WorkerProfileId): string {
+  if (profile === "explorer") return "Explorer";
+  if (profile === "tester") return "Tester";
+  return "Reviewer";
 }
 
 function formatError(error: unknown): string {

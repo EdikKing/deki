@@ -18,6 +18,7 @@ export default defineConfig({
           "@deki-ai/permission-engine",
           "@deki-ai/git-checkpoint",
           "@deki-ai/agent-runtime",
+          "@deki-ai/agent-supervisor",
           "@deki-ai/task-orchestrator",
         ],
       }),

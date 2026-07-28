@@ -17,6 +17,7 @@
     "package:linux": "pnpm --dir ../.. cli:build && pnpm build && electron-builder --linux AppImage deb --x64 --publish never"
   },
   "dependencies": {
+    "@deki-ai/agent-supervisor": "workspace:*",
     "@deki-ai/agent-runtime": "workspace:*",
     "@deki-ai/config": "workspace:*",
     "@deki-ai/git-checkpoint": "workspace:*",

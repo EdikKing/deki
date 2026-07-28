@@ -20,6 +20,7 @@ const statusCopy: Record<TaskStatus, { zh: string; en: string }> = {
   running: { zh: "运行中", en: "Running" },
   waiting_approval: { zh: "等待审批", en: "Needs approval" },
   waiting_user: { zh: "等待输入", en: "Needs input" },
+  waiting_workers: { zh: "等待 Worker", en: "Waiting for workers" },
   paused: { zh: "已暂停", en: "Paused" },
   succeeded: { zh: "已完成", en: "Completed" },
   failed: { zh: "失败", en: "Failed" },
@@ -56,7 +57,8 @@ export function TaskCenter(props: TaskCenterProps) {
     if (taskRefreshSequence.current !== sequence) return;
     setTasks(rows);
     setWorkspaceTasks(allRows);
-    setSelectedId((current) => current ?? rows[0]?.task.id);
+    setSelectedId((current) =>
+      current ?? rows.find((summary) => !summary.task.parentTaskId)?.task.id);
   }
 
   async function refreshDetail(id = selectedId) {
@@ -100,16 +102,20 @@ export function TaskCenter(props: TaskCenterProps) {
     }
     return [...entries.entries()];
   }, [workspaceTasks, props.zh]);
+  const rootTasks = useMemo(
+    () => tasks.filter((summary) => !summary.task.parentTaskId),
+    [tasks],
+  );
 
   const grouped = useMemo(() => {
-    const attention = tasks.filter((item) =>
+    const attention = rootTasks.filter((item) =>
       item.task.status === "waiting_approval"
       || item.task.status === "waiting_user"
       || (
         !item.runnable
         && [
           "queued", "running", "waiting_approval", "waiting_user",
-          "paused", "interrupted",
+          "waiting_workers", "paused", "interrupted",
         ].includes(item.task.status)
       ));
     const attentionIds = new Set(attention.map((item) => item.task.id));
@@ -117,8 +123,9 @@ export function TaskCenter(props: TaskCenterProps) {
       {
         key: "running",
         title: props.zh ? "运行中" : "Running",
-        rows: tasks.filter((item) =>
-          item.task.status === "running" && !attentionIds.has(item.task.id)),
+        rows: rootTasks.filter((item) =>
+          (item.task.status === "running" || item.task.status === "waiting_workers")
+          && !attentionIds.has(item.task.id)),
       },
       {
         key: "attention",
@@ -128,26 +135,26 @@ export function TaskCenter(props: TaskCenterProps) {
       {
         key: "queued",
         title: props.zh ? "排队与暂停" : "Queued & paused",
-        rows: tasks.filter((item) =>
+        rows: rootTasks.filter((item) =>
           (item.task.status === "queued" || item.task.status === "paused")
           && !attentionIds.has(item.task.id)),
       },
       {
         key: "completed",
         title: props.zh ? "已完成" : "Completed",
-        rows: tasks.filter((item) =>
+        rows: rootTasks.filter((item) =>
           item.task.status === "succeeded" || item.task.status === "cancelled"),
       },
       {
         key: "failed",
         title: props.zh ? "失败与中断" : "Failed & interrupted",
-        rows: tasks.filter((item) =>
+        rows: rootTasks.filter((item) =>
           (item.task.status === "failed" || item.task.status === "interrupted")
           && !attentionIds.has(item.task.id)),
       },
     ];
     return groups.filter((group) => group.rows.length > 0);
-  }, [tasks, props.zh]);
+  }, [rootTasks, props.zh]);
 
   async function command(operation: Promise<{ ok: boolean; error?: string | undefined }>) {
     const result = await operation;
@@ -164,7 +171,7 @@ export function TaskCenter(props: TaskCenterProps) {
           <p className="eyebrow">TASK CENTER</p>
           <h1>{props.zh ? "后台任务" : "Background tasks"}</h1>
         </div>
-        <span>{props.zh ? `${tasks.length} 个任务` : `${tasks.length} tasks`}</span>
+        <span>{props.zh ? `${rootTasks.length} 个任务` : `${rootTasks.length} tasks`}</span>
       </header>
 
       <div className="task-center-filters">
@@ -222,6 +229,11 @@ export function TaskCenter(props: TaskCenterProps) {
                             : ""}
                         </span>
                       )}
+                      {summary.workerCount > 0 && (
+                        <span>
+                          Worker {summary.completedWorkerCount}/{summary.workerCount}
+                        </span>
+                      )}
                       {(summary.resultSummary || summary.error) && (
                         <span>{summary.error ?? summary.resultSummary}</span>
                       )}
@@ -235,7 +247,7 @@ export function TaskCenter(props: TaskCenterProps) {
               })}
             </section>
           ))}
-          {tasks.length === 0 && (
+          {rootTasks.length === 0 && (
             <div className="task-empty">
               {props.zh ? "没有符合条件的任务" : "No matching tasks"}
             </div>
@@ -274,6 +286,76 @@ export function TaskCenter(props: TaskCenterProps) {
                 <h3>{props.zh ? "目标" : "Goal"}</h3>
                 <p className="task-goal">{detail.task.goal}</p>
               </section>
+
+              {(detail.children.length > 0 || detail.task.kind === "worker") && (
+                <section className="task-detail-section">
+                  <h3>{props.zh ? "Agent Tree" : "Agent Tree"}</h3>
+                  {detail.task.kind === "worker" && (
+                    <p>
+                      {detail.task.assignedProfile ?? "Worker"}
+                      {" · "}
+                      {props.zh ? statusCopy[detail.task.status].zh : statusCopy[detail.task.status].en}
+                    </p>
+                  )}
+                  {detail.children.map((child) => (
+                    <button
+                      className="task-artifact"
+                      key={child.task.id}
+                      onClick={() => setSelectedId(child.task.id)}
+                    >
+                      <strong>
+                        {child.task.assignedProfile ?? "Worker"} · {child.task.title}
+                      </strong>
+                      <span>
+                        {props.zh
+                          ? statusCopy[child.task.status].zh
+                          : statusCopy[child.task.status].en}
+                        {child.currentRun
+                          ? ` · ${child.currentRun.inputTokens + child.currentRun.outputTokens} tokens`
+                          : ""}
+                      </span>
+                    </button>
+                  ))}
+                </section>
+              )}
+
+              {detail.budget && detail.budgetUsage && (
+                <section className="task-detail-section">
+                  <h3>{props.zh ? "Worker 预算" : "Worker budget"}</h3>
+                  <p>
+                    {detail.budgetUsage.workers}/{detail.budget.maxWorkers} Worker
+                    {" · "}
+                    {detail.budgetUsage.inputTokens}/{detail.budget.maxInputTokens} input
+                    {" · "}
+                    {detail.budgetUsage.outputTokens}/{detail.budget.maxOutputTokens} output
+                    {" · "}
+                    {detail.budgetUsage.toolCalls}/{detail.budget.maxToolCalls} tools
+                  </p>
+                  {detail.budgetUsage.exceeded && (
+                    <p className="error">{props.zh ? "已超过硬预算" : "Hard budget exceeded"}</p>
+                  )}
+                </section>
+              )}
+
+              {detail.workerResult && (
+                <section className="task-detail-section">
+                  <h3>{props.zh ? "Worker 结果" : "Worker result"}</h3>
+                  <p>{detail.workerResult.summary}</p>
+                  {detail.workerResult.findings.map((finding, index) => (
+                    <article key={`${finding.claim}-${index}`}>
+                      <strong>{Math.round(finding.confidence * 100)}% · {finding.claim}</strong>
+                      {finding.evidence.map((evidence, evidenceIndex) => (
+                        <pre key={evidenceIndex} className="task-request-details">
+                          {JSON.stringify(evidence, null, 2)}
+                        </pre>
+                      ))}
+                    </article>
+                  ))}
+                  {detail.workerResult.risks.length > 0 && (
+                    <p>{props.zh ? "风险：" : "Risks: "}{detail.workerResult.risks.join("；")}</p>
+                  )}
+                </section>
+              )}
 
               {detail.planContext && (
                 <section className="task-detail-section task-plan-context">
@@ -503,7 +585,7 @@ function TaskActions(props: {
   };
   return (
     <div className="task-detail-actions">
-      {task.sessionId && (
+      {task.sessionId && task.kind !== "worker" && (
         <button onClick={() => void props.onOpen()}>
           {props.zh ? "打开会话" : "Open chat"}
         </button>
@@ -527,7 +609,9 @@ function TaskActions(props: {
           {props.zh ? "暂停" : "Pause"}
         </button>
       )}
-      {["running", "waiting_approval", "waiting_user"].includes(task.status) && (
+      {["running", "waiting_approval", "waiting_user", "waiting_workers"].includes(
+        task.status,
+      ) && (
         <button onClick={() => void props.onCommand(window.deki.pauseTask(task.id))}>
           {props.zh ? "暂停" : "Pause"}
         </button>
@@ -547,9 +631,14 @@ function TaskActions(props: {
           window.deki.retryTask(task.id),
         )}>{props.zh ? "重试" : "Retry"}</button>
       )}
-      {["queued", "running", "waiting_approval", "waiting_user", "paused"].includes(
-        task.status,
-      ) && (
+      {[
+        "queued",
+        "running",
+        "waiting_approval",
+        "waiting_user",
+        "waiting_workers",
+        "paused",
+      ].includes(task.status) && (
         <button className="danger-text" onClick={() => void props.onCommand(
           window.deki.cancelTask(task.id),
         )}>{props.zh ? "取消" : "Cancel"}</button>

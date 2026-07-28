@@ -117,6 +117,53 @@ describe("ToolGateway", () => {
     await gateway.dispose();
   });
 
+  it("enforces the Worker hard policy before dispatch or gateway events", async () => {
+    const gateway = new ToolGateway();
+    const provider = new FixtureProvider();
+    const events: ToolGatewayEvent[] = [];
+    gateway.subscribe((event) => events.push(event));
+    await gateway.register(provider);
+
+    await expect(gateway.call(
+      "fixture__echo",
+      { text: "attempt unknown side effect" },
+      {
+        callId: "worker-unknown",
+        workspace: "/tmp",
+        interactionMode: "worker",
+        workerProfile: "explorer",
+      },
+    )).rejects.toMatchObject({
+      code: "WORKER_MODE_READ_ONLY",
+      toolName: "fixture__echo",
+    });
+    expect(provider.call).not.toHaveBeenCalled();
+    expect(events).toEqual([]);
+    await gateway.dispose();
+  });
+
+  it("allows explicitly read-only tools for Workers", async () => {
+    const gateway = new ToolGateway();
+    const provider = new FixtureProvider();
+    provider.readOnly = true;
+    await gateway.register(provider);
+
+    await expect(gateway.call(
+      "fixture__echo",
+      { text: "inspect" },
+      {
+        callId: "worker-read",
+        workspace: "/tmp",
+        interactionMode: "worker",
+        workerProfile: "reviewer",
+      },
+    )).resolves.toMatchObject({
+      content: [{ type: "text", text: "{\"text\":\"inspect\"}" }],
+    });
+    expect(provider.call).toHaveBeenCalledOnce();
+    await gateway.dispose();
+  });
+
   it.each([
     "find . -delete",
     "rg token . | tee leaked.txt",
@@ -140,6 +187,26 @@ describe("ToolGateway", () => {
     )).rejects.toMatchObject({ code: "PLAN_MODE_READ_ONLY" });
     expect(provider.call).not.toHaveBeenCalled();
     await gateway.dispose();
+  });
+
+  it("rejects free-form shell for every Worker profile before dispatch", async () => {
+    for (const workerProfile of ["explorer", "tester", "reviewer"] as const) {
+      const gateway = new ToolGateway();
+      const provider = new ShellProvider();
+      await gateway.register(provider);
+      await expect(gateway.call(
+        "workspace__bash",
+        { command: "git status" },
+        {
+          callId: `worker-shell-${workerProfile}`,
+          workspace: "/tmp",
+          interactionMode: "worker",
+          workerProfile,
+        },
+      )).rejects.toMatchObject({ code: "WORKER_MODE_READ_ONLY" });
+      expect(provider.call).not.toHaveBeenCalled();
+      await gateway.dispose();
+    }
   });
 
   it("redacts secrets from results, structured details, events and errors", async () => {

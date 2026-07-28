@@ -501,29 +501,36 @@ export class DekiAgentRuntime {
     if (!modelRuntime || !model) {
       throw new Error("Agent 尚未就绪，请先配置云模型环境变量");
     }
-    const response = await modelRuntime.completeSimple(model, {
-      systemPrompt: [
-        "你是一名提示词优化专家，负责把用户的草稿改写成可直接交给 AI Agent 执行的高质量任务说明。",
-        "先理解用户真正想达成的结果，再补齐清晰的执行步骤、约束和验收标准。",
-        "必须遵守：",
-        "1. 保持用户原本的语言和核心意图，不改变授权范围。",
-        "2. 不编造用户没有提供的业务事实、技术选型、文件路径或截止时间。",
-        "3. 信息不足时，把关键未知项写成“待确认”，不要擅自决定。",
-        "4. 对简单请求保持简洁；只有复杂任务才展开多步计划。",
-        "5. 输出应以明确目标开头，并按需包含背景、要求、工作步骤、交付物和验收标准。",
-        "6. 只输出优化后的任务说明，不要解释改写过程，不要使用代码围栏。",
-      ].join("\n"),
-      messages: [{
-        role: "user",
-        timestamp: Date.now(),
-        content: prompt.trim(),
-      }],
-    }, {
-      maxTokens: Math.min(2_400, this.#options.settings.models.maxOutputTokens),
-      timeoutMs: this.#options.settings.models.timeoutMs,
-      maxRetries: this.#options.settings.models.maxRetries,
-    });
-    const optimized = unwrapPromptOptimization(extractMessageText(response.content));
+    const input = prompt.trim();
+    const projectConnected = this.#projectFeaturesEnabled();
+    const request = async (content: string) => {
+      const response = await modelRuntime.completeSimple(model, {
+        systemPrompt: renderPromptOptimizerSystemPrompt(projectConnected),
+        messages: [{
+          role: "user",
+          timestamp: Date.now(),
+          content,
+        }],
+      }, {
+        maxTokens: Math.min(2_400, this.#options.settings.models.maxOutputTokens),
+        timeoutMs: this.#options.settings.models.timeoutMs,
+        maxRetries: this.#options.settings.models.maxRetries,
+      });
+      return unwrapPromptOptimization(extractMessageText(response.content));
+    };
+    let optimized = await request(input);
+    if (projectConnected && isClarificationHeavyPrompt(optimized)) {
+      optimized = await request([
+        "请重新改写下面的原始输入。",
+        "上一次结果错误地要求用户补充项目类型、技术栈、代码路径等信息；这些都应由目标 Agent 直接检查当前工作区获得。",
+        "不要回复用户，也不要列出需要用户补充的项目资料。请输出一份能立即执行的项目调查任务说明。",
+        "",
+        `原始输入：${input}`,
+      ].join("\n"));
+    }
+    if (projectConnected && isClarificationHeavyPrompt(optimized)) {
+      optimized = renderProjectInvestigationFallback(input);
+    }
     if (!optimized) throw new Error("模型没有返回可用的优化结果");
     return optimized;
   }
@@ -2979,6 +2986,79 @@ function unwrapPromptOptimization(content: string): string {
   const trimmed = content.trim();
   const fenced = trimmed.match(/^```(?:markdown|md|text)?\s*\n([\s\S]*?)\n```\s*$/iu);
   return (fenced?.[1] ?? trimmed).trim();
+}
+
+function renderPromptOptimizerSystemPrompt(projectConnected: boolean): string {
+  const environment = projectConnected
+    ? [
+        "运行环境：目标 AI Agent 已连接用户当前选择的项目工作区。",
+        "它可以自行读取和搜索代码、配置、依赖、测试、Git 历史及项目文档，并可运行受控检查。",
+        "用户提到“当前项目”“这个项目”“代码库”时，指的就是这个已连接工作区；绝对不要反问项目类型、技术栈、仓库路径或代码规模。",
+      ]
+    : [
+        "运行环境：当前是未连接项目的普通会话。",
+        "只有在缺失信息确实阻止任务执行时，才保留最少量的待确认项。",
+      ];
+  return [
+    "你是一名 AI Agent 任务说明优化专家。",
+    "你的输出会直接替换用户输入框中的草稿，随后由另一个 Agent 执行；你不是在回答用户的问题。",
+    "先理解用户真正想达成的结果，再把草稿改写成可立即执行的任务说明。",
+    ...environment,
+    "",
+    "必须遵守：",
+    "1. 保持用户原本的语言、目标和授权范围，不擅自增加修改、部署、发布或其他操作。",
+    "2. 能由 Agent 通过工作区、代码、配置、测试、Git 或工具获得的信息，必须改写为调查步骤，不能要求用户补充。",
+    "3. 只有业务偏好、外部系统权限、密钥、破坏性决定等无法从项目中获得且会实质影响结果的信息，才可标记为“待确认”。",
+    "4. 分析、审查、寻找优化点等请求默认只检查并报告，不修改文件；除非用户明确要求实施。",
+    "5. 对项目审查类请求，应要求 Agent 基于证据识别问题，按影响、紧迫性和实施成本排序，并给出文件位置或检查结果作为依据。",
+    "6. 工作步骤应具体但不过度限定技术方案；先检查实际项目，再决定哪些架构、性能、安全、测试、依赖、可维护性、开发体验或用户体验维度相关。",
+    "7. 输出以明确目标开头，并按需包含检查范围、工作步骤、交付物、约束和验收标准；简单请求保持简洁。",
+    "8. 不要以“请补充信息”“请提供资料”“我需要了解”开头，不要把优化结果写成对用户的问卷。",
+    "9. 只输出优化后的任务说明，不解释改写过程，不使用代码围栏。",
+  ].join("\n");
+}
+
+function isClarificationHeavyPrompt(content: string): boolean {
+  if (!content.trim()) return false;
+  return [
+    /请补充.{0,20}(信息|资料)/u,
+    /请提供.{0,20}(信息|资料)/u,
+    /提供上述信息后/u,
+    /需要(?:先)?了解.{0,20}(项目|信息)/u,
+    /(?:please provide|need more information|could you clarify)/iu,
+  ].some((pattern) => pattern.test(content));
+}
+
+function renderProjectInvestigationFallback(input: string): string {
+  const chinese = /\p{Script=Han}/u.test(input);
+  if (!chinese) {
+    return [
+      `Goal: Work from the currently connected repository to complete this request: ${input}`,
+      "",
+      "Work steps:",
+      "1. Inspect the project documentation, manifests, configuration, directory structure, implementation, tests, and relevant Git context to establish how the project actually works.",
+      "2. Identify the review dimensions supported by evidence, such as architecture, correctness, maintainability, performance, security, dependencies, testing, developer experience, and user experience.",
+      "3. Run safe, relevant checks where useful and distinguish verified findings from hypotheses.",
+      "4. Prioritize findings by impact, urgency, risk, and implementation effort. For each finding, include evidence locations, the recommended change, expected benefit, and a practical next step.",
+      "",
+      "Constraints: Derive technical context from the repository instead of asking the user for information available there. Preserve the original authorization scope; do not modify files when the request only asks for analysis or recommendations.",
+      "",
+      "Deliverable: A concise, prioritized optimization report covering quick wins, larger improvements, risks, and a recommended implementation order.",
+    ].join("\n");
+  }
+  return [
+    `目标：基于当前已连接的项目工作区完成以下请求：${input}`,
+    "",
+    "工作步骤：",
+    "1. 主动检查项目文档、依赖清单、配置、目录结构、核心实现、测试和相关 Git 信息，先建立对项目现状的真实理解。",
+    "2. 根据实际证据选择需要审查的维度，例如架构、正确性、可维护性、性能、安全、依赖、测试、开发体验和用户体验，不做脱离代码的泛泛推测。",
+    "3. 在有帮助时运行安全且相关的检查，明确区分已验证问题和待验证假设。",
+    "4. 按影响、紧迫性、风险和实施成本排列优化项；每项给出文件或检查结果依据、改进建议、预期收益和可执行的下一步。",
+    "",
+    "约束：能从项目中获得的信息由 Agent 自行调查，不要求用户补充。严格保持原始请求的授权范围；如果只是要求分析或建议，不修改文件。",
+    "",
+    "交付物：一份简洁、按优先级排序的优化报告，包含快速收益项、中长期改进、主要风险和推荐实施顺序。",
+  ].join("\n");
 }
 
 function extractMessageThinking(content: unknown): string {

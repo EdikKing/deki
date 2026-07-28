@@ -939,9 +939,6 @@ export function App() {
                       className={`composer-tool prompt-optimizer${optimizingPrompt ? " optimizing" : ""}`}
                       aria-label={zh ? "优化输入" : "Optimize prompt"}
                       aria-busy={optimizingPrompt}
-                      title={optimizingPrompt
-                        ? (zh ? "正在分析意图并规划步骤…" : "Analyzing intent and planning steps…")
-                        : (zh ? "优化输入：明确意图并规划工作步骤" : "Optimize prompt: clarify intent and plan the work")}
                       disabled={!prompt.trim() || busy || optimizingPrompt || isSessionCommand || !state.ready}
                       onClick={() => void optimizeCurrentPrompt()}
                     >
@@ -950,7 +947,6 @@ export function App() {
                     <button
                       className="composer-tool"
                       aria-label={zh ? "保存记忆" : "Save memory"}
-                      title={zh ? "插入 /remember" : "Insert /remember"}
                       disabled={busy || optimizingPrompt || !canRemember}
                       onClick={() => setPrompt((current) => (
                         current ? `${current}\n/remember ` : "/remember "
@@ -961,7 +957,6 @@ export function App() {
                     <button
                       className="composer-tool"
                       aria-label={zh ? "选择项目" : "Choose project"}
-                      title={zh ? "选择或切换项目" : "Choose or switch project"}
                       onClick={() => void runCommand(
                         window.deki.chooseWorkspace(),
                         setError,
@@ -973,9 +968,6 @@ export function App() {
                     <button
                       className="composer-submit composer-background"
                       aria-label={zh ? "后台运行" : "Run in background"}
-                      title={interactionMode === "plan"
-                        ? (zh ? "在后台生成计划" : "Generate plan in background")
-                        : (zh ? "在独立会话中后台运行" : "Run in a separate background session")}
                       disabled={!prompt.trim() || optimizingPrompt || isSessionCommand || !state.ready}
                       onClick={() => void submit("background")}
                     >
@@ -986,7 +978,6 @@ export function App() {
                         <button
                           className="composer-tool"
                           aria-label={zh ? "转到后台" : "Move to background"}
-                          title={zh ? "让当前任务继续在后台运行" : "Keep the current task running in background"}
                           onClick={() => void runCommand(
                             window.deki.promoteTask(foregroundTaskId),
                             setError,
@@ -1003,7 +994,6 @@ export function App() {
                       <button
                         className="composer-submit composer-stop danger"
                         aria-label={zh ? "停止" : "Stop"}
-                        title={zh ? "停止" : "Stop"}
                         onClick={() => void runCommand(window.deki.abortRun(), setError, refresh)}
                       >
                         <span className="composer-stop-glyph" aria-hidden="true" />
@@ -1011,8 +1001,7 @@ export function App() {
                     </>) : (
                       <button
                         className="composer-submit primary"
-                        aria-label={zh ? "发送" : "Send"}
-                        title={interactionMode === "plan"
+                        aria-label={interactionMode === "plan"
                           ? (zh ? "生成计划" : "Generate plan")
                           : (zh ? "发送" : "Send")}
                         disabled={optimizingPrompt || (!state.ready && !isSessionCommand)}
@@ -1441,11 +1430,6 @@ function PermissionModePicker(props: {
         description: props.zh ? "已逐项配置权限策略" : "Per-category policies are configured",
       }
     : permissionModeCopy(selectedMode, props.zh);
-  const triggerTitle = props.available
-    ? selectedCopy.description
-    : (props.zh
-        ? "普通会话不会访问本地文件；关联项目后可选择权限模式"
-        : "General chats cannot access local files. Connect a project to choose a permission mode.");
   const triggerLabel = props.available
     ? selectedCopy.title
     : (props.zh ? "无本地访问" : "No local access");
@@ -1485,7 +1469,6 @@ function PermissionModePicker(props: {
       aria-haspopup="listbox"
       aria-expanded={open}
       disabled={props.disabled || saving || !props.available}
-      title={triggerTitle}
       onClick={() => setOpen((current) => !current)}
     >
       <PermissionModeIcon mode={props.available ? selectedMode : "custom"} />
@@ -1577,7 +1560,6 @@ function ThinkingLevelPicker(props: {
       aria-haspopup="listbox"
       aria-expanded={open}
       disabled={props.disabled || saving}
-      title={selectedCopy.description}
       onClick={() => setOpen((current) => !current)}
     >
       <span>{saving ? (props.zh ? "正在切换…" : "Switching…") : selectedCopy.title}</span>

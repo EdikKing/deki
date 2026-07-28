@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import {
   artifactRecordSchema,
@@ -32,6 +33,7 @@ import {
   type TaskEvent,
   type TaskEventType,
   type TaskKind,
+  type TaskPlanContext,
   type TaskRecord,
   type TaskRequestKind,
   type TaskRequestRecord,
@@ -54,6 +56,21 @@ export const promptExecutionInputSchema = z.object({
 }).strict();
 export type PromptExecutionInput = z.infer<typeof promptExecutionInputSchema>;
 export type TaskExecutionInput = PromptExecutionInput;
+
+export interface ReplanInput {
+  planId: string;
+  reason: string;
+  affectedStepIds: string[];
+  evidence?: string[];
+  title?: string;
+  deliveryMode?: "foreground" | "background";
+}
+
+interface ValidatedReplan {
+  plan: PlanRecord;
+  revision: PlanRevisionRecord;
+  affectedStepIds: string[];
+}
 
 export interface TaskExecutionHandle {
   sessionId: string;
@@ -357,6 +374,7 @@ export class TaskStore {
       artifacts: artifacts.map(rowToArtifact),
       events: events.map(rowToEvent),
       requests: requests.map(rowToRequest),
+      ...(task.planId ? { planContext: this.#planContextFor(task.planId) } : {}),
     });
   }
 
@@ -435,6 +453,12 @@ export class TaskStore {
       "SELECT delivery_mode FROM tasks WHERE id = ?",
     ).get(id) as { delivery_mode: string } | undefined;
     return row?.delivery_mode === "background" ? "background" : "foreground";
+  }
+
+  isPlanExecutionApproved(task: TaskRecord): boolean {
+    if (task.kind !== "plan-execution" || !task.planId) return true;
+    const plan = this.#getPlanRecord(task.planId);
+    return plan?.status === "approved" && plan.approvedRevision !== undefined;
   }
 
   updateExecution(taskId: string, execution: TaskExecutionInput): void {
@@ -855,6 +879,7 @@ export class TaskStore {
     if (task.status !== "queued") {
       throw new Error(`任务 ${taskId} 当前状态为 ${task.status}，不能启动`);
     }
+    this.#assertPlanExecutionApproved(task);
     const attemptRow = this.#database.prepare(
       "SELECT COALESCE(MAX(attempt), 0) + 1 AS attempt FROM runs WHERE task_id = ?",
     ).get(taskId) as { attempt: number };
@@ -1028,7 +1053,7 @@ export class TaskStore {
         runId,
         task.sessionId,
       ));
-      if (plan && !(plan.status === "abandoned" && status === "cancelled")) {
+      if (plan && (plan.status === "executing" || plan.status === "approved")) {
         const planStatus: PlanStatus = status === "succeeded"
           ? "completed"
           : status === "cancelled"
@@ -1079,7 +1104,7 @@ export class TaskStore {
     });
   }
 
-  finishPausedRun(taskId: string, runId: string, replan = false): void {
+  finishPausedRun(taskId: string, runId: string): void {
     const task = this.#requireTask(taskId);
     const run = this.#requireRun(runId);
     if (task.status === "paused") return;
@@ -1113,16 +1138,15 @@ export class TaskStore {
       if (task.kind === "plan-execution" && task.planId) {
         const plan = this.#requirePlan(task.planId);
         if (plan.status === "abandoned") return;
-        const planStatus: PlanStatus = replan ? "draft" : "approved";
         this.#database.prepare(`
           UPDATE plans
           SET status = ?, executing_revision = NULL, updated_at = ?
           WHERE id = ?
-        `).run(planStatus, now, plan.id);
+        `).run("approved", now, plan.id);
         planEvents.push(this.#appendPlanEvent(
           plan.id,
           "plan.execution_paused",
-          { replan },
+          { replan: false },
           taskId,
           runId,
         ));
@@ -1130,9 +1154,137 @@ export class TaskStore {
     });
   }
 
+  finishReplanPausedRun(
+    taskId: string,
+    runId: string,
+    input: ReplanInput,
+    checkpoint: PromptExecutionInput,
+  ): TaskRecord {
+    const task = this.#requireTask(taskId);
+    const run = this.#requireRun(runId);
+    const validated = this.validateReplan(taskId, runId, input);
+    this.#assertTaskTransition(task.status, "paused");
+    this.#assertRunTransition(run.status, "interrupted");
+    const now = new Date().toISOString();
+    let planningTask: TaskRecord;
+    this.#transaction((events, planEvents) => {
+      this.#database.prepare(`
+        UPDATE runs SET status = 'interrupted', finished_at = ?, error = ?
+        WHERE id = ? AND task_id = ?
+      `).run(now, "计划需要重新规划", runId, taskId);
+      this.#database.prepare(`
+        UPDATE tasks SET status = 'paused', updated_at = ?, completed_at = NULL
+        WHERE id = ?
+      `).run(now, taskId);
+      this.#cancelPendingRequests(taskId, now);
+      events.push(this.#appendEvent(
+        taskId,
+        "task.pause_requested",
+        { reason: "replan" },
+        runId,
+        task.sessionId,
+      ));
+      events.push(this.#appendEvent(
+        taskId,
+        "run.interrupted",
+        { reason: "replan" },
+        runId,
+        task.sessionId,
+      ));
+      events.push(this.#appendEvent(
+        taskId,
+        "task.paused",
+        { reason: "replan" },
+        runId,
+        task.sessionId,
+      ));
+      const states = this.#listPlanStepStates(
+        validated.plan.id,
+        validated.revision.revision,
+      );
+      for (const state of states.filter(
+        (candidate) =>
+          (candidate.status === "running" || candidate.status === "blocked")
+          && validated.affectedStepIds.includes(candidate.stepId),
+      )) {
+        this.#database.prepare(`
+          UPDATE plan_step_states
+          SET status = 'blocked', reason = ?, evidence_json = ?, updated_at = ?
+          WHERE plan_id = ? AND revision = ? AND step_id = ?
+        `).run(
+          input.reason,
+          JSON.stringify(input.evidence ?? state.evidence),
+          now,
+          validated.plan.id,
+          validated.revision.revision,
+          state.stepId,
+        );
+        planEvents.push(this.#appendPlanEvent(
+          validated.plan.id,
+          "plan.step_blocked",
+          {
+            revision: validated.revision.revision,
+            stepId: state.stepId,
+            reason: input.reason,
+          },
+          taskId,
+          runId,
+        ));
+      }
+      this.#database.prepare(`
+        UPDATE plans
+        SET status = 'draft', executing_revision = NULL, replan_reason = ?,
+            affected_step_ids_json = ?, replan_evidence_json = ?, updated_at = ?
+        WHERE id = ?
+      `).run(
+        input.reason,
+        JSON.stringify(validated.affectedStepIds),
+        JSON.stringify(input.evidence ?? []),
+        now,
+        validated.plan.id,
+      );
+      planEvents.push(this.#appendPlanEvent(
+        validated.plan.id,
+        "plan.replan_requested",
+        {
+          reason: input.reason,
+          affectedStepIds: validated.affectedStepIds,
+          evidence: input.evidence ?? [],
+        },
+        taskId,
+        runId,
+      ));
+      planEvents.push(this.#appendPlanEvent(
+        validated.plan.id,
+        "plan.execution_paused",
+        { replan: true },
+        taskId,
+        runId,
+      ));
+      planningTask = this.#insertTask({
+        workspaceId: task.workspaceId,
+        ...(task.workspacePath ? { workspacePath: task.workspacePath } : {}),
+        kind: "planning",
+        title: input.title ?? `修订计划：${validated.plan.goal.slice(0, 42)}`,
+        goal: validated.plan.goal,
+        planId: validated.plan.id,
+        execution: {
+          ...checkpoint,
+          preferFork: true,
+          interactionMode: "plan",
+          planId: validated.plan.id,
+          planRevision: validated.plan.currentRevision,
+          deliveryMode: input.deliveryMode ?? "foreground",
+        },
+      }, events);
+    });
+    return planningTask!;
+  }
+
   requeueTask(taskId: string, expected: "paused" | "failed" | "interrupted"): void {
     const task = this.#requireTask(taskId);
     if (task.status !== expected) throw new Error(`任务当前状态不是 ${expected}`);
+    this.#assertPlanExecutionApproved(task);
     this.#assertTaskTransition(task.status, "queued");
     const now = new Date().toISOString();
     this.#transaction((events) => {
@@ -1208,12 +1360,7 @@ export class TaskStore {
     this.#transitionTaskOnly(task, "cancelled", "task.cancelled", true);
   }
 
-  prepareReplan(taskId: string, runId: string, input: {
-    planId: string;
-    reason: string;
-    affectedStepIds: string[];
-    evidence?: string[];
-  }): void {
+  validateReplan(taskId: string, runId: string, input: ReplanInput): ValidatedReplan {
     const task = this.#requireTask(taskId);
     const plan = this.#requirePlan(input.planId);
     if (
@@ -1242,53 +1389,11 @@ export class TaskStore {
     if (!activeSteps.some((state) => affected.has(state.stepId))) {
       throw new Error("受影响步骤必须包含当前执行或阻塞的步骤");
     }
-    const now = new Date().toISOString();
-    this.#transaction((_events, planEvents) => {
-      for (const state of activeSteps.filter((candidate) => affected.has(candidate.stepId))) {
-        this.#database.prepare(`
-          UPDATE plan_step_states
-          SET status = 'blocked', reason = ?, evidence_json = ?, updated_at = ?
-          WHERE plan_id = ? AND revision = ? AND step_id = ?
-        `).run(
-          input.reason,
-          JSON.stringify(input.evidence ?? state.evidence),
-          now,
-          plan.id,
-          executingRevision,
-          state.stepId,
-        );
-        planEvents.push(this.#appendPlanEvent(
-          plan.id,
-          "plan.step_blocked",
-          { revision: executingRevision, stepId: state.stepId, reason: input.reason },
-          taskId,
-          runId,
-        ));
-      }
-      this.#database.prepare(`
-        UPDATE plans
-        SET replan_reason = ?, affected_step_ids_json = ?,
-            replan_evidence_json = ?, updated_at = ?
-        WHERE id = ?
-      `).run(
-        input.reason,
-        JSON.stringify([...affected]),
-        JSON.stringify(input.evidence ?? []),
-        now,
-        plan.id,
-      );
-      planEvents.push(this.#appendPlanEvent(
-        plan.id,
-        "plan.replan_requested",
-        {
-          reason: input.reason,
-          affectedStepIds: [...affected],
-          evidence: input.evidence ?? [],
-        },
-        taskId,
-        runId,
-      ));
-    });
+    return {
+      plan,
+      revision,
+      affectedStepIds: [...affected],
+    };
   }
 
   createRequest(input: {
@@ -1535,7 +1640,31 @@ export class TaskStore {
       pendingRequestCount: this.pendingRequestCount(task.id),
       ...(latestRun?.result_summary ? { resultSummary: latestRun.result_summary } : {}),
       ...(latestRun?.error ? { error: latestRun.error } : {}),
+      ...(task.planId ? { planContext: this.#planContextFor(task.planId) } : {}),
     });
+  }
+
+  #planContextFor(planId: string): TaskPlanContext {
+    const plan = this.#requirePlan(planId);
+    const revision = this.#requirePlanRevision(plan.id, plan.currentRevision);
+    const states = this.#listPlanStepStates(plan.id, plan.currentRevision);
+    const stateById = new Map(states.map((state) => [state.stepId, state]));
+    const currentStep = revision.steps.find((step) => {
+      const status = stateById.get(step.id)?.status;
+      return status === "running" || status === "blocked";
+    });
+    return {
+      planId: plan.id,
+      status: plan.status,
+      currentRevision: plan.currentRevision,
+      ...(plan.approvedRevision ? { approvedRevision: plan.approvedRevision } : {}),
+      completedSteps: states.filter(
+        (state) => state.status === "completed" || state.status === "skipped",
+      ).length,
+      totalSteps: revision.steps.length,
+      ...(currentStep ? { currentStep } : {}),
+      ...(plan.replanReason ? { replanReason: plan.replanReason } : {}),
+    };
   }
 
   #transitionTaskOnly(
@@ -1573,6 +1702,14 @@ export class TaskStore {
     const task = this.getTask(id);
     if (!task) throw new Error(`未找到任务: ${id}`);
     return task;
+  }
+
+  #assertPlanExecutionApproved(task: TaskRecord): void {
+    if (task.kind !== "plan-execution" || !task.planId) return;
+    const plan = this.#requirePlan(task.planId);
+    if (plan.status !== "approved" || !plan.approvedRevision) {
+      throw new Error("计划必须完成修订并重新批准后才能恢复执行");
+    }
   }
 
   #requireRun(id: string): RunRecord {
@@ -2114,7 +2251,10 @@ interface ActiveExecution {
   cancelRequested: boolean;
   interruptRequested: boolean;
   pauseRequested: boolean;
-  replanRequested: boolean;
+  replanIntent: ReplanInput | undefined;
+  replanCheckpoint: PromptExecutionInput | undefined;
+  resolveReplan: ((task: TaskRecord) => void) | undefined;
+  rejectReplan: ((error: Error) => void) | undefined;
   slotHeld: boolean;
   summary: string;
   completion: Promise<void>;
@@ -2129,6 +2269,10 @@ interface ResumeWaiter {
 export interface ResumeLease {
   commit(): void;
   release(): void;
+}
+
+export interface ReplanRequest {
+  planningTask: Promise<TaskRecord>;
 }
 
 export interface WorkspaceAvailability {
@@ -2308,23 +2452,43 @@ export class TaskOrchestrator {
     return true;
   }
 
-  requestReplan(taskId: string, input: {
-    planId: string;
-    reason: string;
-    affectedStepIds: string[];
-    evidence?: string[];
-  }): boolean {
+  requestReplan(taskId: string, input: ReplanInput): ReplanRequest | null {
     const active = this.#active.get(taskId);
-    if (!active) return false;
-    this.#store.prepareReplan(taskId, active.runId, input);
-    this.#store.requestPause(taskId);
-    active.replanRequested = true;
+    if (!active || active.replanIntent) return null;
+    this.#store.validateReplan(taskId, active.runId, input);
+    const checkpoint = active.handle?.captureContext?.() ?? this.#store.getExecution(taskId);
+    if (!checkpoint.sourceSessionFile || !existsSync(checkpoint.sourceSessionFile)) {
+      throw new Error("计划最新 checkpoint 不可用，无法安全地重新规划");
+    }
+    let resolveReplan!: (task: TaskRecord) => void;
+    let rejectReplan!: (error: Error) => void;
+    const planningTask = new Promise<TaskRecord>((resolve, reject) => {
+      resolveReplan = resolve;
+      rejectReplan = reject;
+    });
+    void planningTask.catch(() => undefined);
+    active.replanIntent = input;
+    active.replanCheckpoint = checkpoint;
+    active.resolveReplan = resolveReplan;
+    active.rejectReplan = rejectReplan;
     active.pauseRequested = true;
     setImmediate(() => {
-      active.controller.abort();
-      void active.handle?.cancel().catch(() => undefined);
+      void (async () => {
+        try {
+          await active.handle?.cancel();
+          active.controller.abort();
+        } catch (error) {
+          active.pauseRequested = false;
+          active.replanIntent = undefined;
+          active.replanCheckpoint = undefined;
+          const normalized = error instanceof Error ? error : new Error(String(error));
+          active.rejectReplan?.(normalized);
+          active.resolveReplan = undefined;
+          active.rejectReplan = undefined;
+        }
+      })();
     });
-    return true;
+    return { planningTask };
   }
 
   resumeTask(taskId: string): boolean {
@@ -2526,7 +2690,11 @@ export class TaskOrchestrator {
     const queued = this.#store.listQueuedTasks();
     for (const task of queued) {
       if (available <= 0) break;
-      if (this.#active.has(task.id) || !this.#isWorkspaceAvailable(task)) continue;
+      if (
+        this.#active.has(task.id)
+        || !this.#isWorkspaceAvailable(task)
+        || !this.#store.isPlanExecutionApproved(task)
+      ) continue;
       const run = this.#store.createRun(task.id);
       const controller = new AbortController();
       const active: ActiveExecution = {
@@ -2536,7 +2704,10 @@ export class TaskOrchestrator {
         cancelRequested: false,
         interruptRequested: false,
         pauseRequested: false,
-        replanRequested: false,
+        replanIntent: undefined,
+        replanCheckpoint: undefined,
+        resolveReplan: undefined,
+        rejectReplan: undefined,
         slotHeld: true,
         summary: "",
         completion: Promise.resolve(),
@@ -2570,8 +2741,7 @@ export class TaskOrchestrator {
       }
       await handle.completion;
       if (active.pauseRequested && !active.cancelRequested && !active.interruptRequested) {
-        if (handle.captureContext) this.#store.updateExecution(task.id, handle.captureContext());
-        this.#store.finishPausedRun(task.id, run.id, active.replanRequested);
+        this.#finishPausedExecution(active, task, run);
       } else {
         if (task.kind === "planning" && !this.#store.getPlanForPlanningTask(task.id)) {
           throw new Error("Planning Task 未提交结构化计划");
@@ -2590,10 +2760,7 @@ export class TaskOrchestrator {
       }
     } catch (error) {
       if (active.pauseRequested && !active.cancelRequested && !active.interruptRequested) {
-        if (active.handle?.captureContext) {
-          this.#store.updateExecution(task.id, active.handle.captureContext());
-        }
-        this.#store.finishPausedRun(task.id, run.id, active.replanRequested);
+        this.#finishPausedExecution(active, task, run);
       } else {
         if (
           active.handle?.captureContext
@@ -2617,6 +2784,11 @@ export class TaskOrchestrator {
         );
       }
     } finally {
+      if (active.rejectReplan) {
+        active.rejectReplan(new Error("重新规划请求未能完成"));
+        active.rejectReplan = undefined;
+        active.resolveReplan = undefined;
+      }
       this.#active.delete(task.id);
       for (const waiter of this.#resumeWaiters.filter((item) => item.taskId === task.id)) {
         waiter.resolve(null);
@@ -2627,6 +2799,38 @@ export class TaskOrchestrator {
         ...this.#resumeWaiters.filter((waiter) => waiter.taskId !== task.id),
       );
       this.#drain();
+    }
+  }
+
+  #finishPausedExecution(
+    active: ActiveExecution,
+    task: TaskRecord,
+    run: RunRecord,
+  ): void {
+    const checkpoint = active.handle?.captureContext?.()
+      ?? active.replanCheckpoint
+      ?? this.#store.getExecution(task.id);
+    this.#store.updateExecution(task.id, checkpoint);
+    if (!active.replanIntent) {
+      this.#store.finishPausedRun(task.id, run.id);
+      return;
+    }
+    try {
+      const planningTask = this.#store.finishReplanPausedRun(
+        task.id,
+        run.id,
+        active.replanIntent,
+        checkpoint,
+      );
+      active.resolveReplan?.(planningTask);
+      active.resolveReplan = undefined;
+      active.rejectReplan = undefined;
+    } catch (error) {
+      const normalized = error instanceof Error ? error : new Error(String(error));
+      active.rejectReplan?.(normalized);
+      active.resolveReplan = undefined;
+      active.rejectReplan = undefined;
+      this.#store.finishPausedRun(task.id, run.id);
     }
   }
 }

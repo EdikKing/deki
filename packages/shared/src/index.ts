@@ -558,12 +558,25 @@ export const taskEventSchema = z.object({
 }).strict();
 export type TaskEvent = z.infer<typeof taskEventSchema>;
 
+export const taskPlanContextSchema = z.object({
+  planId: z.string().uuid(),
+  status: planStatusSchema,
+  currentRevision: z.number().int().positive(),
+  approvedRevision: z.number().int().positive().optional(),
+  completedSteps: z.number().int().nonnegative(),
+  totalSteps: z.number().int().nonnegative(),
+  currentStep: planStepSchema.optional(),
+  replanReason: z.string().max(10_000).optional(),
+}).strict();
+export type TaskPlanContext = z.infer<typeof taskPlanContextSchema>;
+
 export const taskDetailSchema = z.object({
   task: taskRecordSchema,
   runs: z.array(runRecordSchema),
   artifacts: z.array(artifactRecordSchema),
   events: z.array(taskEventSchema),
   requests: z.array(taskRequestRecordSchema).default([]),
+  planContext: taskPlanContextSchema.optional(),
 }).strict();
 export type TaskDetail = z.infer<typeof taskDetailSchema>;
 
@@ -579,6 +592,7 @@ export const taskSummarySchema = z.object({
     "workspace_untrusted",
     "runtime_unavailable",
   ]).optional(),
+  planContext: taskPlanContextSchema.optional(),
 }).strict();
 export type TaskSummary = z.infer<typeof taskSummarySchema>;
 

@@ -3715,6 +3715,96 @@ html[data-theme="light"] .settings-error {
   background: var(--bg-input);
 }
 
+.plan-revision-selectors {
+  display: flex;
+  align-items: end;
+  gap: 8px;
+  margin: 8px 0;
+}
+
+.plan-revision-selectors label {
+  display: grid;
+  gap: 4px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.plan-revision-selectors select {
+  min-width: 84px;
+}
+
+.plan-revision-field-diff {
+  display: grid;
+  gap: 3px;
+  padding: 6px 0;
+}
+
+.task-plan-context {
+  display: grid;
+  gap: 5px;
+}
+
+.task-plan-context small {
+  color: var(--text-muted);
+}
+
+.task-artifact {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  margin: 6px 0;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-surface);
+  color: inherit;
+  text-align: left;
+}
+
+.artifact-preview-backdrop {
+  position: fixed;
+  z-index: 80;
+  inset: 0;
+  display: flex;
+  justify-content: flex-end;
+  background: rgb(0 0 0 / 28%);
+}
+
+.artifact-preview {
+  width: min(640px, 88vw);
+  height: 100%;
+  padding: 18px;
+  overflow: auto;
+  border-left: 1px solid var(--border);
+  background: var(--bg-elevated);
+  box-shadow: -18px 0 48px rgb(0 0 0 / 16%);
+}
+
+.artifact-preview header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  margin-bottom: 14px;
+}
+
+.artifact-preview header div {
+  display: grid;
+  gap: 3px;
+}
+
+.artifact-preview pre {
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.inspector-header > div {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
 .plan-revision-diff small {
   color: var(--text-muted);
   line-height: 1.4;

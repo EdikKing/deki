@@ -478,6 +478,47 @@ export class DekiAgentRuntime {
     };
   }
 
+  async validatePromptContext(context: AgentPromptContext): Promise<void> {
+    if (!context.sourceSessionFile) {
+      throw new Error("计划上下文尚未持久化，无法创建安全分支");
+    }
+    try {
+      await access(context.sourceSessionFile);
+    } catch {
+      throw new Error("计划上下文对应的会话文件已不存在");
+    }
+    const manager = SessionManager.open(
+      context.sourceSessionFile,
+      join(this.#options.paths.sessionsRoot, this.#options.scopeId),
+      this.#options.workspace,
+    );
+    if (context.sourceEntryId && !manager.getEntry(context.sourceEntryId)) {
+      throw new Error("计划上下文对应的会话位置已不存在");
+    }
+  }
+
+  async captureSessionPromptContext(
+    sessionId: string,
+    preferFork: boolean,
+  ): Promise<AgentPromptContext> {
+    if (this.#runtime?.session.sessionId === sessionId) {
+      return this.capturePromptContext(preferFork);
+    }
+    const session = await this.#findSession(sessionId);
+    const manager = SessionManager.open(
+      session.path,
+      join(this.#options.paths.sessionsRoot, this.#options.scopeId),
+      this.#options.workspace,
+    );
+    const sourceEntryId = manager.getLeafId() ?? undefined;
+    return {
+      sourceSessionId: sessionId,
+      sourceSessionFile: session.path,
+      ...(sourceEntryId ? { sourceEntryId } : {}),
+      preferFork,
+    };
+  }
+
   async startPrompt(input: {
     taskId: string;
     runId: string;

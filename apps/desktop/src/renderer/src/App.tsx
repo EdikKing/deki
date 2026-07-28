@@ -66,6 +66,7 @@ export function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [showTaskCenter, setShowTaskCenter] = useState(false);
   const [selectedTaskId, setSelectedTaskId] = useState<string>();
+  const [linkedTaskId, setLinkedTaskId] = useState<string>();
   const [taskAttentionCount, setTaskAttentionCount] = useState(0);
   const [foregroundTaskId, setForegroundTaskId] = useState<string>();
   const [backgroundTask, setBackgroundTask] = useState<{ id: string; title: string }>();
@@ -106,6 +107,15 @@ export function App() {
       (summary) => summary.plan.sessionId === activeSessionId.current,
     );
     setActivePlan(current ? await window.deki.getPlan(current.plan.id) : null);
+  }
+
+  async function refreshLinkedTask(sessionId = activeSessionId.current) {
+    if (!sessionId) {
+      setLinkedTaskId(undefined);
+      return;
+    }
+    const tasks = await window.deki.listTasks({ limit: 500 });
+    setLinkedTaskId(tasks.find((item) => item.task.sessionId === sessionId)?.task.id);
   }
 
   useEffect(() => {
@@ -180,6 +190,7 @@ export function App() {
     void refreshAttention();
     const unsubscribeTasks = window.deki.subscribeTaskEvents(() => {
       void refreshAttention();
+      void refreshLinkedTask();
       void refresh();
     });
     const unsubscribeOpenTask = window.deki.subscribeOpenTask((taskId) => {
@@ -244,6 +255,7 @@ export function App() {
       })
       .catch((reason) => setError(String(reason)));
     void refreshPlan().catch((reason) => setError(String(reason)));
+    void refreshLinkedTask(state.sessionId).catch((reason) => setError(String(reason)));
   }, [state?.trusted, state?.workspace, state?.sessionId]);
 
   useEffect(() => {
@@ -992,7 +1004,20 @@ export function App() {
             )}
             <header className="inspector-header">
               <strong>{zh ? "运行详情" : "Run details"}</strong>
-              <button className="icon-button" aria-label={zh ? "关闭运行详情" : "Close run details"} onClick={() => setInspectorOpen(false)}>×</button>
+              <div>
+                {linkedTaskId && (
+                  <button
+                    className="icon-button"
+                    aria-label={zh ? "打开关联任务" : "Open linked task"}
+                    title={zh ? "打开关联任务" : "Open linked task"}
+                    onClick={() => {
+                      setSelectedTaskId(linkedTaskId);
+                      setShowTaskCenter(true);
+                    }}
+                  >↗</button>
+                )}
+                <button className="icon-button" aria-label={zh ? "关闭运行详情" : "Close run details"} onClick={() => setInspectorOpen(false)}>×</button>
+              </div>
             </header>
             {activePlan && (
               <PlanPanel

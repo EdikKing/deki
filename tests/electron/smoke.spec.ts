@@ -19,6 +19,7 @@ import {
   type ElectronApplication,
 } from "@playwright/test";
 import type { DekiDesktopApi } from "@deki-ai/shared";
+import { TaskStore } from "@deki-ai/task-orchestrator";
 
 const require = createRequire(import.meta.url);
 const electronPath = require("electron") as string;
@@ -163,6 +164,48 @@ test("starts a general chat without a workspace", async ({}, testInfo) => {
       path: testInfo.outputPath("deki-empty-workspace.png"),
       fullPage: true,
     });
+  } finally {
+    await electronApp.close();
+    await rm(temporaryHome, { recursive: true, force: true });
+  }
+});
+
+// Playwright requires an object-destructured fixtures parameter.
+// eslint-disable-next-line no-empty-pattern
+test("shows Plan progress and previews persisted artifacts inside Task Center", async ({}) => {
+  const temporaryHome = await mkdtemp(resolve(tmpdir(), "deki-electron-task-plan-"));
+  await seedChineseSettings(temporaryHome);
+  await seedTaskPlanFixture(temporaryHome);
+  const electronApp = await electron.launch({
+    executablePath: electronPath,
+    args: createElectronArguments(temporaryHome),
+    env: createTestEnvironment(temporaryHome),
+  });
+
+  try {
+    const window = await electronApp.firstWindow();
+    await window.getByTestId("open-task-center").click();
+    await expect(window.getByRole("heading", { name: "后台任务" })).toBeVisible();
+    await expect(window.getByRole("heading", { name: "需要处理" })).toBeVisible();
+    const row = window.locator(".task-row").filter({ hasText: "审阅计划 Fixture" });
+    await expect(row).toContainText("规划");
+    await expect(row).toContainText("Plan v1");
+    await row.click();
+    await expect(window.getByText("计划进度")).toBeVisible();
+    await expect(window.locator(".task-plan-context")).toContainText("0/1");
+    await window.getByRole("button", { name: /Fixture Diff/ }).click();
+    const preview = window.getByRole("dialog", { name: "Fixture Diff" });
+    await expect(preview).toBeVisible();
+    await expect(preview).toContainText("+fixture");
+    await preview.getByRole("button", { name: "关闭预览" }).click();
+    await expect(preview).toHaveCount(0);
+
+    const queuedRow = window.locator(".task-row").filter({ hasText: "后台暂停 Fixture" });
+    await queuedRow.click();
+    await window.locator(".task-detail-actions").getByRole("button", { name: "暂停" }).click();
+    await expect(window.locator(".task-status-pill")).toHaveText("已暂停");
+    await window.locator(".task-detail-actions").getByRole("button", { name: "恢复" }).click();
+    await expect(window.locator(".task-status-pill")).toHaveText("排队中");
   } finally {
     await electronApp.close();
     await rm(temporaryHome, { recursive: true, force: true });
@@ -690,6 +733,74 @@ async function seedComposerModels(temporaryHome: string) {
       },
     },
   }));
+}
+
+async function seedTaskPlanFixture(temporaryHome: string) {
+  const tasksDirectory = join(temporaryHome, ".deki", "tasks");
+  await mkdir(tasksDirectory, { recursive: true });
+  const store = new TaskStore(join(tasksDirectory, "tasks.db"));
+  const missingWorkspace = join(temporaryHome, "missing-workspace");
+  const task = store.createTask({
+    workspaceId: "fixture-workspace",
+    workspacePath: missingWorkspace,
+    kind: "planning",
+    title: "审阅计划 Fixture",
+    goal: "验证 Task Center 的计划展示",
+    execution: {
+      type: "agent-prompt",
+      sourceSessionId: "fixture-session",
+      sourceSessionFile: join(temporaryHome, "missing-session.jsonl"),
+      sourceEntryId: "fixture-entry",
+      preferFork: true,
+      interactionMode: "plan",
+      deliveryMode: "background",
+    },
+  });
+  const plan = store.createPlan({
+    workspaceId: "fixture-workspace",
+    workspacePath: missingWorkspace,
+    sessionId: "fixture-session",
+    planningTaskId: task.id,
+    goal: "验证 Task Center 的计划展示",
+    assumptions: ["fixture"],
+    constraints: ["应用内预览"],
+    steps: [{
+      id: "inspect",
+      title: "检查实现",
+      description: "检查当前实现",
+      dependencies: [],
+      candidateFiles: ["src/index.ts"],
+      validation: ["显示正确"],
+      risk: "low",
+      parallelizable: false,
+    }],
+  });
+  const run = store.createRun(task.id);
+  store.createArtifact({
+    taskId: task.id,
+    runId: run.id,
+    kind: "diff",
+    title: "Fixture Diff",
+    content: "--- a/file\n+++ b/file\n+fixture",
+    metadata: { planId: plan.id },
+  });
+  store.createTask({
+    workspaceId: "fixture-workspace",
+    workspacePath: missingWorkspace,
+    kind: "background",
+    title: "后台暂停 Fixture",
+    goal: "验证排队任务暂停与恢复",
+    execution: {
+      type: "agent-prompt",
+      sourceSessionId: "fixture-session",
+      sourceSessionFile: join(temporaryHome, "missing-session.jsonl"),
+      sourceEntryId: "fixture-entry",
+      preferFork: true,
+      interactionMode: "act",
+      deliveryMode: "background",
+    },
+  });
+  store.close();
 }
 
 async function seedPersistedSession(

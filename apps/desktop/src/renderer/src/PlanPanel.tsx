@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type {
   PlanDetail,
   PlanRevisionRecord,
@@ -17,6 +17,10 @@ export function PlanPanel(props: PlanPanelProps) {
   const { detail, zh } = props;
   const [error, setError] = useState<string>();
   const [busy, setBusy] = useState(false);
+  const [beforeRevision, setBeforeRevision] = useState(
+    Math.max(1, detail.plan.currentRevision - 1),
+  );
+  const [afterRevision, setAfterRevision] = useState(detail.plan.currentRevision);
   const revision = detail.revisions.find(
     (candidate) => candidate.revision === detail.plan.currentRevision,
   );
@@ -25,14 +29,21 @@ export function PlanPanel(props: PlanPanelProps) {
       .filter((state) => state.revision === detail.plan.currentRevision)
       .map((state) => [state.stepId, state]),
   ), [detail]);
+  useEffect(() => {
+    setAfterRevision(detail.plan.currentRevision);
+    setBeforeRevision(Math.max(1, detail.plan.currentRevision - 1));
+  }, [detail.plan.id, detail.plan.currentRevision]);
   const revisionDelta = useMemo(() => {
-    if (!revision || revision.revision <= 1) return undefined;
-    const previous = detail.revisions.find(
-      (candidate) => candidate.revision === revision.revision - 1,
+    const before = detail.revisions.find(
+      (candidate) => candidate.revision === beforeRevision,
     );
-    if (!previous) return undefined;
-    return diffPlanRevisions(previous, revision);
-  }, [detail.revisions, revision]);
+    const after = detail.revisions.find(
+      (candidate) => candidate.revision === afterRevision,
+    );
+    return before && after && before.revision !== after.revision
+      ? diffPlanRevisions(before, after)
+      : undefined;
+  }, [afterRevision, beforeRevision, detail.revisions]);
 
   async function run(operation: Promise<{ ok: boolean; error?: string | undefined }>) {
     setBusy(true);
@@ -178,7 +189,8 @@ export function PlanPanel(props: PlanPanelProps) {
             {zh ? "暂停执行" : "Pause"}
           </button>
         )}
-        {detail.executionTask
+        {detail.plan.status === "approved"
+          && detail.executionTask
           && ["paused", "interrupted"].includes(detail.executionTask.status) && (
           <button
             disabled={busy}
@@ -187,7 +199,7 @@ export function PlanPanel(props: PlanPanelProps) {
             {zh ? "恢复执行" : "Resume"}
           </button>
         )}
-        {detail.executionTask?.status === "failed" && (
+        {detail.plan.status === "approved" && detail.executionTask?.status === "failed" && (
           <button
             disabled={busy}
             onClick={() => void run(window.deki.retryTask(detail.executionTask!.id))}
@@ -211,6 +223,31 @@ export function PlanPanel(props: PlanPanelProps) {
       {detail.revisions.length > 1 && (
         <details className="plan-revisions">
           <summary>{zh ? "版本历史" : "Revision history"} · {detail.revisions.length}</summary>
+          <div className="plan-revision-selectors">
+            <label>
+              {zh ? "基准版本" : "Base"}
+              <select
+                value={beforeRevision}
+                onChange={(event) => setBeforeRevision(Number(event.target.value))}
+              >
+                {detail.revisions.map((item) => (
+                  <option key={item.revision} value={item.revision}>v{item.revision}</option>
+                ))}
+              </select>
+            </label>
+            <span>→</span>
+            <label>
+              {zh ? "对比版本" : "Compare"}
+              <select
+                value={afterRevision}
+                onChange={(event) => setAfterRevision(Number(event.target.value))}
+              >
+                {detail.revisions.map((item) => (
+                  <option key={item.revision} value={item.revision}>v{item.revision}</option>
+                ))}
+              </select>
+            </label>
+          </div>
           {revisionDelta && (
             <div className="plan-revision-diff">
               <p>
@@ -232,8 +269,26 @@ export function PlanPanel(props: PlanPanelProps) {
               {revisionDelta.constraints.removed.map((item) => (
                 <small key={`cr-${item}`}>− {zh ? "约束" : "constraint"}: {item}</small>
               ))}
-              {revisionDelta.changed.map(({ step, fields }) => (
-                <small key={step.id}>~ {step.title}: {fields.join(", ")}</small>
+              {revisionDelta.added.map((step) => (
+                <small key={`add-${step.id}`}>+ {zh ? "步骤" : "step"}: {step.title}</small>
+              ))}
+              {revisionDelta.removed.map((step) => (
+                <small key={`remove-${step.id}`}>− {zh ? "步骤" : "step"}: {step.title}</small>
+              ))}
+              {revisionDelta.reordered.map(({ step, before, after }) => (
+                <small key={`move-${step.id}`}>
+                  ↕ {step.title}: {before + 1} → {after + 1}
+                </small>
+              ))}
+              {revisionDelta.changed.map(({ before, after, fields }) => (
+                <div className="plan-revision-field-diff" key={after.id}>
+                  <strong>~ {after.title}</strong>
+                  {fields.map((field) => (
+                    <small key={field}>
+                      {field}: {formatPlanField(before[field])} → {formatPlanField(after[field])}
+                    </small>
+                  ))}
+                </div>
               ))}
             </div>
           )}
@@ -262,20 +317,30 @@ export function diffPlanRevisions(
     const old = before.get(step.id);
     if (!old) return [];
     const fields = changedStepFields(old, step);
-    return fields.length > 0 ? [{ step, fields }] : [];
+    return fields.length > 0 ? [{ before: old, after: step, fields }] : [];
   });
   return {
     added: afterRevision.steps.filter((step) => !before.has(step.id)),
     removed: beforeRevision.steps.filter((step) => !after.has(step.id)),
     changed,
-    reordered: afterRevision.steps.filter((step, index) =>
-      beforeOrder.has(step.id) && beforeOrder.get(step.id) !== index),
+    reordered: afterRevision.steps.flatMap((step, index) => {
+      const oldIndex = beforeOrder.get(step.id);
+      return oldIndex !== undefined && oldIndex !== index
+        ? [{ step, before: oldIndex, after: index }]
+        : [];
+    }),
     assumptions: setDiff(beforeRevision.assumptions, afterRevision.assumptions),
     constraints: setDiff(beforeRevision.constraints, afterRevision.constraints),
   };
 }
 
-function changedStepFields(before: PlanStep, after: PlanStep): string[] {
+function formatPlanField(value: PlanStep[keyof PlanStep]): string {
+  if (Array.isArray(value)) return value.length > 0 ? value.join(", ") : "—";
+  if (value === undefined || value === "") return "—";
+  return String(value);
+}
+
+function changedStepFields(before: PlanStep, after: PlanStep): Array<keyof PlanStep> {
   const fields: Array<keyof PlanStep> = [
     "title",
     "description",

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type {
+  ArtifactRecord,
   TaskDetail,
   TaskStatus,
   TaskSummary,
@@ -35,6 +36,7 @@ export function TaskCenter(props: TaskCenterProps) {
   const [status, setStatus] = useState<TaskStatus | "">("");
   const [error, setError] = useState<string>();
   const [inputValues, setInputValues] = useState<Record<string, string>>({});
+  const [previewArtifact, setPreviewArtifact] = useState<ArtifactRecord>();
 
   async function refreshTasks() {
     const rows = await window.deki.listTasks({
@@ -87,26 +89,35 @@ export function TaskCenter(props: TaskCenterProps) {
   }, [tasks, props.zh]);
 
   const grouped = useMemo(() => {
+    const attention = tasks.filter((item) =>
+      item.task.status === "waiting_approval"
+      || item.task.status === "waiting_user"
+      || (
+        !item.runnable
+        && [
+          "queued", "running", "waiting_approval", "waiting_user",
+          "paused", "interrupted",
+        ].includes(item.task.status)
+      ));
+    const attentionIds = new Set(attention.map((item) => item.task.id));
     const groups = [
       {
         key: "running",
         title: props.zh ? "运行中" : "Running",
-        rows: tasks.filter((item) => item.task.status === "running"),
+        rows: tasks.filter((item) =>
+          item.task.status === "running" && !attentionIds.has(item.task.id)),
       },
       {
         key: "attention",
         title: props.zh ? "需要处理" : "Needs attention",
-        rows: tasks.filter((item) =>
-          item.task.status === "waiting_approval"
-          || item.task.status === "waiting_user"
-          || (item.task.status === "queued" && !item.runnable)),
+        rows: attention,
       },
       {
         key: "queued",
         title: props.zh ? "排队与暂停" : "Queued & paused",
         rows: tasks.filter((item) =>
           (item.task.status === "queued" || item.task.status === "paused")
-          && item.runnable),
+          && !attentionIds.has(item.task.id)),
       },
       {
         key: "completed",
@@ -118,7 +129,8 @@ export function TaskCenter(props: TaskCenterProps) {
         key: "failed",
         title: props.zh ? "失败与中断" : "Failed & interrupted",
         rows: tasks.filter((item) =>
-          item.task.status === "failed" || item.task.status === "interrupted"),
+          (item.task.status === "failed" || item.task.status === "interrupted")
+          && !attentionIds.has(item.task.id)),
       },
     ];
     return groups.filter((group) => group.rows.length > 0);
@@ -184,7 +196,19 @@ export function TaskCenter(props: TaskCenterProps) {
                         {workspaceName(task.workspacePath, props.zh)}
                         {" · "}
                         {props.zh ? statusCopy[task.status].zh : statusCopy[task.status].en}
+                        {" · "}
+                        {taskKindLabel(task.kind, props.zh)}
                       </small>
+                      {summary.planContext && (
+                        <span>
+                          Plan v{summary.planContext.currentRevision}
+                          {" · "}
+                          {summary.planContext.completedSteps}/{summary.planContext.totalSteps}
+                          {summary.planContext.currentStep
+                            ? ` · ${summary.planContext.currentStep.title}`
+                            : ""}
+                        </span>
+                      )}
                       {(summary.resultSummary || summary.error) && (
                         <span>{summary.error ?? summary.resultSummary}</span>
                       )}
@@ -237,6 +261,31 @@ export function TaskCenter(props: TaskCenterProps) {
                 <h3>{props.zh ? "目标" : "Goal"}</h3>
                 <p className="task-goal">{detail.task.goal}</p>
               </section>
+
+              {detail.planContext && (
+                <section className="task-detail-section task-plan-context">
+                  <h3>{props.zh ? "计划进度" : "Plan progress"}</h3>
+                  <p>
+                    Plan v{detail.planContext.currentRevision}
+                    {" · "}
+                    {detail.planContext.completedSteps}/{detail.planContext.totalSteps}
+                    {" · "}
+                    {detail.planContext.status}
+                  </p>
+                  {detail.planContext.currentStep && (
+                    <>
+                      <strong>{detail.planContext.currentStep.title}</strong>
+                      <small>
+                        {props.zh ? "依赖" : "Dependencies"}:{" "}
+                        {detail.planContext.currentStep.dependencies.join(", ") || "—"}
+                      </small>
+                    </>
+                  )}
+                  {detail.planContext.replanReason && (
+                    <p className="error">{detail.planContext.replanReason}</p>
+                  )}
+                </section>
+              )}
 
               {detail.requests.filter((request) => request.status === "pending").map((request) => (
                 <section className="task-request" key={request.id}>
@@ -339,10 +388,14 @@ export function TaskCenter(props: TaskCenterProps) {
                 <section className="task-detail-section">
                   <h3>{props.zh ? "产物" : "Artifacts"}</h3>
                   {detail.artifacts.map((artifact) => (
-                    <details className="task-artifact" key={artifact.id}>
-                      <summary>{artifact.title} · {artifact.kind}</summary>
-                      {artifact.content && <pre>{artifact.content}</pre>}
-                    </details>
+                    <button
+                      className="task-artifact"
+                      key={artifact.id}
+                      onClick={() => setPreviewArtifact(artifact)}
+                    >
+                      <strong>{artifact.title}</strong>
+                      <span>{artifact.kind}</span>
+                    </button>
                   ))}
                 </section>
               )}
@@ -367,6 +420,41 @@ export function TaskCenter(props: TaskCenterProps) {
         </div>
       </div>
       {error && <p className="error task-center-error">{error}</p>}
+      {previewArtifact && (
+        <div
+          className="artifact-preview-backdrop"
+          role="presentation"
+          onClick={() => setPreviewArtifact(undefined)}
+        >
+          <aside
+            className="artifact-preview"
+            role="dialog"
+            aria-modal="true"
+            aria-label={previewArtifact.title}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <header>
+              <div>
+                <strong>{previewArtifact.title}</strong>
+                <small>{previewArtifact.kind}</small>
+              </div>
+              <button
+                aria-label={props.zh ? "关闭预览" : "Close preview"}
+                onClick={() => setPreviewArtifact(undefined)}
+              >×</button>
+            </header>
+            {previewArtifact.content ? (
+              <pre>{previewArtifact.content}</pre>
+            ) : (
+              <p>
+                {props.zh
+                  ? "该产物仅保存了 URI，出于安全考虑不在 Deki 中打开。"
+                  : "This artifact only stores a URI. Deki does not open it for safety."}
+              </p>
+            )}
+          </aside>
+        </div>
+      )}
     </section>
   );
 }
@@ -392,6 +480,8 @@ function TaskActions(props: {
   onOpenPlan(planId: string): void;
 }) {
   const { task } = props.detail;
+  const executionCanContinue = task.kind !== "plan-execution"
+    || props.detail.planContext?.status === "approved";
   const reopenWorkspace = async () => {
     if (!task.workspacePath) return { ok: false, error: "任务没有可用的项目路径" };
     const opened = await window.deki.openWorkspace(task.workspacePath);
@@ -429,17 +519,17 @@ function TaskActions(props: {
           {props.zh ? "暂停" : "Pause"}
         </button>
       )}
-      {task.status === "paused" && (
+      {task.status === "paused" && executionCanContinue && (
         <button className="primary" onClick={() => void props.onCommand(
           window.deki.resumeTask(task.id),
         )}>{props.zh ? "恢复" : "Resume"}</button>
       )}
-      {task.status === "interrupted" && (
+      {task.status === "interrupted" && executionCanContinue && (
         <button className="primary" onClick={() => void props.onCommand(
           window.deki.resumeTask(task.id),
         )}>{props.zh ? "恢复" : "Resume"}</button>
       )}
-      {task.status === "failed" && (
+      {task.status === "failed" && executionCanContinue && (
         <button className="primary" onClick={() => void props.onCommand(
           window.deki.retryTask(task.id),
         )}>{props.zh ? "重试" : "Retry"}</button>
@@ -453,6 +543,17 @@ function TaskActions(props: {
       )}
     </div>
   );
+}
+
+function taskKindLabel(kind: TaskDetail["task"]["kind"], zh: boolean): string {
+  const labels = {
+    interactive: zh ? "前台" : "Interactive",
+    background: zh ? "后台" : "Background",
+    worker: zh ? "Worker" : "Worker",
+    planning: zh ? "规划" : "Planning",
+    "plan-execution": zh ? "计划执行" : "Plan execution",
+  };
+  return labels[kind];
 }
 
 function workspaceName(path: string | undefined, zh: boolean): string {

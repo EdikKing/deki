@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -103,6 +103,50 @@ describe("TaskStore", () => {
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'plans'",
     ).get()).toBeTruthy();
     verified.close();
+  });
+
+  it("migrates a v2 task database through Plan and delivery schemas", async () => {
+    const databasePath = await createDatabasePath();
+    const legacy = new DatabaseSync(databasePath);
+    legacy.exec(`
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, workspace_path TEXT,
+        root_task_id TEXT NOT NULL, parent_task_id TEXT, kind TEXT NOT NULL,
+        title TEXT NOT NULL, goal TEXT NOT NULL, status TEXT NOT NULL,
+        priority INTEGER NOT NULL, session_id TEXT, plan_id TEXT,
+        current_run_id TEXT, assigned_profile TEXT, execution_json TEXT NOT NULL,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT
+      );
+      CREATE TABLE runs (
+        id TEXT PRIMARY KEY, task_id TEXT, attempt INTEGER, status TEXT,
+        session_id TEXT, runner_id TEXT, model_provider TEXT, model_id TEXT,
+        started_at TEXT, finished_at TEXT, error TEXT, result_summary TEXT,
+        input_tokens INTEGER, output_tokens INTEGER, tool_call_count INTEGER
+      );
+      CREATE TABLE task_requests (
+        id TEXT PRIMARY KEY, task_id TEXT, run_id TEXT, kind TEXT, status TEXT,
+        title TEXT, description TEXT, payload_json TEXT, response_json TEXT,
+        created_at TEXT, resolved_at TEXT
+      );
+      INSERT INTO tasks VALUES (
+        '00000000-0000-4000-8000-000000000012', 'workspace-v2', '/tmp/v2',
+        '00000000-0000-4000-8000-000000000012', NULL, 'background',
+        'legacy v2', 'legacy v2', 'queued', 0, NULL, NULL, NULL, NULL,
+        '{"type":"agent-prompt","sourceSessionId":"s","preferFork":true}',
+        '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z', NULL
+      );
+      PRAGMA user_version = 2;
+    `);
+    legacy.close();
+
+    const migrated = new TaskStore(databasePath);
+    expect(migrated.getTask("00000000-0000-4000-8000-000000000012"))
+      .toMatchObject({ workspacePath: "/tmp/v2", status: "queued" });
+    expect(migrated.getDeliveryMode("00000000-0000-4000-8000-000000000012"))
+      .toBe("background");
+    migrated.close();
+    const reopened = new TaskStore(databasePath);
+    reopened.close();
   });
 
   it("persists tasks, runs, artifacts, and monotonic events", async () => {
@@ -860,6 +904,119 @@ describe("TaskOrchestrator", () => {
 
   it("keeps Plan execution consistent on failure and atomically prepares replan", async () => {
     const store = await createStore();
+    const sourceDirectory = await mkdtemp(join(tmpdir(), "deki-replan-session-"));
+    temporaryDirectories.push(sourceDirectory);
+    const sourceSessionFile = join(sourceDirectory, "session.jsonl");
+    await writeFile(sourceSessionFile, "{}\n");
+    const executionCheckpoint = {
+      ...promptExecution(),
+      sourceSessionFile,
+    };
+    const planning = store.createTask({
+      workspaceId: "workspace-a",
+      kind: "planning",
+      title: "plan",
+      goal: "plan",
+      execution: { ...executionCheckpoint, interactionMode: "plan" },
+    });
+    const plan = store.createPlan({
+      workspaceId: "workspace-a",
+      sessionId: "session-plan",
+      planningTaskId: planning.id,
+      goal: "plan",
+      assumptions: [],
+      constraints: [],
+      steps: planSteps(),
+    });
+    store.cancelInactiveTask(planning.id);
+    const execution = store.approvePlan(plan.id, 1, {
+      title: "execute",
+      execution: {
+        ...executionCheckpoint,
+        preferFork: true,
+        interactionMode: "plan-execution",
+        planId: plan.id,
+        planRevision: 1,
+      },
+    });
+    const handle = deferredHandle("session-execution");
+    const planningHandle = deferredHandle("session-revision");
+    const orchestrator = new TaskOrchestrator({
+      store,
+      concurrency: 1,
+      executor: async ({ task }) => task.kind === "planning" ? planningHandle : handle,
+    });
+    orchestrator.start();
+    await settle();
+    expect(store.getPlan(plan.id)?.plan.status).toBe("executing");
+    const runId = store.getTask(execution.id)!.currentRunId!;
+    store.updatePlanStep(plan.id, {
+      revision: 1,
+      stepId: "inspect",
+      status: "running",
+      taskId: execution.id,
+      runId,
+    });
+
+    expect(() => orchestrator.requestReplan(execution.id, {
+      planId: plan.id,
+      reason: "无效请求",
+      affectedStepIds: ["missing"],
+    })).toThrow("受影响步骤包含未知 Step ID");
+    expect(store.getPlan(plan.id)?.plan.status).toBe("executing");
+    expect(store.getPlan(plan.id)?.plan.replanReason).toBeUndefined();
+    await rm(sourceSessionFile);
+    expect(() => orchestrator.requestReplan(execution.id, {
+      planId: plan.id,
+      reason: "checkpoint missing",
+      affectedStepIds: ["inspect"],
+    })).toThrow("计划最新 checkpoint 不可用");
+    expect(store.getPlan(plan.id)?.plan.status).toBe("executing");
+    expect(store.getTask(execution.id)?.status).toBe("running");
+    await writeFile(sourceSessionFile, "{}\n");
+
+    const request = orchestrator.requestReplan(execution.id, {
+      planId: plan.id,
+      reason: "假设失效",
+      affectedStepIds: ["inspect"],
+      evidence: ["API 已变化"],
+    });
+    expect(request).not.toBeNull();
+    handle.reject(abortError());
+    const revisionTask = await request!.planningTask;
+    await settle();
+    const detail = store.getPlan(plan.id)!;
+    expect(detail.plan).toMatchObject({
+      status: "draft",
+      replanReason: "假设失效",
+      affectedStepIds: ["inspect"],
+      replanEvidence: ["API 已变化"],
+    });
+    expect(detail.stepStates.find((state) => state.stepId === "inspect"))
+      .toMatchObject({ status: "blocked", reason: "假设失效" });
+    expect(store.getTask(execution.id)?.status).toBe("paused");
+    expect(revisionTask).toMatchObject({
+      kind: "planning",
+      planId: plan.id,
+      status: "queued",
+    });
+    expect(store.getTaskDetail(execution.id)?.planContext).toMatchObject({
+      planId: plan.id,
+      status: "draft",
+      currentRevision: 1,
+      completedSteps: 0,
+      totalSteps: 2,
+      currentStep: { id: "inspect" },
+    });
+    expect(() => orchestrator.resumeTask(execution.id))
+      .toThrow("计划必须完成修订并重新批准后才能恢复执行");
+    planningHandle.reject(abortError());
+    await settle();
+    await orchestrator.dispose();
+  });
+
+  it("does not start or resume an execution task while its Plan is draft", async () => {
+    const store = await createStore();
     const planning = store.createTask({
       workspaceId: "workspace-a",
       kind: "planning",
@@ -886,7 +1043,64 @@ describe("TaskOrchestrator", () => {
         planRevision: 1,
       },
     });
+    store.requestPlanRevision(plan.id, "change it");
+    const executor = vi.fn(async () => deferredHandle("should-not-start"));
+    const orchestrator = new TaskOrchestrator({
+      store,
+      concurrency: 1,
+      executor,
+    });
+    orchestrator.start();
+    await settle();
+
+    expect(executor).not.toHaveBeenCalled();
+    expect(store.getTask(execution.id)?.status).toBe("queued");
+    expect(() => store.createRun(execution.id))
+      .toThrow("计划必须完成修订并重新批准后才能恢复执行");
+    store.pauseQueuedTask(execution.id);
+    expect(() => orchestrator.resumeTask(execution.id))
+      .toThrow("计划必须完成修订并重新批准后才能恢复执行");
+    await orchestrator.dispose();
+  });
+
+  it("keeps the active Plan unchanged when precise replan cancellation fails", async () => {
+    const store = await createStore();
+    const sourceDirectory = await mkdtemp(join(tmpdir(), "deki-replan-cancel-"));
+    temporaryDirectories.push(sourceDirectory);
+    const sourceSessionFile = join(sourceDirectory, "session.jsonl");
+    await writeFile(sourceSessionFile, "{}\n");
+    const checkpoint = { ...promptExecution(), sourceSessionFile };
+    const planning = store.createTask({
+      workspaceId: "workspace-a",
+      kind: "planning",
+      title: "plan",
+      goal: "plan",
+      execution: { ...checkpoint, interactionMode: "plan" },
+    });
+    const plan = store.createPlan({
+      workspaceId: "workspace-a",
+      sessionId: "session-plan",
+      planningTaskId: planning.id,
+      goal: "plan",
+      assumptions: [],
+      constraints: [],
+      steps: planSteps(),
+    });
+    store.cancelInactiveTask(planning.id);
+    const execution = store.approvePlan(plan.id, 1, {
+      title: "execute",
+      execution: {
+        ...checkpoint,
+        preferFork: true,
+        interactionMode: "plan-execution",
+        planId: plan.id,
+        planRevision: 1,
+      },
+    });
     const handle = deferredHandle("session-execution");
+    handle.cancel = vi.fn(async () => {
+      throw new Error("cancel failed");
+    });
     const orchestrator = new TaskOrchestrator({
       store,
       concurrency: 1,
@@ -894,7 +1108,6 @@ describe("TaskOrchestrator", () => {
     });
     orchestrator.start();
     await settle();
-    expect(store.getPlan(plan.id)?.plan.status).toBe("executing");
     const runId = store.getTask(execution.id)!.currentRunId!;
     store.updatePlanStep(plan.id, {
       revision: 1,
@@ -904,24 +1117,20 @@ describe("TaskOrchestrator", () => {
       runId,
     });
 
-    await orchestrator.requestReplan(execution.id, {
+    const request = orchestrator.requestReplan(execution.id, {
       planId: plan.id,
-      reason: "假设失效",
+      reason: "needs replan",
       affectedStepIds: ["inspect"],
-      evidence: ["API 已变化"],
     });
-    handle.reject(abortError());
+    await expect(request!.planningTask).rejects.toThrow("cancel failed");
+    expect(store.getTask(execution.id)?.status).toBe("running");
+    expect(store.getPlan(plan.id)?.plan.status).toBe("executing");
+    expect(store.getPlan(plan.id)?.plan.replanReason).toBeUndefined();
+    expect(store.getPlan(plan.id)?.stepStates.find((state) => state.stepId === "inspect"))
+      .toMatchObject({ status: "running" });
+
+    handle.reject(new Error("stop fixture"));
     await settle();
-    const detail = store.getPlan(plan.id)!;
-    expect(detail.plan).toMatchObject({
-      status: "draft",
-      replanReason: "假设失效",
-      affectedStepIds: ["inspect"],
-      replanEvidence: ["API 已变化"],
-    });
-    expect(detail.stepStates.find((state) => state.stepId === "inspect"))
-      .toMatchObject({ status: "blocked", reason: "假设失效" });
-    expect(store.getTask(execution.id)?.status).toBe("paused");
     await orchestrator.dispose();
   });
 });

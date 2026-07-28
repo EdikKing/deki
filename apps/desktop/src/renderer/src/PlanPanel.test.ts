@@ -31,9 +31,10 @@ describe("diffPlanRevisions", () => {
     expect(diff.constraints.added).toEqual(["no daemon"]);
     expect(diff.added.map((item) => item.id)).toEqual(["verify"]);
     expect(diff.removed.map((item) => item.id)).toEqual(["remove"]);
-    expect(diff.reordered.map((item) => item.id)).toEqual(["implement", "inspect"]);
+    expect(diff.reordered.map((item) => item.step.id)).toEqual(["implement", "inspect"]);
     expect(diff.changed).toEqual([{
-      step: after.steps[0],
+      before: before.steps[2],
+      after: after.steps[0],
       fields: ["title", "description", "validation"],
     }]);
   });

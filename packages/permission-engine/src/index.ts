@@ -55,6 +55,7 @@ export interface PermissionEngineOptions {
   resolvePolicies?: () => Record<PermissionCategory, PermissionPolicy>;
   emit: (event: AgentEvent) => void;
   taskId?: () => string | undefined;
+  runId?: () => string | undefined;
   acquireResumeLease?: (
     taskId: string,
     requestId: string,
@@ -67,6 +68,7 @@ interface PendingApproval {
   resolve: (decision: ApprovalDecision) => void;
   timeout: ReturnType<typeof setTimeout>;
   taskId?: string;
+  runId?: string;
   resolving: boolean;
 }
 
@@ -232,6 +234,8 @@ export class PermissionEngine {
       type: "approval.resolved",
       requestId,
       decision,
+      ...(pending.taskId ? { taskId: pending.taskId } : {}),
+      ...(pending.runId ? { runId: pending.runId } : {}),
     });
     pending.resolve(decision);
     return true;
@@ -285,6 +289,7 @@ export class PermissionEngine {
       Date.now() + this.#options.settings.permissions.approvalTimeoutMs,
     ).toISOString();
     const taskId = this.#options.taskId?.();
+    const runId = this.#options.runId?.();
     const decision = new Promise<ApprovalDecision>((resolveDecision) => {
       const timeout = setTimeout(() => {
         void this.#resolvePending(requestId, "deny");
@@ -294,6 +299,7 @@ export class PermissionEngine {
         resolve: resolveDecision,
         timeout,
         ...(taskId ? { taskId } : {}),
+        ...(runId ? { runId } : {}),
         resolving: false,
       });
     });
@@ -306,6 +312,8 @@ export class PermissionEngine {
       details: redactValue(request.details),
       ...(request.diff ? { diff: redactText(request.diff) } : {}),
       expiresAt,
+      ...(taskId ? { taskId } : {}),
+      ...(runId ? { runId } : {}),
     });
     return decision;
   }

@@ -64,12 +64,22 @@ export interface ReplanInput {
   evidence?: string[];
   title?: string;
   deliveryMode?: "foreground" | "background";
+  mode?: "replan" | "revision";
+}
+
+export interface PlanRevisionTaskInput {
+  feedback: string;
+  affectedStepIds: string[];
+  evidence?: string[];
+  title: string;
+  execution: PromptExecutionInput;
 }
 
 interface ValidatedReplan {
   plan: PlanRecord;
   revision: PlanRevisionRecord;
   affectedStepIds: string[];
+  blockSteps: boolean;
 }
 
 export interface TaskExecutionHandle {
@@ -246,15 +256,6 @@ const runTransitions: Record<RunStatus, ReadonlySet<RunStatus>> = {
   failed: new Set(),
   cancelled: new Set(),
   interrupted: new Set(),
-};
-
-const planTransitions: Record<PlanStatus, ReadonlySet<PlanStatus>> = {
-  draft: new Set(["ready", "abandoned"]),
-  ready: new Set(["draft", "approved", "abandoned"]),
-  approved: new Set(["executing", "draft", "abandoned"]),
-  executing: new Set(["approved", "draft", "completed", "abandoned"]),
-  completed: new Set(),
-  abandoned: new Set(),
 };
 
 export class TaskStore {
@@ -455,6 +456,16 @@ export class TaskStore {
     return row?.delivery_mode === "background" ? "background" : "foreground";
   }
 
+  getLatestPlanningTask(planId: string): TaskRecord | undefined {
+    const row = this.#database.prepare(`
+      SELECT * FROM tasks
+      WHERE plan_id = ? AND kind = 'planning'
+      ORDER BY created_at DESC, rowid DESC
+      LIMIT 1
+    `).get(planId) as unknown as TaskRow | undefined;
+    return row ? rowToTask(row) : undefined;
+  }
+
   isPlanExecutionApproved(task: TaskRecord): boolean {
     if (task.kind !== "plan-execution" || !task.planId) return true;
     const plan = this.#getPlanRecord(task.planId);
@@ -606,40 +617,93 @@ export class TaskStore {
     return this.#requirePlan(planId);
   }
 
-  requestPlanRevision(
+  createPlanRevisionTask(
     planId: string,
-    feedback: string,
-    affectedStepIds: string[] = [],
-  ): PlanRecord {
+    input: PlanRevisionTaskInput,
+  ): TaskRecord {
     const plan = this.#requirePlan(planId);
     if (!["draft", "ready", "approved"].includes(plan.status)) {
       throw new Error(`计划当前状态为 ${plan.status}，不能请求修订`);
     }
-    if (plan.status !== "draft") this.#assertPlanTransition(plan.status, "draft");
+    const pending = this.#findNonTerminalPlanningTask(planId);
+    if (pending) throw new Error("该计划已有正在进行的修订任务");
     const revision = this.#requirePlanRevision(planId, plan.currentRevision);
     const knownIds = new Set(revision.steps.map((step) => step.id));
-    if (affectedStepIds.some((id) => !knownIds.has(id))) {
+    if (input.affectedStepIds.some((id) => !knownIds.has(id))) {
       throw new Error("受影响步骤包含未知 Step ID");
     }
-    const nextAffected = affectedStepIds.length > 0
-      ? affectedStepIds
+    const executionTask = plan.executionTaskId
+      ? this.#requireTask(plan.executionTaskId)
+      : undefined;
+    if (
+      executionTask
+      && ["running", "waiting_approval", "waiting_user"].includes(executionTask.status)
+    ) {
+      throw new Error("计划执行任务仍在运行，必须先精确暂停");
+    }
+    if (
+      executionTask
+      && !["queued", "paused", "failed", "interrupted", "cancelled"].includes(
+        executionTask.status,
+      )
+    ) {
+      throw new Error(`执行任务当前状态为 ${executionTask.status}，不能修订`);
+    }
+    const execution = promptExecutionInputSchema.parse(input.execution);
+    const affectedStepIds = input.affectedStepIds.length > 0
+      ? input.affectedStepIds
       : plan.affectedStepIds;
     const now = new Date().toISOString();
-    this.#transaction((_events, planEvents) => {
-      this.#database.prepare(
-        `UPDATE plans
-         SET status = 'draft', replan_reason = COALESCE(replan_reason, ?),
-             affected_step_ids_json = ?, updated_at = ?
-         WHERE id = ?`,
-      ).run(feedback, JSON.stringify(nextAffected), now, planId);
+    let planningTask: TaskRecord;
+    this.#transaction((events, planEvents) => {
+      if (executionTask?.status === "queued") {
+        this.#database.prepare(`
+          UPDATE tasks SET status = 'paused', updated_at = ?, completed_at = NULL
+          WHERE id = ?
+        `).run(now, executionTask.id);
+        events.push(this.#appendEvent(
+          executionTask.id,
+          "task.paused",
+          { reason: "plan_revision" },
+          executionTask.currentRunId,
+          executionTask.sessionId,
+        ));
+      }
+      this.#database.prepare(`
+        UPDATE plans
+        SET status = 'draft', executing_revision = NULL, replan_reason = ?,
+            affected_step_ids_json = ?, replan_evidence_json = ?, updated_at = ?
+        WHERE id = ?
+      `).run(
+        input.feedback,
+        JSON.stringify(affectedStepIds),
+        JSON.stringify(input.evidence ?? []),
+        now,
+        planId,
+      );
       planEvents.push(this.#appendPlanEvent(
         planId,
         "plan.replan_requested",
-        { feedback, affectedStepIds: nextAffected },
-        plan.executionTaskId,
+        {
+          feedback: input.feedback,
+          reason: input.feedback,
+          affectedStepIds,
+          evidence: input.evidence ?? [],
+        },
+        executionTask?.id,
+        executionTask?.currentRunId,
       ));
+      planningTask = this.#insertTask({
+        workspaceId: plan.workspaceId,
+        ...(plan.workspacePath ? { workspacePath: plan.workspacePath } : {}),
+        kind: "planning",
+        title: input.title,
+        goal: plan.goal,
+        planId,
+        execution,
+      }, events);
     });
-    return this.#requirePlan(planId);
+    return planningTask!;
   }
 
   getPlan(planId: string): PlanDetail | undefined {
@@ -662,6 +726,9 @@ export class TaskStore {
       revisions: revisions.map(rowToPlanRevision),
       stepStates: states.map(rowToPlanStepState),
       events: events.map(rowToPlanEvent),
+      ...(plan.planningTaskId
+        ? { planningTask: this.getTask(plan.planningTaskId) }
+        : {}),
       ...(plan.executionTaskId
         ? { executionTask: this.getTask(plan.executionTaskId) }
         : {}),
@@ -729,6 +796,11 @@ export class TaskStore {
     const plan = this.#requirePlan(planId);
     if (plan.status !== "ready") throw new Error("只有待审阅计划可以批准");
     if (revisionNumber !== plan.currentRevision) throw new Error("只能批准最新计划版本");
+    if (!plan.planningTaskId) throw new Error("计划缺少有效的规划任务");
+    const planningTask = this.#requireTask(plan.planningTaskId);
+    if (planningTask.status !== "succeeded") {
+      throw new Error("规划任务尚未成功完成，不能批准计划");
+    }
     this.#requirePlanRevision(planId, revisionNumber);
     const now = new Date().toISOString();
     let task: TaskRecord;
@@ -1247,6 +1319,7 @@ export class TaskStore {
         validated.plan.id,
         "plan.replan_requested",
         {
+          feedback: input.reason,
           reason: input.reason,
           affectedStepIds: validated.affectedStepIds,
           evidence: input.evidence ?? [],
@@ -1363,18 +1436,21 @@ export class TaskStore {
   validateReplan(taskId: string, runId: string, input: ReplanInput): ValidatedReplan {
     const task = this.#requireTask(taskId);
     const plan = this.#requirePlan(input.planId);
+    const revisionNumber = plan.executingRevision ?? plan.approvedRevision;
     if (
       task.kind !== "plan-execution"
       || task.planId !== plan.id
       || task.currentRunId !== runId
-      || plan.status !== "executing"
-      || !plan.executingRevision
+      || !revisionNumber
+      || (
+        plan.status !== "executing"
+        && !(input.mode === "revision" && plan.status === "approved")
+      )
     ) {
       throw new Error("只能为当前执行中的计划请求重新规划");
     }
-    const executingRevision = plan.executingRevision;
-    const revision = this.#requirePlanRevision(plan.id, executingRevision);
-    const states = this.#listPlanStepStates(plan.id, executingRevision);
+    const revision = this.#requirePlanRevision(plan.id, revisionNumber);
+    const states = this.#listPlanStepStates(plan.id, revisionNumber);
     const knownIds = new Set(revision.steps.map((step) => step.id));
     if (input.affectedStepIds.some((id) => !knownIds.has(id))) {
       throw new Error("受影响步骤包含未知 Step ID");
@@ -1382,17 +1458,26 @@ export class TaskStore {
     const activeSteps = states.filter(
       (state) => state.status === "running" || state.status === "blocked",
     );
-    if (activeSteps.length === 0) throw new Error("当前没有正在执行或阻塞的步骤");
+    if (
+      activeSteps.length === 0
+      && !(input.mode === "revision" && plan.status === "approved")
+    ) {
+      throw new Error("当前没有正在执行或阻塞的步骤");
+    }
     const affected = input.affectedStepIds.length > 0
       ? new Set(input.affectedStepIds)
       : new Set(activeSteps.map((state) => state.stepId));
-    if (!activeSteps.some((state) => affected.has(state.stepId))) {
+    if (
+      activeSteps.length > 0
+      && !activeSteps.some((state) => affected.has(state.stepId))
+    ) {
       throw new Error("受影响步骤必须包含当前执行或阻塞的步骤");
     }
     return {
       plan,
       revision,
       affectedStepIds: [...affected],
+      blockSteps: activeSteps.length > 0,
     };
   }
 
@@ -1704,6 +1789,19 @@ export class TaskStore {
     return task;
   }
 
+  #findNonTerminalPlanningTask(planId: string): TaskRecord | undefined {
+    const row = this.#database.prepare(`
+      SELECT * FROM tasks
+      WHERE plan_id = ? AND kind = 'planning'
+        AND status IN (
+          'queued', 'running', 'waiting_approval', 'waiting_user', 'paused'
+        )
+      ORDER BY created_at DESC, rowid DESC
+      LIMIT 1
+    `).get(planId) as unknown as TaskRow | undefined;
+    return row ? rowToTask(row) : undefined;
+  }
+
   #assertPlanExecutionApproved(task: TaskRecord): void {
     if (task.kind !== "plan-execution" || !task.planId) return;
     const plan = this.#requirePlan(task.planId);
@@ -1729,12 +1827,6 @@ export class TaskStore {
   #assertRunTransition(from: RunStatus, to: RunStatus): void {
     if (!runTransitions[from].has(to)) {
       throw new Error(`非法运行状态转换: ${from} -> ${to}`);
-    }
-  }
-
-  #assertPlanTransition(from: PlanStatus, to: PlanStatus): void {
-    if (!planTransitions[from].has(to)) {
-      throw new Error(`非法计划状态转换: ${from} -> ${to}`);
     }
   }
 
@@ -2452,12 +2544,55 @@ export class TaskOrchestrator {
     return true;
   }
 
+  requestPlanRevision(
+    planId: string,
+    input: PlanRevisionTaskInput,
+  ): ReplanRequest {
+    const detail = this.#store.getPlan(planId);
+    if (!detail) throw new Error("未找到计划");
+    const executionTask = detail.executionTask;
+    if (
+      executionTask
+      && ["running", "waiting_approval", "waiting_user"].includes(executionTask.status)
+    ) {
+      return this.#requestActivePlanPause(executionTask.id, {
+        planId,
+        reason: input.feedback,
+        affectedStepIds: input.affectedStepIds,
+        ...(input.evidence ? { evidence: input.evidence } : {}),
+        title: input.title,
+        deliveryMode: input.execution.deliveryMode ?? "foreground",
+        mode: "revision",
+      });
+    }
+    return {
+      planningTask: Promise.resolve(
+        this.#store.createPlanRevisionTask(planId, input),
+      ),
+    };
+  }
+
   requestReplan(taskId: string, input: ReplanInput): ReplanRequest | null {
+    return this.#requestActivePlanPause(taskId, {
+      ...input,
+      mode: input.mode ?? "replan",
+    });
+  }
+
+  #requestActivePlanPause(
+    taskId: string,
+    input: ReplanInput,
+  ): ReplanRequest {
     const active = this.#active.get(taskId);
-    if (!active || active.replanIntent) return null;
+    if (!active) throw new Error("计划执行任务当前不在运行");
+    if (active.replanIntent) throw new Error("计划已有正在处理的修订请求");
     this.#store.validateReplan(taskId, active.runId, input);
     const checkpoint = active.handle?.captureContext?.() ?? this.#store.getExecution(taskId);
-    if (!checkpoint.sourceSessionFile || !existsSync(checkpoint.sourceSessionFile)) {
+    if (
+      !checkpoint.sourceSessionFile
+      || !checkpoint.sourceEntryId
+      || !existsSync(checkpoint.sourceSessionFile)
+    ) {
       throw new Error("计划最新 checkpoint 不可用，无法安全地重新规划");
     }
     let resolveReplan!: (task: TaskRecord) => void;
@@ -2740,6 +2875,9 @@ export class TaskOrchestrator {
         await handle.cancel().catch(() => undefined);
       }
       await handle.completion;
+      if (handle.captureContext) {
+        this.#store.updateExecution(task.id, handle.captureContext());
+      }
       if (active.pauseRequested && !active.cancelRequested && !active.interruptRequested) {
         this.#finishPausedExecution(active, task, run);
       } else {

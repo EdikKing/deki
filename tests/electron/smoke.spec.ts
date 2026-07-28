@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
+import { createServer, type Server } from "node:http";
 import {
   mkdir,
   mkdtemp,
@@ -11,6 +12,7 @@ import {
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import type { AddressInfo } from "node:net";
 import { promisify } from "node:util";
 import {
   _electron as electron,
@@ -209,6 +211,136 @@ test("shows Plan progress and previews persisted artifacts inside Task Center", 
   } finally {
     await electronApp.close();
     await rm(temporaryHome, { recursive: true, force: true });
+  }
+});
+
+// Playwright requires an object-destructured fixtures parameter.
+// eslint-disable-next-line no-empty-pattern
+test("runs a real Plan revision and replan flow through an OpenAI-compatible fixture", async ({}) => {
+  const temporaryHome = await mkdtemp(resolve(tmpdir(), "deki-electron-plan-flow-"));
+  const workspace = await mkdtemp(resolve(tmpdir(), "deki-electron-plan-workspace-"));
+  const modelServer = await startFixtureModelServer();
+  await seedChineseSettings(temporaryHome);
+  await seedFixtureModel(temporaryHome, modelServer.baseUrl);
+  await writeFile(join(workspace, "README.md"), "fixture workspace\n");
+  await execFileAsync("git", ["init"], { cwd: workspace });
+  await execFileAsync("git", ["add", "README.md"], { cwd: workspace });
+  await execFileAsync("git", [
+    "-c", "user.name=Deki Test",
+    "-c", "user.email=deki@example.com",
+    "commit", "-m", "fixture",
+  ], { cwd: workspace });
+  const beforeStatus = await gitWorkspaceSnapshot(workspace);
+  const electronApp = await electron.launch({
+    executablePath: electronPath,
+    args: createElectronArguments(
+      temporaryHome,
+      "--workspace",
+      workspace,
+    ),
+    env: createTestEnvironment(temporaryHome),
+  });
+
+  try {
+    const window = await electronApp.firstWindow();
+    await window.getByRole("button", { name: /信任并继续|Trust and continue/ }).click();
+    const composer = window.locator(".composer-card");
+    await expect(composer.getByRole("button", { name: "选择模型" })).toContainText(
+      "Fixture Model",
+    );
+    await composer.getByRole("group", { name: "交互模式" })
+      .getByRole("button", { name: "规划" }).click();
+    await composer.locator(".composer-input").fill("创建一个会触发重新规划的单步骤计划");
+    await composer.getByRole("button", { name: "发送" }).click();
+
+    const panel = window.getByTestId("plan-panel");
+    await expect(panel).toBeVisible();
+    await expect(panel.getByRole("button", { name: "批准并执行" }))
+      .toBeEnabled({ timeout: 15_000 });
+    await panel.getByRole("button", { name: "批准并执行" }).click();
+
+    await expect(panel).toContainText("计划 v2", { timeout: 15_000 });
+    expect(modelServer.userPrompts.some((prompt) =>
+      prompt.includes("Fixture assumption changed")
+      && prompt.includes("fixture-evidence")
+      && prompt.includes("inspect"))).toBe(true);
+    await expect(panel.getByRole("button", { name: "批准并执行" }))
+      .toBeEnabled({ timeout: 15_000 });
+
+    await panel.getByRole("button", { name: "批准并执行" }).click();
+    await expect(panel).toContainText("已完成", { timeout: 15_000 });
+    expect(await gitWorkspaceSnapshot(workspace)).toEqual(beforeStatus);
+  } finally {
+    await electronApp.close();
+    await modelServer.close();
+    await rm(temporaryHome, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+// Playwright requires an object-destructured fixtures parameter.
+// eslint-disable-next-line no-empty-pattern
+test("resumes real background approval and user-input tasks", async ({}) => {
+  const temporaryHome = await mkdtemp(resolve(tmpdir(), "deki-electron-waiting-flow-"));
+  const workspace = await mkdtemp(resolve(tmpdir(), "deki-electron-waiting-workspace-"));
+  const modelServer = await startFixtureModelServer();
+  await seedChineseSettings(temporaryHome);
+  await seedFixtureModel(temporaryHome, modelServer.baseUrl);
+  await writeFile(join(workspace, "approval-target.txt"), "delete after approval\n");
+  const electronApp = await electron.launch({
+    executablePath: electronPath,
+    args: createElectronArguments(temporaryHome, "--workspace", workspace),
+    env: createTestEnvironment(temporaryHome),
+  });
+
+  try {
+    const window = await electronApp.firstWindow();
+    await window.getByRole("button", { name: /信任并继续|Trust and continue/ }).click();
+    const composer = window.locator(".composer-card");
+    await composer.locator(".composer-input").fill("测试后台审批");
+    await composer.getByRole("button", { name: "后台运行" }).click();
+    await window.getByTestId("open-task-center").click();
+    const approvalRow = window.locator(".task-row").filter({ hasText: "测试后台审批" });
+    await expect(approvalRow).toContainText("等待审批", { timeout: 15_000 });
+    await approvalRow.click();
+    const approvalResult = await window.evaluate(async () => {
+      const api = (globalThis as unknown as { deki: DekiDesktopApi }).deki;
+      const summary = (await api.listTasks({ query: "测试后台审批", limit: 10 }))[0];
+      const detail = summary ? await api.getTask(summary.task.id) : null;
+      const request = detail?.requests.find((candidate) =>
+        candidate.kind === "approval" && candidate.status === "pending");
+      return request
+        ? api.respondToApproval(request.id, "allow_once", detail!.task.id)
+        : { ok: false, error: "missing approval request" };
+    });
+    expect(approvalResult).toEqual({ ok: true });
+    await expect(window.locator(".task-status-pill")).toHaveText("已完成", {
+      timeout: 15_000,
+    });
+    await expect(readFile(join(workspace, "approval-target.txt"), "utf8")).rejects.toThrow();
+
+    const submission = await window.evaluate(
+      () => (globalThis as unknown as { deki: DekiDesktopApi }).deki.sendPrompt(
+        "测试后台输入",
+        { mode: "background", interactionMode: "act" },
+      ),
+    );
+    expect(submission.ok).toBe(true);
+    const inputRow = window.locator(".task-row").filter({ hasText: "测试后台输入" });
+    await expect(inputRow).toContainText("等待输入", { timeout: 15_000 });
+    await inputRow.click();
+    await window.getByPlaceholder("输入回答").fill("fixture-answer");
+    await window.getByRole("button", { name: "提交回答" }).click();
+    await expect(window.locator(".task-status-pill")).toHaveText("已完成", {
+      timeout: 15_000,
+    });
+    expect(modelServer.userPrompts.some((prompt) =>
+      prompt.includes("测试后台输入"))).toBe(true);
+  } finally {
+    await electronApp.close();
+    await modelServer.close();
+    await rm(temporaryHome, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
   }
 });
 
@@ -733,6 +865,265 @@ async function seedComposerModels(temporaryHome: string) {
       },
     },
   }));
+}
+
+async function seedFixtureModel(temporaryHome: string, baseUrl: string) {
+  await writeFile(join(temporaryHome, ".deki", "models.json"), JSON.stringify({
+    providers: {
+      fixture: {
+        name: "Fixture Provider",
+        baseUrl,
+        api: "openai-completions",
+        apiKey: "fixture-key",
+        models: [{
+          id: "fixture-model",
+          name: "Fixture Model",
+          reasoning: false,
+          contextWindow: 32_000,
+          maxTokens: 4_096,
+        }],
+      },
+    },
+  }));
+}
+
+async function startFixtureModelServer(): Promise<{
+  baseUrl: string;
+  userPrompts: string[];
+  close(): Promise<void>;
+}> {
+  const userPrompts: string[] = [];
+  let callSequence = 0;
+  const server: Server = createServer(async (request, response) => {
+    if (request.method === "GET" && request.url?.endsWith("/models")) {
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify({
+        object: "list",
+        data: [{ id: "fixture-model", object: "model", owned_by: "fixture" }],
+      }));
+      return;
+    }
+    if (request.method !== "POST" || !request.url?.endsWith("/chat/completions")) {
+      response.statusCode = 404;
+      response.end("not found");
+      return;
+    }
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(Buffer.from(chunk));
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
+      model?: string;
+      messages?: Array<Record<string, unknown>>;
+    };
+    const messages = body.messages ?? [];
+    const lastUserIndex = messages.findLastIndex((message) => message.role === "user");
+    const currentTurn = messages.slice(Math.max(0, lastUserIndex));
+    const userPrompt = messageText(messages[lastUserIndex]);
+    if (userPrompt) userPrompts.push(userPrompt);
+    const calledTools = currentTurn.flatMap((message) => {
+      if (message.role !== "assistant" || !Array.isArray(message.tool_calls)) return [];
+      return message.tool_calls.flatMap((call) => {
+        if (!isRecord(call) || !isRecord(call.function)) return [];
+        return typeof call.function.name === "string" ? [call.function.name] : [];
+      });
+    });
+    const completion = fixtureCompletion(userPrompt, calledTools);
+    response.writeHead(200, {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+    });
+    const id = `fixture-${Date.now()}-${callSequence += 1}`;
+    const created = Math.floor(Date.now() / 1000);
+    const writeChunk = (delta: Record<string, unknown>, finishReason: string | null) => {
+      response.write(`data: ${JSON.stringify({
+        id,
+        object: "chat.completion.chunk",
+        created,
+        model: body.model ?? "fixture-model",
+        choices: [{ index: 0, delta, finish_reason: finishReason }],
+      })}\n\n`);
+    };
+    if (completion.tool) {
+      writeChunk({
+        role: "assistant",
+        tool_calls: [{
+          index: 0,
+          id: `call-${callSequence}`,
+          type: "function",
+          function: {
+            name: completion.tool.name,
+            arguments: JSON.stringify(completion.tool.arguments),
+          },
+        }],
+      }, null);
+      writeChunk({}, "tool_calls");
+    } else {
+      writeChunk({ role: "assistant", content: completion.text }, null);
+      writeChunk({}, "stop");
+    }
+    response.end("data: [DONE]\n\n");
+  });
+  await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+  const address = server.address() as AddressInfo;
+  return {
+    baseUrl: `http://127.0.0.1:${address.port}/v1`,
+    userPrompts,
+    close: () => new Promise<void>((resolveClose, reject) => {
+      server.close((error) => error ? reject(error) : resolveClose());
+    }),
+  };
+}
+
+function fixtureCompletion(
+  prompt: string,
+  calledTools: string[],
+): {
+  text: string;
+  tool?: { name: string; arguments: Record<string, unknown> };
+} {
+  if (prompt.includes("测试后台审批")) {
+    if (calledTools.includes("workspace__delete")) return { text: "Approval completed." };
+    return {
+      text: "",
+      tool: {
+        name: "workspace__delete",
+        arguments: { path: "approval-target.txt" },
+      },
+    };
+  }
+  if (prompt.includes("测试后台输入")) {
+    if (calledTools.includes("interaction__request_user_input")) {
+      return { text: "User input completed." };
+    }
+    return {
+      text: "",
+      tool: {
+        name: "interaction__request_user_input",
+        arguments: {
+          question: "请输入测试回答",
+          description: "Fixture user input",
+          options: ["fixture-answer"],
+        },
+      },
+    };
+  }
+  if (prompt.includes("plan__revise")) {
+    if (calledTools.includes("plan__revise")) return { text: "Plan revision ready." };
+    const planId = prompt.match(/planId=([0-9a-f-]{36})/i)?.[1] ?? "";
+    const basedOnRevision = Number(prompt.match(/basedOnRevision=(\d+)/)?.[1] ?? "1");
+    return {
+      text: "",
+      tool: {
+        name: "plan__revise",
+        arguments: {
+          planId,
+          basedOnRevision,
+          feedback: "Fixture assumption changed",
+          goal: "创建一个会触发重新规划的单步骤计划",
+          assumptions: ["Fixture assumption changed"],
+          constraints: ["Plan mode remains read-only"],
+          steps: [fixturePlanStep()],
+        },
+      },
+    };
+  }
+  if (prompt.includes("plan__submit")) {
+    if (calledTools.includes("plan__submit")) return { text: "Plan ready for review." };
+    return {
+      text: "",
+      tool: {
+        name: "plan__submit",
+        arguments: {
+          goal: "创建一个会触发重新规划的单步骤计划",
+          assumptions: ["Initial fixture assumption"],
+          constraints: ["Plan mode remains read-only"],
+          steps: [fixturePlanStep()],
+        },
+      },
+    };
+  }
+  if (prompt.includes("执行下面已由用户批准的计划")) {
+    const planId = prompt.match(/planId=([0-9a-f-]{36})/i)?.[1] ?? "";
+    const revision = Number(prompt.match(/revision=(\d+)/)?.[1] ?? "1");
+    const updateCount = calledTools.filter((name) => name === "plan__update_step").length;
+    if (updateCount === 0) {
+      return {
+        text: "",
+        tool: {
+          name: "plan__update_step",
+          arguments: { planId, revision, stepId: "inspect", status: "running" },
+        },
+      };
+    }
+    if (revision === 1 && !calledTools.includes("plan__request_replan")) {
+      return {
+        text: "",
+        tool: {
+          name: "plan__request_replan",
+          arguments: {
+            planId,
+            reason: "Fixture assumption changed",
+            affectedStepIds: ["inspect"],
+            evidence: ["fixture-evidence"],
+          },
+        },
+      };
+    }
+    if (revision > 1 && updateCount === 1) {
+      return {
+        text: "",
+        tool: {
+          name: "plan__update_step",
+          arguments: {
+            planId,
+            revision,
+            stepId: "inspect",
+            status: "completed",
+            summary: "Fixture completed",
+            evidence: ["fixture-result"],
+          },
+        },
+      };
+    }
+    return { text: "Plan execution completed." };
+  }
+  return { text: "Fixture response." };
+}
+
+function fixturePlanStep() {
+  return {
+    id: "inspect",
+    title: "Inspect fixture",
+    description: "Inspect the fixture without changing files.",
+    dependencies: [],
+    candidateFiles: ["README.md"],
+    validation: ["Workspace remains unchanged"],
+    risk: "low",
+    parallelizable: false,
+  };
+}
+
+function messageText(message: Record<string, unknown> | undefined): string {
+  if (!message) return "";
+  if (typeof message.content === "string") return message.content;
+  if (!Array.isArray(message.content)) return "";
+  return message.content.flatMap((item) =>
+    isRecord(item) && item.type === "text" && typeof item.text === "string"
+      ? [item.text]
+      : []).join("\n");
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+async function gitWorkspaceSnapshot(workspace: string) {
+  const [status, diff, staged] = await Promise.all([
+    execFileAsync("git", ["status", "--porcelain"], { cwd: workspace }),
+    execFileAsync("git", ["diff", "--no-ext-diff"], { cwd: workspace }),
+    execFileAsync("git", ["diff", "--cached", "--no-ext-diff"], { cwd: workspace }),
+  ]);
+  return { status: status.stdout, diff: diff.stdout, staged: staged.stdout };
 }
 
 async function seedTaskPlanFixture(temporaryHome: string) {

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type {
@@ -29,6 +29,7 @@ const statusCopy: Record<TaskStatus, { zh: string; en: string }> = {
 
 export function TaskCenter(props: TaskCenterProps) {
   const [tasks, setTasks] = useState<TaskSummary[]>([]);
+  const [workspaceTasks, setWorkspaceTasks] = useState<TaskSummary[]>([]);
   const [selectedId, setSelectedId] = useState(props.initialTaskId);
   const [detail, setDetail] = useState<TaskDetail | null>(null);
   const [query, setQuery] = useState("");
@@ -37,24 +38,36 @@ export function TaskCenter(props: TaskCenterProps) {
   const [error, setError] = useState<string>();
   const [inputValues, setInputValues] = useState<Record<string, string>>({});
   const [previewArtifact, setPreviewArtifact] = useState<ArtifactRecord>();
+  const taskRefreshSequence = useRef(0);
+  const detailRefreshSequence = useRef(0);
 
   async function refreshTasks() {
-    const rows = await window.deki.listTasks({
-      ...(query.trim() ? { query: query.trim() } : {}),
-      ...(workspaceId ? { workspaceIds: [workspaceId] } : {}),
-      ...(status ? { statuses: [status] } : {}),
-      limit: 500,
-    });
+    const sequence = taskRefreshSequence.current + 1;
+    taskRefreshSequence.current = sequence;
+    const [rows, allRows] = await Promise.all([
+      window.deki.listTasks({
+        ...(query.trim() ? { query: query.trim() } : {}),
+        ...(workspaceId ? { workspaceIds: [workspaceId] } : {}),
+        ...(status ? { statuses: [status] } : {}),
+        limit: 500,
+      }),
+      window.deki.listTasks({ limit: 500 }),
+    ]);
+    if (taskRefreshSequence.current !== sequence) return;
     setTasks(rows);
+    setWorkspaceTasks(allRows);
     setSelectedId((current) => current ?? rows[0]?.task.id);
   }
 
   async function refreshDetail(id = selectedId) {
+    const sequence = detailRefreshSequence.current + 1;
+    detailRefreshSequence.current = sequence;
     if (!id) {
       setDetail(null);
       return;
     }
-    setDetail(await window.deki.getTask(id));
+    const next = await window.deki.getTask(id);
+    if (detailRefreshSequence.current === sequence) setDetail(next);
   }
 
   useEffect(() => {
@@ -79,14 +92,14 @@ export function TaskCenter(props: TaskCenterProps) {
 
   const workspaces = useMemo(() => {
     const entries = new Map<string, string>();
-    for (const summary of tasks) {
+    for (const summary of workspaceTasks) {
       entries.set(
         summary.task.workspaceId,
         workspaceName(summary.task.workspacePath, props.zh),
       );
     }
     return [...entries.entries()];
-  }, [tasks, props.zh]);
+  }, [workspaceTasks, props.zh]);
 
   const grouped = useMemo(() => {
     const attention = tasks.filter((item) =>

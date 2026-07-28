@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -18,6 +18,45 @@ afterEach(async () => {
 });
 
 describe("TaskStore", () => {
+  it.each([1, 2, 3, 4])(
+    "opens and migrates the real v%s database fixture repeatedly",
+    async (version) => {
+      const databasePath = await createDatabasePath();
+      await copyFile(
+        join(
+          process.cwd(),
+          "packages",
+          "task-orchestrator",
+          "test",
+          "fixtures",
+          `tasks-v${version}.db`,
+        ),
+        databasePath,
+      );
+      const migrated = new TaskStore(databasePath);
+      expect(migrated.getTask("00000000-0000-4000-8000-000000000101"))
+        .toMatchObject({ status: "succeeded", title: `fixture v${version}` });
+      expect(migrated.getDeliveryMode("00000000-0000-4000-8000-000000000101"))
+        .toBe("background");
+      if (version >= 2) {
+        expect(migrated.getTaskDetail("00000000-0000-4000-8000-000000000101")
+          ?.requests).toHaveLength(1);
+      }
+      if (version >= 3) {
+        expect(migrated.getPlan("00000000-0000-4000-8000-000000000103"))
+          .toMatchObject({
+            plan: { status: "ready", currentRevision: 1 },
+            planningTask: { status: "succeeded" },
+          });
+      }
+      migrated.close();
+      const reopened = new TaskStore(databasePath);
+      expect(reopened.getTask("00000000-0000-4000-8000-000000000101"))
+        .toBeTruthy();
+      reopened.close();
+    },
+  );
+
   it("migrates a v3 database to v4 idempotently", async () => {
     const databasePath = await createDatabasePath();
     const legacy = new DatabaseSync(databasePath);
@@ -239,9 +278,22 @@ describe("TaskStore", () => {
     expect(plan.status).toBe("ready");
     expect(store.getPlan(plan.id)?.events.map((event) => event.sequence)).toEqual([1, 2]);
 
-    store.requestPlanRevision(plan.id, "补充回归测试");
+    succeedPlanningTask(store, planningTask.id);
+    const revisionTask = store.createPlanRevisionTask(plan.id, {
+      feedback: "补充回归测试",
+      affectedStepIds: [],
+      title: "修订计划",
+      execution: { ...promptExecution(true), interactionMode: "plan", planId: plan.id },
+    });
+    expect(store.getLatestPlanningTask(plan.id)?.id).toBe(revisionTask.id);
+    expect(() => store.createPlanRevisionTask(plan.id, {
+      feedback: "重复修订",
+      affectedStepIds: [],
+      title: "重复修订",
+      execution: { ...promptExecution(true), interactionMode: "plan", planId: plan.id },
+    })).toThrow("已有正在进行的修订任务");
     store.revisePlan(plan.id, {
-      planningTaskId: planningTask.id,
+      planningTaskId: revisionTask.id,
       feedback: "补充回归测试",
       assumptions: ["现有测试可运行"],
       constraints: ["保持兼容"],
@@ -263,6 +315,7 @@ describe("TaskStore", () => {
     expect(revised.revisions).toHaveLength(2);
     expect(revised.revisions[0]?.steps).toHaveLength(2);
     expect(revised.revisions[1]?.steps).toHaveLength(3);
+    succeedPlanningTask(store, revisionTask.id);
 
     const executionTask = store.approvePlan(plan.id, 2, {
       title: "执行计划",
@@ -300,6 +353,48 @@ describe("TaskStore", () => {
     }
     store.finishRun(executionTask.id, run.id, "succeeded");
     expect(store.getPlan(plan.id)?.plan.status).toBe("completed");
+    store.close();
+  });
+
+  it("requires the current Planning Task to succeed before approval", async () => {
+    const store = await createStore();
+    const planning = store.createTask({
+      workspaceId: "workspace-a",
+      kind: "planning",
+      title: "plan",
+      goal: "plan",
+      execution: { ...promptExecution(), interactionMode: "plan" },
+    });
+    const plan = store.createPlan({
+      workspaceId: "workspace-a",
+      sessionId: "session-plan",
+      planningTaskId: planning.id,
+      goal: "plan",
+      assumptions: [],
+      constraints: [],
+      steps: planSteps(),
+    });
+    expect(store.getPlan(plan.id)?.planningTask?.status).toBe("queued");
+    expect(() => store.approvePlan(plan.id, 1, {
+      title: "execute",
+      execution: {
+        ...promptExecution(true),
+        interactionMode: "plan-execution",
+        planId: plan.id,
+        planRevision: 1,
+      },
+    })).toThrow("规划任务尚未成功完成");
+    succeedPlanningTask(store, planning.id);
+    expect(store.getPlan(plan.id)?.planningTask?.status).toBe("succeeded");
+    expect(store.approvePlan(plan.id, 1, {
+      title: "execute",
+      execution: {
+        ...promptExecution(true),
+        interactionMode: "plan-execution",
+        planId: plan.id,
+        planRevision: 1,
+      },
+    }).kind).toBe("plan-execution");
     store.close();
   });
 
@@ -342,7 +437,7 @@ describe("TaskStore", () => {
       constraints: [],
       steps: planSteps(),
     });
-    store.cancelInactiveTask(planning.id);
+    succeedPlanningTask(store, planning.id);
     const execution = store.approvePlan(plan.id, 1, {
       title: "execute",
       execution: {
@@ -928,7 +1023,7 @@ describe("TaskOrchestrator", () => {
       constraints: [],
       steps: planSteps(),
     });
-    store.cancelInactiveTask(planning.id);
+    succeedPlanningTask(store, planning.id);
     const execution = store.approvePlan(plan.id, 1, {
       title: "execute",
       execution: {
@@ -1015,6 +1110,80 @@ describe("TaskOrchestrator", () => {
     await orchestrator.dispose();
   });
 
+  it("atomically pauses an active execution when the user requests a revision", async () => {
+    const store = await createStore();
+    const sourceDirectory = await mkdtemp(join(tmpdir(), "deki-active-revision-"));
+    temporaryDirectories.push(sourceDirectory);
+    const sourceSessionFile = join(sourceDirectory, "session.jsonl");
+    await writeFile(sourceSessionFile, "{}\n");
+    const checkpoint = { ...promptExecution(), sourceSessionFile };
+    const planning = store.createTask({
+      workspaceId: "workspace-a",
+      kind: "planning",
+      title: "plan",
+      goal: "plan",
+      execution: { ...checkpoint, interactionMode: "plan" },
+    });
+    const plan = store.createPlan({
+      workspaceId: "workspace-a",
+      sessionId: "session-plan",
+      planningTaskId: planning.id,
+      goal: "plan",
+      assumptions: [],
+      constraints: [],
+      steps: planSteps(),
+    });
+    succeedPlanningTask(store, planning.id);
+    const execution = store.approvePlan(plan.id, 1, {
+      title: "execute",
+      execution: {
+        ...checkpoint,
+        interactionMode: "plan-execution",
+        planId: plan.id,
+        planRevision: 1,
+      },
+    });
+    const handle = deferredHandle("session-execution");
+    const orchestrator = new TaskOrchestrator({
+      store,
+      concurrency: 1,
+      executor: async () => handle,
+    });
+    orchestrator.start();
+    await settle();
+    const runId = store.getTask(execution.id)!.currentRunId!;
+    store.updatePlanStep(plan.id, {
+      revision: 1,
+      stepId: "inspect",
+      status: "running",
+      taskId: execution.id,
+      runId,
+    });
+    const request = orchestrator.requestPlanRevision(plan.id, {
+      feedback: "用户要求修改",
+      affectedStepIds: ["inspect"],
+      evidence: ["验收条件变化"],
+      title: "revise",
+      execution: {
+        ...checkpoint,
+        interactionMode: "plan",
+        planId: plan.id,
+        planRevision: 1,
+      },
+    });
+    handle.reject(abortError());
+    const revisionTask = await request.planningTask;
+    await settle();
+    expect(store.getTask(execution.id)?.status).toBe("paused");
+    expect(store.getPlan(plan.id)?.plan).toMatchObject({
+      status: "draft",
+      replanReason: "用户要求修改",
+      replanEvidence: ["验收条件变化"],
+    });
+    expect(revisionTask).toMatchObject({ kind: "planning", status: "queued" });
+    await orchestrator.dispose();
+  });
+
   it("does not start or resume an execution task while its Plan is draft", async () => {
     const store = await createStore();
     const planning = store.createTask({
@@ -1033,7 +1202,7 @@ describe("TaskOrchestrator", () => {
       constraints: [],
       steps: planSteps(),
     });
-    store.cancelInactiveTask(planning.id);
+    succeedPlanningTask(store, planning.id);
     const execution = store.approvePlan(plan.id, 1, {
       title: "execute",
       execution: {
@@ -1043,8 +1212,21 @@ describe("TaskOrchestrator", () => {
         planRevision: 1,
       },
     });
-    store.requestPlanRevision(plan.id, "change it");
-    const executor = vi.fn(async () => deferredHandle("should-not-start"));
+    store.createPlanRevisionTask(plan.id, {
+      feedback: "change it",
+      affectedStepIds: [],
+      title: "revise",
+      execution: { ...promptExecution(true), interactionMode: "plan", planId: plan.id },
+    });
+    const startedKinds: string[] = [];
+    const executor = vi.fn(async (input: { task: { kind: string } }) => {
+      startedKinds.push(input.task.kind);
+      return {
+      sessionId: "revision-session",
+      completion: Promise.resolve(),
+      cancel: vi.fn(async () => undefined),
+      };
+    });
     const orchestrator = new TaskOrchestrator({
       store,
       concurrency: 1,
@@ -1053,11 +1235,11 @@ describe("TaskOrchestrator", () => {
     orchestrator.start();
     await settle();
 
-    expect(executor).not.toHaveBeenCalled();
-    expect(store.getTask(execution.id)?.status).toBe("queued");
+    expect(executor).toHaveBeenCalledOnce();
+    expect(startedKinds).toEqual(["planning"]);
+    expect(store.getTask(execution.id)?.status).toBe("paused");
     expect(() => store.createRun(execution.id))
-      .toThrow("计划必须完成修订并重新批准后才能恢复执行");
-    store.pauseQueuedTask(execution.id);
+      .toThrow("当前状态为 paused");
     expect(() => orchestrator.resumeTask(execution.id))
       .toThrow("计划必须完成修订并重新批准后才能恢复执行");
     await orchestrator.dispose();
@@ -1086,7 +1268,7 @@ describe("TaskOrchestrator", () => {
       constraints: [],
       steps: planSteps(),
     });
-    store.cancelInactiveTask(planning.id);
+    succeedPlanningTask(store, planning.id);
     const execution = store.approvePlan(plan.id, 1, {
       title: "execute",
       execution: {
@@ -1153,6 +1335,12 @@ function promptExecution(preferFork = false) {
     sourceEntryId: "entry-1",
     preferFork,
   };
+}
+
+function succeedPlanningTask(store: TaskStore, taskId: string): void {
+  const run = store.createRun(taskId);
+  store.bindRun(taskId, run.id, { sessionId: "planning-session" });
+  store.finishRun(taskId, run.id, "succeeded");
 }
 
 function planSteps() {

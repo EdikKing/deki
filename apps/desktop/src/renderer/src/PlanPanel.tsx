@@ -24,6 +24,12 @@ export function PlanPanel(props: PlanPanelProps) {
   const revision = detail.revisions.find(
     (candidate) => candidate.revision === detail.plan.currentRevision,
   );
+  const planningComplete = detail.planningTask?.status === "succeeded";
+  const planningBusy = detail.planningTask
+    ? ["queued", "running", "waiting_approval", "waiting_user", "paused"].includes(
+        detail.planningTask.status,
+      )
+    : false;
   const states = useMemo(() => new Map(
     detail.stepStates
       .filter((state) => state.revision === detail.plan.currentRevision)
@@ -142,13 +148,17 @@ export function PlanPanel(props: PlanPanelProps) {
           <>
             <button
               className="primary"
-              disabled={busy}
+              disabled={busy || !planningComplete}
               onClick={() => void run(window.deki.approvePlan(
                 detail.plan.id,
                 detail.plan.currentRevision,
               ))}
-            >{zh ? "批准并执行" : "Approve & run"}</button>
-            <button disabled={busy} onClick={requestRevision}>
+            >
+              {!planningComplete
+                ? zh ? "正在完成规划" : "Finishing plan"
+                : zh ? "批准并执行" : "Approve & run"}
+            </button>
+            <button disabled={busy || planningBusy} onClick={requestRevision}>
               {zh ? "要求修改" : "Request changes"}
             </button>
           </>

@@ -181,17 +181,41 @@ export function App() {
   useEffect(() => {
     const refreshAttention = async () => {
       const rows = await window.deki.listTasks({
-        statuses: ["waiting_approval", "waiting_user", "queued"],
+        statuses: [
+          "waiting_approval",
+          "waiting_user",
+          "queued",
+          "paused",
+          "interrupted",
+        ],
         limit: 500,
       });
       setTaskAttentionCount(rows.filter((item) =>
-        item.task.status !== "queued" || !item.runnable).length);
+        item.task.status === "waiting_approval"
+        || item.task.status === "waiting_user"
+        || !item.runnable
+      ).length);
     };
     void refreshAttention();
-    const unsubscribeTasks = window.deki.subscribeTaskEvents(() => {
+    const unsubscribeTasks = window.deki.subscribeTaskEvents((event) => {
       void refreshAttention();
       void refreshLinkedTask();
       void refresh();
+      if (
+        event.taskId === activePlan?.plan.planningTaskId
+        || event.taskId === activePlan?.plan.executionTaskId
+        || (
+          activePlan
+          && [
+            "task.succeeded",
+            "task.failed",
+            "task.cancelled",
+            "task.interrupted",
+          ].includes(event.type)
+        )
+      ) {
+        void refreshPlan(activePlan.plan.id);
+      }
     });
     const unsubscribeOpenTask = window.deki.subscribeOpenTask((taskId) => {
       setSelectedTaskId(taskId);

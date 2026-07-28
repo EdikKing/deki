@@ -601,6 +601,7 @@ export const planDetailSchema = z.object({
   revisions: z.array(planRevisionRecordSchema),
   stepStates: z.array(planStepStateSchema),
   events: z.array(planEventSchema),
+  planningTask: taskRecordSchema.optional(),
   executionTask: taskRecordSchema.optional(),
 }).strict();
 export type PlanDetail = z.infer<typeof planDetailSchema>;

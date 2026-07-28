@@ -427,6 +427,9 @@ class DesktopController {
       if (!detail || detail.plan.workspaceId !== this.#scopeId) {
         return { ok: false, error: "未找到当前项目的计划" };
       }
+      if (detail.planningTask?.status !== "succeeded") {
+        return { ok: false, error: "规划任务尚未成功完成，不能批准计划" };
+      }
       const context = await this.#resolvePlanCheckpoint(detail, true);
       taskStore!.approvePlan(planId, revision, {
         title: `执行计划：${createTaskTitle(detail.plan.goal)}`,
@@ -465,32 +468,21 @@ class DesktopController {
       if (!detail || detail.plan.workspaceId !== this.#scopeId) {
         return { ok: false, error: "未找到当前项目的计划" };
       }
-      if (
-        detail.plan.status === "executing"
-        && detail.plan.executionTaskId
-      ) {
-        const activeStepIds = detail.stepStates.filter(
-          (state) => state.revision === detail.plan.currentRevision
-            && (state.status === "running" || state.status === "blocked"),
-        ).map((state) => state.stepId);
-        return await this.requestPlanReplan(planId, feedback, activeStepIds);
-      }
-      const context = await this.#resolvePlanCheckpoint(detail, mode === "background");
-      if (detail.executionTask?.status === "queued") {
-        const paused = await this.#tasks.pauseTask(detail.executionTask.id);
-        if (!paused) return { ok: false, error: "旧计划执行任务无法暂停" };
-        if (taskStore?.getTask(detail.executionTask.id)?.status !== "paused") {
-          return { ok: false, error: "旧计划执行任务正在暂停，请稍后重试修订" };
-        }
-      }
-      taskStore!.requestPlanRevision(planId, feedback, affectedStepIds);
-      const task = this.#tasks.submitPrompt({
-        workspaceId: this.#scopeId,
-        ...(this.#workspace ? { workspacePath: this.#workspace } : {}),
+      const activeExecution = detail.executionTask
+        && ["running", "waiting_approval", "waiting_user"].includes(
+          detail.executionTask.status,
+        );
+      const context = activeExecution
+        ? taskStore!.getExecution(detail.executionTask!.id)
+        : await this.#resolvePlanCheckpoint(detail, mode === "background");
+      const activeStepIds = detail.stepStates.filter(
+        (state) => state.revision === detail.plan.currentRevision
+          && (state.status === "running" || state.status === "blocked"),
+      ).map((state) => state.stepId);
+      const request = this.#tasks.requestPlanRevision(planId, {
+        feedback,
+        affectedStepIds: affectedStepIds.length > 0 ? affectedStepIds : activeStepIds,
         title: `修订计划：${createTaskTitle(detail.plan.goal)}`,
-        prompt: detail.plan.goal,
-        kind: "planning",
-        planId,
         execution: {
           type: "agent-prompt",
           sourceSessionId: context.sourceSessionId,
@@ -505,7 +497,7 @@ class DesktopController {
           deliveryMode: mode,
         },
       });
-      return { ok: true, task };
+      return { ok: true, task: await request.planningTask };
     } catch (error) {
       return { ok: false, error: formatError(error) };
     }
@@ -548,19 +540,19 @@ class DesktopController {
     preferFork: boolean,
   ): Promise<PromptExecutionInput> {
     const taskIds = [
-      detail.plan.planningTaskId,
+      taskStore?.getLatestPlanningTask(detail.plan.id)?.id,
       detail.plan.executionTaskId,
     ].filter((id): id is string => Boolean(id));
     for (const taskId of taskIds) {
       const execution = taskStore?.getExecution(taskId);
       if (!execution) continue;
-      if (!execution.sourceSessionFile) {
+      if (!execution.sourceSessionFile || !execution.sourceEntryId) {
         throw new Error("计划最新 checkpoint 尚未持久化，不能从旧上下文继续");
       }
       const context = {
         sourceSessionId: execution.sourceSessionId,
         sourceSessionFile: execution.sourceSessionFile,
-        ...(execution.sourceEntryId ? { sourceEntryId: execution.sourceEntryId } : {}),
+        sourceEntryId: execution.sourceEntryId,
         preferFork,
       };
       await this.#runtime!.validatePromptContext(context);
@@ -2732,7 +2724,7 @@ function maybeNotifyPlanEvent(event: PlanEvent): void {
   if (
     quitting
     || !Notification.isSupported()
-    || !["plan.submitted", "plan.completed", "plan.replan_requested"].includes(event.type)
+    || !["plan.completed", "plan.replan_requested"].includes(event.type)
   ) return;
   const plan = taskStore?.getPlan(event.planId)?.plan;
   if (!plan) return;
@@ -2741,13 +2733,8 @@ function maybeNotifyPlanEvent(event: PlanEvent): void {
     : plan.executionTaskId
       ? taskStore?.getDeliveryMode(plan.executionTaskId)
       : "foreground";
-  if (
-    (event.type === "plan.submitted" || event.type === "plan.completed")
-    && deliveryMode !== "background"
-  ) return;
-  const body = event.type === "plan.submitted"
-    ? "计划已生成，等待审阅"
-    : event.type === "plan.completed"
+  if (event.type === "plan.completed" && deliveryMode !== "background") return;
+  const body = event.type === "plan.completed"
       ? "计划执行完成"
       : "计划需要重新规划";
   const notification = new Notification({
@@ -2770,6 +2757,26 @@ function maybeNotifyTaskEvent(event: TaskEvent): void {
   if (!detail || !Notification.isSupported()) return;
   const task = detail.task;
   const deliveryMode = taskStore?.getDeliveryMode(task.id) ?? "foreground";
+  if (
+    event.type === "task.succeeded"
+    && task.kind === "planning"
+    && task.planId
+    && deliveryMode === "background"
+  ) {
+    const notification = new Notification({
+      title: task.title,
+      body: "计划已生成，等待审阅",
+    });
+    notification.on("click", () => {
+      let window = BrowserWindow.getAllWindows()[0];
+      if (!window || window.isDestroyed()) window = createWindow();
+      window.show();
+      window.focus();
+      window.webContents.send(IPC_CHANNELS.openPlan, task.planId);
+    });
+    notification.show();
+    return;
+  }
   const activeState = controller?.getState();
   const isActiveSession = controller?.scopeId === task.workspaceId
     && activeState?.sessionId === task.sessionId;
@@ -2825,14 +2832,22 @@ function renderPlanningPrompt(
     const revision = detail?.revisions.find(
       (candidate) => candidate.revision === detail.plan.currentRevision,
     );
-    const feedback = [...(detail?.events ?? [])].reverse().find(
+    const eventFeedback = [...(detail?.events ?? [])].reverse().find(
       (event) => event.type === "plan.replan_requested",
     )?.payload.feedback;
+    const feedback = detail?.plan.replanReason
+      ?? (typeof eventFeedback === "string" ? eventFeedback : undefined);
     return [
       "你处于 Plan 模式。只允许读取和分析，不得修改文件或执行有副作用的工具。",
       "检查项目实际状态后，基于当前计划和反馈生成完整的新版本。",
       `必须调用 plan__revise，planId=${planId}，basedOnRevision=${detail?.plan.currentRevision ?? 1}。`,
-      typeof feedback === "string" ? `用户反馈：${feedback}` : "",
+      typeof feedback === "string" ? `用户反馈或重新规划原因：${feedback}` : "",
+      detail?.plan.affectedStepIds.length
+        ? `受影响步骤：${detail.plan.affectedStepIds.join(", ")}`
+        : "",
+      detail?.plan.replanEvidence.length
+        ? `重新规划证据：${JSON.stringify(detail.plan.replanEvidence)}`
+        : "",
       revision ? `当前版本：${JSON.stringify(revision)}` : "",
       `目标：${goal}`,
     ].filter(Boolean).join("\n\n");

@@ -1,3 +1,4 @@
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { access, readFile, readdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -266,6 +267,7 @@ export class DekiAgentRuntime {
             : event);
         },
         taskId: () => this.#executionContext.getStore()?.taskId,
+        runId: () => this.#executionContext.getStore()?.runId,
         ...(this.#options.acquireResumeLease
           ? { acquireResumeLease: this.#options.acquireResumeLease }
           : {}),
@@ -468,8 +470,29 @@ export class DekiAgentRuntime {
     if (!session) {
       throw new Error("Agent 尚未就绪，请先配置云模型环境变量");
     }
-    const sourceSessionFile = session.sessionFile;
+    let sourceSessionFile = session.sessionFile;
     const sourceEntryId = session.sessionManager.getLeafId() ?? undefined;
+    if (preferFork && (!sourceSessionFile || !existsSync(sourceSessionFile))) {
+      const header = session.sessionManager.getHeader();
+      if (!header) throw new Error("当前会话缺少持久化头信息");
+      const checkpointDirectory = join(
+        this.#options.paths.sessionsRoot,
+        this.#options.scopeId,
+        "checkpoints",
+      );
+      mkdirSync(checkpointDirectory, { recursive: true });
+      sourceSessionFile = join(
+        checkpointDirectory,
+        `${session.sessionId}-${Date.now()}-${crypto.randomUUID()}.jsonl`,
+      );
+      writeFileSync(
+        sourceSessionFile,
+        `${[header, ...session.sessionManager.getEntries()]
+          .map((entry) => JSON.stringify(entry))
+          .join("\n")}\n`,
+        { flag: "wx" },
+      );
+    }
     return {
       sourceSessionId: session.sessionId,
       ...(sourceSessionFile ? { sourceSessionFile } : {}),
@@ -482,6 +505,9 @@ export class DekiAgentRuntime {
     if (!context.sourceSessionFile) {
       throw new Error("计划上下文尚未持久化，无法创建安全分支");
     }
+    if (!context.sourceEntryId) {
+      throw new Error("计划上下文缺少精确的会话位置，无法创建安全分支");
+    }
     try {
       await access(context.sourceSessionFile);
     } catch {
@@ -492,7 +518,7 @@ export class DekiAgentRuntime {
       join(this.#options.paths.sessionsRoot, this.#options.scopeId),
       this.#options.workspace,
     );
-    if (context.sourceEntryId && !manager.getEntry(context.sourceEntryId)) {
+    if (!manager.getEntry(context.sourceEntryId)) {
       throw new Error("计划上下文对应的会话位置已不存在");
     }
   }
@@ -1072,7 +1098,12 @@ export class DekiAgentRuntime {
   }): Promise<AgentPromptRunHandle> {
     const createRuntime = this.#createRuntimeFactory;
     const sourceFile = input.context.sourceSessionFile;
-    if (!createRuntime || !sourceFile) {
+    if (!createRuntime) throw new Error("Agent Runtime 尚未就绪");
+    const sessionDirectory = join(
+      this.#options.paths.sessionsRoot,
+      this.#options.scopeId,
+    );
+    if (!sourceFile) {
       throw new Error("源会话尚未持久化，不能创建并发分支");
     }
     try {
@@ -1080,10 +1111,6 @@ export class DekiAgentRuntime {
     } catch {
       throw new Error("任务恢复失败：最新会话文件已不存在");
     }
-    const sessionDirectory = join(
-      this.#options.paths.sessionsRoot,
-      this.#options.scopeId,
-    );
     const sessionManager = SessionManager.forkFrom(
       sourceFile,
       this.#options.workspace,

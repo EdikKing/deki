@@ -51,6 +51,7 @@ describe("PermissionEngine", () => {
     let requestId = "";
     let acquired = "";
     let committed = false;
+    let resolvedContext = "";
     const engine = new PermissionEngine({
       workspace: root,
       logsRoot: join(root, "logs"),
@@ -58,6 +59,7 @@ describe("PermissionEngine", () => {
       sessionId: () => "session",
       model: () => "provider/model",
       taskId: () => "task-1",
+      runId: () => "run-1",
       acquireResumeLease: async (taskId, pendingRequestId) => {
         acquired = `${taskId}:${pendingRequestId}`;
         return {
@@ -69,6 +71,9 @@ describe("PermissionEngine", () => {
       },
       emit: (event) => {
         if (event.type === "approval.requested") requestId = event.requestId;
+        if (event.type === "approval.resolved") {
+          resolvedContext = `${event.taskId}:${event.runId}`;
+        }
       },
     });
     const authorization = engine.authorize({
@@ -84,6 +89,7 @@ describe("PermissionEngine", () => {
     await authorization;
     expect(acquired).toBe(`task-1:${requestId}`);
     expect(committed).toBe(true);
+    expect(resolvedContext).toBe("task-1:run-1");
   });
 
   it("classifies privileged, git, install and safe shell commands", () => {

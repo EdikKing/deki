@@ -355,6 +355,22 @@ html[data-platform="darwin"] .sidebar-brand {
   opacity: 0.72;
 }
 
+.session-list-toggle {
+  width: 100%;
+  min-height: 32px;
+  padding: 6px 9px;
+  border-radius: 8px;
+  color: var(--text-muted);
+  background: transparent;
+  font-size: 10px;
+  text-align: left;
+}
+
+.session-list-toggle:hover {
+  color: var(--text-primary);
+  background: var(--bg-hover);
+}
+
 .icon-button {
   width: 24px;
   height: 24px;

@@ -64,6 +64,7 @@ export function App() {
   const [approval, setApproval] = useState<Extract<AgentEvent, { type: "approval.requested" }>>();
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [activeSession, setActiveSession] = useState<SessionSummary>();
+  const [showAllSessions, setShowAllSessions] = useState(false);
   const [expandedProjectKey, setExpandedProjectKey] = useState<string>(GENERAL_PROJECT_KEY);
   const [settingsSection, setSettingsSection] = useState<"models" | "permissions">();
   const [compactLayout, setCompactLayout] = useState(() => window.innerWidth <= 980);
@@ -235,6 +236,15 @@ export function App() {
       ? [state.workspace]
       : []),
   ].slice(0, 7);
+  const sortedSessions = useMemo(
+    () => [...sessions].sort(
+      (left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt),
+    ),
+    [sessions],
+  );
+  const visibleSessions = showAllSessions
+    ? sortedSessions
+    : sortedSessions.slice(0, 5);
 
   if (!state) {
     return <main className="loading">正在启动 Deki…</main>;
@@ -346,6 +356,7 @@ export function App() {
     setEvents([]);
     setSessions([]);
     setActiveSession(undefined);
+    setShowAllSessions(false);
     const result = await (workspace
       ? window.deki.openWorkspace(workspace)
       : window.deki.openGeneralChat());
@@ -458,7 +469,7 @@ export function App() {
 
                     {expanded && active && (
                       <div className="project-session-list">
-                        {sessions.map((session) => (
+                        {visibleSessions.map((session) => (
                           <div className={`session-tree-row${session.current ? " active" : ""}`} key={session.id}>
                             <button
                               className="session-tree-item"
@@ -505,7 +516,17 @@ export function App() {
                             </div>
                           </div>
                         ))}
-                        {sessions.length === 0 && (
+                        {sortedSessions.length > 5 && (
+                          <button
+                            className="session-list-toggle"
+                            onClick={() => setShowAllSessions((current) => !current)}
+                          >
+                            {showAllSessions
+                              ? (zh ? "收起" : "Show less")
+                              : (zh ? `显示更多（${sortedSessions.length - 5}）` : `Show more (${sortedSessions.length - 5})`)}
+                          </button>
+                        )}
+                        {sortedSessions.length === 0 && (
                           <button className="session-tree-item placeholder" disabled>
                             <strong>{zh ? "新会话" : "New chat"}</strong>
                             <span>{state.ready ? (zh ? "尚未保存" : "Not saved") : (zh ? "等待模型" : "Waiting for model")}</span>

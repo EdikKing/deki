@@ -432,7 +432,6 @@ export function App() {
                       >
                         <FolderIcon />
                         <strong>{node.name}</strong>
-                        <span className={`project-tree-chevron${expanded ? " expanded" : ""}`} aria-hidden="true">›</span>
                       </button>
                       <button
                         className="icon-button project-new-session"

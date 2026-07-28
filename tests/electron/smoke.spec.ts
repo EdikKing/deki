@@ -281,6 +281,101 @@ test("runs a real Plan revision and replan flow through an OpenAI-compatible fix
 
 // Playwright requires an object-destructured fixtures parameter.
 // eslint-disable-next-line no-empty-pattern
+test("runs a budgeted DAG with mandatory Reviewer and Integrator gates", async ({}) => {
+  test.setTimeout(90_000);
+  const temporaryHome = await mkdtemp(resolve(tmpdir(), "deki-electron-dag-home-"));
+  const workspace = await mkdtemp(resolve(tmpdir(), "deki-electron-dag-workspace-"));
+  const modelServer = await startFixtureModelServer();
+  const route = ["fixture/fixture-model"];
+  await seedChineseSettings(temporaryHome, {
+    agent: {
+      maxConcurrentRuns: 3,
+      dagExecutionEnabled: true,
+      planMaxConcurrentSteps: 2,
+      planMaxDurationMs: 300_000,
+      planMaxInputTokens: 100_000,
+      planMaxOutputTokens: 20_000,
+      planMaxToolCalls: 100,
+      planModelRoutes: {
+        coordinator: route,
+        explorer: route,
+        implementer: route,
+        tester: route,
+        reviewer: route,
+        integrator: route,
+      },
+    },
+  });
+  await seedFixtureModel(temporaryHome, modelServer.baseUrl);
+  await writeFile(join(workspace, "package.json"), JSON.stringify({
+    name: "dag-fixture",
+    private: true,
+    scripts: { test: "node -e \"process.exit(0)\"" },
+  }));
+  await execFileAsync("git", ["init"], { cwd: workspace });
+  await execFileAsync("git", ["add", "-A"], { cwd: workspace });
+  await execFileAsync("git", [
+    "-c", "user.name=Deki Test",
+    "-c", "user.email=deki@example.com",
+    "commit", "-m", "fixture",
+  ], { cwd: workspace });
+  const electronApp = await electron.launch({
+    executablePath: electronPath,
+    args: createElectronArguments(temporaryHome, "--workspace", workspace),
+    env: createTestEnvironment(temporaryHome),
+  });
+
+  try {
+    const window = await electronApp.firstWindow();
+    await window.getByRole("button", { name: /信任并继续|Trust and continue/ }).click();
+    const composer = window.locator(".composer-card");
+    await composer.getByRole("group", { name: "交互模式" })
+      .getByRole("button", { name: "规划" }).click();
+    await composer.locator(".composer-input").fill("DAG 发布收尾验收");
+    await composer.getByRole("button", { name: "生成计划", exact: true }).click();
+    const panel = window.getByTestId("plan-panel");
+    await expect(panel.getByRole("button", { name: "批准并执行" }))
+      .toBeEnabled({ timeout: 20_000 });
+    await panel.getByRole("button", { name: "批准并执行" }).click();
+    await expect(panel.getByText("DAG 执行图")).toBeVisible({ timeout: 20_000 });
+    await expect(panel).toContainText("5/5", { timeout: 45_000 });
+    await expect(readFile(join(workspace, "alpha.txt"), "utf8")).rejects.toThrow();
+    await expect(readFile(join(workspace, "beta.txt"), "utf8")).rejects.toThrow();
+
+    const result = await window.evaluate(async () => {
+      const api = (globalThis as unknown as { deki: DekiDesktopApi }).deki;
+      const root = (await api.listTasks({ limit: 100 }))
+        .find((summary) => summary.task.kind === "plan-execution");
+      const detail = root ? await api.getTask(root.task.id) : null;
+      const plan = (await api.listPlans({ limit: 20 }))[0];
+      const planDetail = plan ? await api.getPlan(plan.plan.id) : null;
+      const request = detail?.requests.find((candidate) => candidate.status === "pending");
+      if (!root || !detail || !request) return { ok: false, detail, planDetail };
+      const decision = await api.respondToIntegration(root.task.id, request.id, "apply");
+      return { ok: decision.ok, detail, planDetail };
+    });
+    expect(result.ok).toBe(true);
+    expect(result.detail?.children.filter((child) =>
+      child.task.assignedProfile === "reviewer")).toHaveLength(2);
+    expect(result.detail?.children.filter((child) =>
+      child.task.assignedProfile === "integrator")).toHaveLength(1);
+    expect(result.planDetail?.executionGraph?.usage.inputTokens ?? 0)
+      .toBeLessThanOrEqual(100_000);
+    expect(modelServer.maxWorkerConcurrency).toBeGreaterThanOrEqual(2);
+    await expect.poll(() => readFile(join(workspace, "alpha.txt"), "utf8"))
+      .toContain("alpha implemented");
+    expect(await readFile(join(workspace, "beta.txt"), "utf8"))
+      .toContain("beta implemented");
+  } finally {
+    await electronApp.close();
+    await modelServer.close();
+    await rm(temporaryHome, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+// Playwright requires an object-destructured fixtures parameter.
+// eslint-disable-next-line no-empty-pattern
 test("runs two real read-only Workers and renders their Agent Tree", async ({}) => {
   const temporaryHome = await mkdtemp(resolve(tmpdir(), "deki-electron-worker-flow-"));
   const workspace = await mkdtemp(resolve(tmpdir(), "deki-electron-worker-workspace-"));
@@ -1606,7 +1701,7 @@ function fixtureCompletion(
   if (prompt.includes("你是 Implementer")) {
     const overlap = prompt.includes("\"path\":\"overlap.txt\"");
     const exclusive = prompt.includes("\"path\":\"pnpm-lock.yaml\"");
-    const alpha = !overlap && !exclusive && prompt.includes("\"path\":\"alpha.txt\"");
+    const alpha = !overlap && !exclusive && prompt.includes("alpha.txt");
     const target = overlap
       ? "overlap.txt"
       : exclusive
@@ -1698,7 +1793,12 @@ function fixtureCompletion(
       },
     };
   }
-  if (prompt.includes("你是只读 Reviewer")) {
+  if (
+    prompt.includes("你是只读 Reviewer")
+    || prompt.includes("review.verdict")
+    || prompt.includes("Profile: reviewer")
+    || prompt.includes("Review: Implement")
+  ) {
     if (calledTools.includes("worker__submit_result")) {
       return { text: "Reviewer result submitted." };
     }
@@ -1706,7 +1806,13 @@ function fixtureCompletion(
       text: "",
       tool: {
         name: "worker__submit_result",
-        arguments: fixtureWorkerResult("Fixture Reviewer finding"),
+        arguments: {
+          ...fixtureWorkerResult("Fixture Reviewer finding"),
+          review: {
+            verdict: "approved",
+            findings: [],
+          },
+        },
       },
     };
   }
@@ -1814,15 +1920,18 @@ function fixtureCompletion(
   }
   if (prompt.includes("plan__submit")) {
     if (calledTools.includes("plan__submit")) return { text: "Plan ready for review." };
+    const dag = prompt.includes("DAG 发布收尾验收");
     return {
       text: "",
       tool: {
         name: "plan__submit",
         arguments: {
-          goal: "创建一个会触发重新规划的单步骤计划",
+          goal: dag ? "DAG 发布收尾验收" : "创建一个会触发重新规划的单步骤计划",
           assumptions: ["Initial fixture assumption"],
           constraints: ["Plan mode remains read-only"],
-          steps: [fixturePlanStep()],
+          steps: dag
+            ? [fixtureDagImplementer("alpha"), fixtureDagImplementer("beta")]
+            : [fixturePlanStep()],
         },
       },
     };
@@ -1905,6 +2014,23 @@ function fixturePlanStep() {
     validation: ["Workspace remains unchanged"],
     risk: "low",
     parallelizable: false,
+    executionProfile: "explorer",
+  };
+}
+
+function fixtureDagImplementer(name: "alpha" | "beta") {
+  return {
+    id: name,
+    title: `Implement ${name}`,
+    description: `Create ${name}.txt in an isolated worktree.`,
+    dependencies: [],
+    candidateFiles: [`${name}.txt`],
+    validation: ["test passes"],
+    risk: "low",
+    parallelizable: true,
+    executionProfile: "implementer",
+    writeSet: [{ path: `${name}.txt`, kind: "file", exclusive: false }],
+    validationTargets: [{ script: "test" }],
   };
 }
 

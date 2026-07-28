@@ -25,6 +25,8 @@ import {
   workerResultSchema,
   implementationResultSchema,
   integrationRecordSchema,
+  planExecutionBudgetSchema,
+  planExecutionGraphSchema,
   type AgentEvent,
   type ArtifactKind,
   type ArtifactRecord,
@@ -58,8 +60,38 @@ import {
   type WorkerResultEnvelope,
   type ImplementationResult,
   type IntegrationRecord,
+  type PlanExecutionBudget,
+  type PlanExecutionGraph,
+  type PlanExecutionNode,
+  type PlanBudgetReservation,
 } from "@deki-ai/shared";
 import { z } from "zod";
+import {
+  blockedByFailedDependencies,
+  canFallbackFailure,
+  classifyExecutionFailure,
+  classifyExecutionFailureDetail,
+  compilePlanExecutionGraph,
+  computeRunnableNodes,
+  emptyBudgetReservation,
+  selectModelRoute,
+} from "./dag.js";
+export {
+  assertDagExecutable,
+  blockedByFailedDependencies,
+  canFallbackFailure,
+  classifyExecutionFailure,
+  classifyExecutionFailureDetail,
+  compilePlanExecutionGraph,
+  computeRunnableNodes,
+  emptyBudgetReservation,
+  emptyBudgetUsage,
+  selectModelRoute,
+  type ExecutionFailureClass,
+  type ExecutionFailureDetail,
+  type ModelRouteDecision,
+  type RoutedProfile,
+} from "./dag.js";
 
 export const promptExecutionInputSchema = z.object({
   type: z.literal("agent-prompt"),
@@ -74,6 +106,17 @@ export const promptExecutionInputSchema = z.object({
   deliveryMode: z.enum(["foreground", "background"]).optional(),
   workerProfile: workerProfileIdSchema.optional(),
   workerContext: workerContextPackageSchema.optional(),
+  dagNodeId: z.string().uuid().optional(),
+  requestedModel: z.string().optional(),
+  routeCandidateIndex: z.number().int().nonnegative().optional(),
+  routeReason: z.string().optional(),
+  budgetTier: z.enum(["normal", "soft", "critical"]).optional(),
+  outputTokenScale: z.union([z.literal(1), z.literal(0.75), z.literal(0.5)]).optional(),
+  lowerThinking: z.boolean().optional(),
+  dagModelRoutes: z.record(
+    z.enum(["coordinator", "explorer", "implementer", "tester", "reviewer", "integrator"]),
+    z.array(z.string()).max(3),
+  ).optional(),
   worktreeContext: z.object({
     baselineCommit: z.string().regex(/^[0-9a-f]{40,64}$/i),
     baseCommit: z.string().regex(/^[0-9a-f]{40,64}$/i),
@@ -85,6 +128,14 @@ export const promptExecutionInputSchema = z.object({
     validationTargets: z.array(validationTargetSchema).min(1).max(30),
     wave: z.number().int().nonnegative(),
     integratorMode: z.enum(["resolve", "review"]).optional(),
+    integratorGuard: z.object({
+      allowedFiles: z.array(z.string().min(1).max(2_000)).min(1).max(100),
+      protectedStateSha256: z.string().regex(/^[0-9a-f]{64}$/i),
+    }).strict().optional(),
+    conflictArtifactIds: z.array(z.string().uuid()).max(500).optional(),
+    pendingIntegrationCommits: z.array(
+      z.string().regex(/^[0-9a-f]{40,64}$/i),
+    ).max(100).optional(),
     integrationResource: z.object({
       id: z.string().min(1),
       path: z.string().min(1),
@@ -212,6 +263,11 @@ interface RunRow {
   runner_id: string;
   model_provider: string | null;
   model_id: string | null;
+  route_candidate_index: number | null;
+  route_reason: string | null;
+  budget_tier: string | null;
+  failure_class: string | null;
+  failure_detail_json: string | null;
   started_at: string | null;
   finished_at: string | null;
   error: string | null;
@@ -339,6 +395,15 @@ interface PlanEventRow {
   sequence: number;
   type: string;
   payload_json: string;
+}
+
+interface PlanExecutionGraphRow {
+  plan_id: string;
+  revision: number;
+  graph_json: string;
+  status: string;
+  created_at: string;
+  updated_at: string;
 }
 
 const taskTransitions: Record<TaskStatus, ReadonlySet<TaskStatus>> = {
@@ -503,10 +568,10 @@ export class TaskStore {
       events: events.map(rowToEvent),
       requests: requests.map(rowToRequest),
       children: childRows.map((row) => this.#summaryFor(rowToTask(row))),
-      ...(task.kind === "worker" || task.kind === "integration"
+      ...(task.kind === "worker" || task.kind === "integration" || task.kind === "plan-step"
         ? { workerResult: this.getWorkerResult(task.id) }
         : {}),
-      ...(task.kind === "worker"
+      ...(task.kind === "worker" || task.kind === "plan-step"
         ? { implementationResult: this.getImplementationResult(task.id) }
         : {}),
       ...(this.getIntegrationForTask(task.id)
@@ -787,7 +852,7 @@ export class TaskStore {
     const task = this.#requireTask(parsed.taskId);
     const run = this.#requireRun(parsed.runId);
     if (
-      task.kind !== "worker"
+      (task.kind !== "worker" && task.kind !== "plan-step")
       || task.assignedProfile !== "implementer"
       || run.taskId !== task.id
     ) {
@@ -1030,7 +1095,7 @@ export class TaskStore {
     this.#assertTaskTransition(task.status, status);
     this.#assertRunTransition(run.status, status);
     const now = new Date().toISOString();
-    this.#transaction((events) => {
+    this.#transaction((events, planEvents) => {
       this.#database.prepare(`
         UPDATE tasks SET status = ?, updated_at = ?, completed_at = ? WHERE id = ?
       `).run(status, now, now, taskId);
@@ -1048,6 +1113,28 @@ export class TaskStore {
         runId,
         task.sessionId,
       ));
+      if (task.kind === "plan-execution" && task.planId) {
+        const graph = this.getPlanExecutionGraph(task.planId);
+        const planStatus: PlanStatus = decision === "cancel"
+          ? "abandoned"
+          : graph?.status === "completed" ? "completed" : "blocked";
+        this.#database.prepare(`
+          UPDATE plans
+          SET status = ?, executing_revision = NULL, updated_at = ?
+          WHERE id = ?
+        `).run(planStatus, now, task.planId);
+        planEvents.push(this.#appendPlanEvent(
+          task.planId,
+          planStatus === "completed"
+            ? "plan.completed"
+            : planStatus === "abandoned"
+              ? "plan.abandoned"
+              : "plan.execution_blocked",
+          { integrationDecision: decision },
+          task.id,
+          run.id,
+        ));
+      }
     });
   }
 
@@ -1183,6 +1270,7 @@ export class TaskStore {
     if (
       (
         task.kind !== "worker"
+        && task.kind !== "plan-step"
         && !(task.kind === "integration" && task.assignedProfile === "integrator")
       )
       || run.taskId !== task.id
@@ -1249,6 +1337,23 @@ export class TaskStore {
       run.id,
       task.id,
     );
+    if (task.kind === "plan-step" && task.planId) {
+      const graph = this.getPlanExecutionGraph(task.planId);
+      if (!graph) return undefined;
+      graph.usage = this.#dagUsage(graph);
+      graph.reserved = this.#dagReservations(graph);
+      const ratio = Math.max(
+        (graph.usage.durationMs + graph.reserved.durationMs) / graph.budget.maxDurationMs,
+        (graph.usage.inputTokens + graph.reserved.inputTokens) / graph.budget.maxInputTokens,
+        (graph.usage.outputTokens + graph.reserved.outputTokens) / graph.budget.maxOutputTokens,
+        (graph.usage.toolCalls + graph.reserved.toolCalls) / graph.budget.maxToolCalls,
+      );
+      graph.usage.warningEmitted ||= ratio >= 0.7;
+      graph.usage.exceeded ||= dagBudgetExceeded(graph);
+      graph.updatedAt = new Date().toISOString();
+      this.savePlanExecutionGraph(graph);
+      return graph.usage;
+    }
     if (!budgetRow || task.kind !== "worker") return undefined;
     const budget = taskBudgetSchema.parse(JSON.parse(budgetRow.budget_json));
     const aggregate = this.#database.prepare(`
@@ -1403,6 +1508,25 @@ export class TaskStore {
       warningEmitted: warning || rootWarning,
       exceeded: exceeded || rootExceeded,
     };
+  }
+
+  setRunFailureClass(
+    runId: string,
+    failureClass: NonNullable<RunRecord["failureClass"]>,
+  ): void {
+    this.#database.prepare(
+      "UPDATE runs SET failure_class = ? WHERE id = ?",
+    ).run(failureClass, runId);
+  }
+
+  setRunFailureDetail(
+    runId: string,
+    failureClass: NonNullable<RunRecord["failureClass"]>,
+    detail: NonNullable<RunRecord["failureDetail"]>,
+  ): void {
+    this.#database.prepare(
+      "UPDATE runs SET failure_class = ?, failure_detail_json = ? WHERE id = ?",
+    ).run(failureClass, JSON.stringify(detail), runId);
   }
 
   getTaskBudget(taskId: string): {
@@ -1707,7 +1831,7 @@ export class TaskStore {
     input: PlanRevisionTaskInput,
   ): TaskRecord {
     const plan = this.#requirePlan(planId);
-    if (!["draft", "ready", "approved"].includes(plan.status)) {
+    if (!["draft", "ready", "approved", "blocked"].includes(plan.status)) {
       throw new Error(`计划当前状态为 ${plan.status}，不能请求修订`);
     }
     const pending = this.#findNonTerminalPlanningTask(planId);
@@ -1822,7 +1946,545 @@ export class TaskStore {
       ...(plan.executionTaskId
         ? { executionTask: this.getTask(plan.executionTaskId) }
         : {}),
+      ...(this.getPlanExecutionGraph(planId)
+        ? { executionGraph: this.getPlanExecutionGraph(planId) }
+        : {}),
     });
+  }
+
+  getPlanExecutionGraph(planId: string): PlanExecutionGraph | undefined {
+    const row = this.#database.prepare(`
+      SELECT * FROM plan_execution_graphs
+      WHERE plan_id = ? ORDER BY revision DESC LIMIT 1
+    `).get(planId) as unknown as PlanExecutionGraphRow | undefined;
+    return row ? planExecutionGraphSchema.parse(JSON.parse(row.graph_json)) : undefined;
+  }
+
+  savePlanExecutionGraph(graph: PlanExecutionGraph): PlanExecutionGraph {
+    const parsed = planExecutionGraphSchema.parse(graph);
+    this.#database.prepare(`
+      INSERT INTO plan_execution_graphs (
+        plan_id, revision, graph_json, status, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(plan_id, revision) DO UPDATE SET
+        graph_json = excluded.graph_json,
+        status = excluded.status,
+        updated_at = excluded.updated_at
+    `).run(
+      parsed.planId,
+      parsed.revision,
+      JSON.stringify(parsed),
+      parsed.status,
+      parsed.createdAt,
+      parsed.updatedAt,
+    );
+    return parsed;
+  }
+
+  updatePlanExecutionNode(
+    planId: string,
+    nodeId: string,
+    patch: Partial<Omit<PlanExecutionNode, "id" | "planId" | "revision">>,
+  ): PlanExecutionGraph {
+    const graph = this.getPlanExecutionGraph(planId);
+    if (!graph) throw new Error("计划没有 DAG 执行图");
+    const index = graph.nodes.findIndex((node) => node.id === nodeId);
+    if (index < 0) throw new Error(`未找到 DAG 节点: ${nodeId}`);
+    const now = new Date().toISOString();
+    graph.nodes[index] = {
+      ...graph.nodes[index]!,
+      ...patch,
+      updatedAt: now,
+    };
+    const blocked = blockedByFailedDependencies(graph);
+    const blockedIds = new Set(blocked.map((node) => node.id));
+    graph.nodes = graph.nodes.map((node) =>
+      blockedIds.has(node.id)
+        ? { ...node, status: "blocked", reason: "上游节点未成功", updatedAt: now }
+        : node
+    );
+    graph.updatedAt = now;
+    graph.status = graph.nodes.every((node) => node.status === "succeeded")
+      ? "completed"
+      : graph.nodes.some((node) => node.status === "running")
+        ? "running"
+        : graph.nodes.some((node) => node.status === "failed" || node.status === "blocked")
+          ? "blocked"
+          : "pending";
+    return this.savePlanExecutionGraph(graph);
+  }
+
+  listRunnablePlanNodes(planId: string, capacity: number): PlanExecutionNode[] {
+    const graph = this.getPlanExecutionGraph(planId);
+    if (!graph) return [];
+    return computeRunnableNodes(graph, capacity);
+  }
+
+  refreshPlanDagUsage(planId: string): PlanExecutionGraph | undefined {
+    const graph = this.getPlanExecutionGraph(planId);
+    if (!graph) return undefined;
+    graph.usage = this.#dagUsage(graph);
+    graph.reserved = this.#dagReservations(graph);
+    const exceeded = dagBudgetExceeded(graph);
+    graph.usage.exceeded = exceeded;
+    if (exceeded) {
+      graph.status = "blocked";
+      graph.blockedReason = "budget";
+      const now = new Date().toISOString();
+      for (const node of graph.nodes) {
+        if (node.status !== "pending" && node.status !== "ready") continue;
+        node.status = "blocked";
+        node.reason = "Plan 硬预算已耗尽";
+        node.updatedAt = now;
+      }
+      graph.updatedAt = now;
+    }
+    return this.savePlanExecutionGraph(graph);
+  }
+
+  reservePlanDagNode(
+    planId: string,
+    nodeId: string,
+    outputScale: 1 | 0.75 | 0.5,
+  ): "reserved" | "waiting" | "blocked" {
+    const graph = this.refreshPlanDagUsage(planId);
+    const node = graph?.nodes.find((candidate) => candidate.id === nodeId);
+    if (!graph || !node) throw new Error("未找到待预留的 DAG 节点");
+    if (graph.status === "blocked") return "blocked";
+    if (node.reservation) return "reserved";
+    const reservation = dagNodeReservation(graph, outputScale);
+    const fits = dagReservationFits(graph, reservation);
+    if (!fits) {
+      if (hasActiveDagReservations(graph)) return "waiting";
+      const now = new Date().toISOString();
+      node.status = "blocked";
+      node.reason = "剩余 Plan 预算不足以运行此质量关卡";
+      node.updatedAt = now;
+      graph.status = "blocked";
+      graph.blockedReason = "budget";
+      graph.updatedAt = now;
+      this.savePlanExecutionGraph(graph);
+      return "blocked";
+    }
+    node.reservation = reservation;
+    node.updatedAt = new Date().toISOString();
+    graph.reserved = this.#dagReservations(graph);
+    graph.updatedAt = node.updatedAt;
+    this.savePlanExecutionGraph(graph);
+    return "reserved";
+  }
+
+  releasePlanDagNodeReservation(planId: string, nodeId: string): void {
+    const graph = this.getPlanExecutionGraph(planId);
+    const node = graph?.nodes.find((candidate) => candidate.id === nodeId);
+    if (!graph || !node?.reservation) return;
+    delete node.reservation;
+    node.updatedAt = new Date().toISOString();
+    graph.reserved = this.#dagReservations(graph);
+    graph.updatedAt = node.updatedAt;
+    this.savePlanExecutionGraph(graph);
+  }
+
+  preparePlanDagRetry(planId: string): boolean {
+    const plan = this.#requirePlan(planId);
+    const graph = this.getPlanExecutionGraph(planId);
+    if (!graph || plan.status !== "blocked") return true;
+    if (graph.nodes.some((node) => node.status === "failed" && node.failureClass === "review")) {
+      return false;
+    }
+    const rootExecution = this.getExecution(graph.rootTaskId);
+    const now = new Date().toISOString();
+    for (const node of graph.nodes) {
+      if (node.status === "failed" && node.taskId) {
+        const task = this.getTask(node.taskId);
+        if (task?.status === "failed" && node.failureClass !== "review") {
+          const candidates = rootExecution.dagModelRoutes?.[node.profile] ?? [];
+          const currentIndex = node.routeCandidateIndex ?? -1;
+          if (currentIndex < Math.min(2, candidates.length - 1)) {
+            const route = selectModelRoute({
+              candidates,
+              usage: graph.usage,
+              budget: graph.budget,
+              reserved: graph.reserved,
+              risk: node.risk,
+              profile: node.profile,
+              previousCandidateIndex: Math.max(0, currentIndex),
+              fallback: true,
+            });
+            const execution = this.getExecution(task.id);
+            this.updateExecution(task.id, {
+              ...execution,
+              ...(route.model ? { requestedModel: route.model } : {}),
+              routeCandidateIndex: route.candidateIndex,
+              routeReason: `manual-retry:${route.candidateIndex}`,
+              budgetTier: route.budgetTier,
+              outputTokenScale: route.outputScale,
+              lowerThinking: route.lowerThinking,
+            });
+            node.routeCandidateIndex = route.candidateIndex;
+            node.routeReason = `manual-retry:${route.candidateIndex}`;
+            node.budgetTier = route.budgetTier;
+          }
+          this.requeueTask(task.id, "failed");
+          node.status = "ready";
+          node.attempt += 1;
+          delete node.reason;
+        }
+      } else if (node.status === "blocked") {
+        node.status = "pending";
+        delete node.reason;
+      }
+      node.updatedAt = now;
+    }
+    graph.status = "pending";
+    delete graph.blockedReason;
+    graph.reserved = this.#dagReservations(graph);
+    graph.updatedAt = now;
+    this.savePlanExecutionGraph(graph);
+    this.#database.prepare(`
+      UPDATE plans SET status = 'approved', updated_at = ? WHERE id = ?
+    `).run(now, planId);
+    return true;
+  }
+
+  startPlanDagExecution(taskId: string): RunRecord {
+    const task = this.#requireTask(taskId);
+    if (task.kind !== "plan-execution" || !task.planId) {
+      throw new Error("只有 Plan 根任务可以启动 DAG");
+    }
+    const graph = this.getPlanExecutionGraph(task.planId);
+    if (!graph) throw new Error("计划没有 DAG 执行图");
+    const run = this.createRun(taskId, "dag-coordinator");
+    this.bindRun(taskId, run.id, { sessionId: `dag:${graph.id}` });
+    graph.status = "running";
+    graph.updatedAt = new Date().toISOString();
+    this.savePlanExecutionGraph(graph);
+    return this.#requireRun(run.id);
+  }
+
+  createPlanNodeTask(
+    rootTaskId: string,
+    rootRunId: string,
+    nodeId: string,
+    route: {
+      model?: string;
+      candidateIndex: number;
+      budgetTier: "normal" | "soft" | "critical";
+      reason: string;
+      outputScale: 1 | 0.75 | 0.5;
+      lowerThinking: boolean;
+    },
+  ): TaskRecord {
+    const root = this.#requireTask(rootTaskId);
+    if (root.kind !== "plan-execution" || !root.planId) {
+      throw new Error("DAG 节点缺少 Plan 根任务");
+    }
+    const graph = this.getPlanExecutionGraph(root.planId);
+    const node = graph?.nodes.find((candidate) => candidate.id === nodeId);
+    if (!graph || !node) throw new Error("未找到 DAG 节点");
+    if (node.taskId) {
+      const existing = this.getTask(node.taskId);
+      if (existing) return existing;
+    }
+    const rootExecution = this.getExecution(root.id);
+    const reservation = node.reservation ?? dagNodeReservation(graph, route.outputScale);
+    const budget = taskBudgetSchema.parse({
+      maxWorkers: 1,
+      maxDurationMs: reservation.durationMs,
+      maxInputTokens: reservation.inputTokens,
+      maxOutputTokens: reservation.outputTokens,
+      maxToolCalls: reservation.toolCalls,
+    });
+    const workerTaskId = randomUUID();
+    const executionProfile = node.profile === "integrator" ? "reviewer" : node.profile;
+    const task = this.createTask({
+      id: workerTaskId,
+      workspaceId: root.workspaceId,
+      ...(root.workspacePath ? { workspacePath: root.workspacePath } : {}),
+      parentTaskId: root.id,
+      kind: "plan-step",
+      title: node.title,
+      goal: renderDagNodeGoal(node),
+      planId: root.planId,
+      assignedProfile: node.profile,
+      systemCreated: true,
+      execution: {
+        type: "agent-prompt",
+        sourceSessionId: rootExecution.sourceSessionId,
+        preferFork: true,
+        interactionMode: "worker",
+        planId: root.planId,
+        planRevision: graph.revision,
+        deliveryMode: "background",
+        workerProfile: executionProfile,
+        dagNodeId: node.id,
+        ...(route.model ? { requestedModel: route.model } : {}),
+        routeCandidateIndex: route.candidateIndex,
+        routeReason: route.reason,
+        budgetTier: route.budgetTier,
+        outputTokenScale: route.outputScale,
+        lowerThinking: route.lowerThinking,
+        workerContext: {
+          rootTaskId: root.rootTaskId,
+          parentTaskId: root.id,
+          workerTaskId,
+          objective: renderDagNodeGoal(node),
+          successCriteria: node.validationTargets.length
+            ? node.validationTargets.map((target) => `${target.cwd ?? "."}: ${target.script}`)
+            : ["提交带证据的结构化结果"],
+          constraints: [
+            `执行图节点 ${node.id}`,
+            ...(node.syntheticKind ? [`自动质量关卡: ${node.syntheticKind}`] : []),
+          ],
+          knownFacts: [],
+          fileHints: node.writeSet.map((entry) => entry.path),
+          symbolHints: [],
+          plan: {
+            planId: root.planId,
+            revision: graph.revision,
+            ...(node.sourceStepId ? { stepId: node.sourceStepId } : {}),
+          },
+          budget,
+        },
+      },
+    });
+    node.taskId = task.id;
+    node.status = "ready";
+    node.routeCandidateIndex = route.candidateIndex;
+    node.routeReason = route.reason;
+    node.budgetTier = route.budgetTier;
+    node.attempt += 1;
+    node.updatedAt = new Date().toISOString();
+    graph.updatedAt = node.updatedAt;
+    this.savePlanExecutionGraph(graph);
+    this.#transaction((events, planEvents) => {
+      events.push(this.#appendEvent(
+        task.id,
+        "route.selected",
+        {
+          nodeId: node.id,
+          candidateIndex: route.candidateIndex,
+          model: route.model,
+          reason: route.reason,
+          budgetTier: route.budgetTier,
+        },
+        undefined,
+      ));
+      planEvents.push(this.#appendPlanEvent(
+        root.planId!,
+        "plan.node_ready",
+        {
+          nodeId: node.id,
+          profile: node.profile,
+          taskId: task.id,
+          route: route.reason,
+        },
+        task.id,
+        rootRunId,
+      ));
+      planEvents.push(this.#appendPlanEvent(
+        root.planId!,
+        "plan.route_selected",
+        {
+          nodeId: node.id,
+          candidateIndex: route.candidateIndex,
+          model: route.model,
+          reason: route.reason,
+          budgetTier: route.budgetTier,
+        },
+        task.id,
+        rootRunId,
+      ));
+    });
+    return task;
+  }
+
+  syncPlanDagNode(
+    taskId: string,
+    status: "running" | "succeeded" | "failed" | "cancelled" | "interrupted",
+    input: {
+      runId?: string;
+      summary?: string;
+      reason?: string;
+      failureClass?: NonNullable<RunRecord["failureClass"]>;
+    } = {},
+  ): PlanExecutionGraph | undefined {
+    const task = this.getTask(taskId);
+    if (!task?.planId || task.kind !== "plan-step") return undefined;
+    const graph = this.getPlanExecutionGraph(task.planId);
+    const node = graph?.nodes.find((candidate) => candidate.taskId === taskId);
+    if (!graph || !node) return undefined;
+    const now = new Date().toISOString();
+    node.status = status;
+    node.runId = input.runId ?? task.currentRunId;
+    const routedRun = node.runId ? this.#requireRun(node.runId) : undefined;
+    node.modelProvider = routedRun?.modelProvider;
+    node.modelId = routedRun?.modelId;
+    node.summary = input.summary;
+    node.reason = input.reason;
+    node.failureClass = input.failureClass;
+    if (status !== "running") delete node.reservation;
+    node.updatedAt = now;
+    if (status === "running" && node.sourceStepId) {
+      this.#setDagStepState(task.planId, graph.revision, node.sourceStepId, "running", now);
+    }
+    if (status === "succeeded" && node.sourceStepId) {
+      const hasReview = graph.nodes.some((candidate) =>
+        candidate.syntheticKind === "reviewer"
+        && candidate.sourceStepId === node.sourceStepId
+      );
+      if (!hasReview || node.syntheticKind === "reviewer") {
+        this.#setDagStepState(
+          task.planId,
+          graph.revision,
+          node.sourceStepId,
+          "completed",
+          now,
+          input.summary,
+        );
+      }
+    }
+    if (
+      node.sourceStepId
+      && (status === "failed" || status === "cancelled" || status === "interrupted")
+    ) {
+      this.#setDagStepState(
+        task.planId,
+        graph.revision,
+        node.sourceStepId,
+        "blocked",
+        now,
+        input.summary,
+      );
+    }
+    const blockedIds = new Set(blockedByFailedDependencies(graph).map((item) => item.id));
+    for (const candidate of graph.nodes) {
+      if (!blockedIds.has(candidate.id)) continue;
+      candidate.status = "blocked";
+      candidate.reason = "上游节点未成功";
+      candidate.updatedAt = now;
+    }
+    graph.usage = this.#dagUsage(graph);
+    graph.reserved = this.#dagReservations(graph);
+    graph.updatedAt = now;
+    graph.status = graph.nodes.every((candidate) => candidate.status === "succeeded")
+      ? "completed"
+      : graph.nodes.some((candidate) => candidate.status === "running")
+        ? "running"
+        : graph.nodes.some((candidate) =>
+            candidate.status === "failed" || candidate.status === "blocked")
+          ? "blocked"
+          : "pending";
+    if (graph.status === "completed" || graph.status === "running" || graph.status === "pending") {
+      delete graph.blockedReason;
+    } else if (input.failureClass === "review") {
+      graph.blockedReason = "review";
+    } else if (input.failureClass === "budget") {
+      graph.blockedReason = "budget";
+    } else if (input.failureClass === "integration") {
+      graph.blockedReason = "integration";
+    } else {
+      graph.blockedReason ??= "dependency";
+    }
+    const saved = this.savePlanExecutionGraph(graph);
+    const eventType: PlanEventType = status === "running"
+      ? "plan.node_started"
+      : status === "succeeded"
+        ? "plan.node_completed"
+        : status === "failed"
+          ? "plan.node_failed"
+          : "plan.node_blocked";
+    this.#transaction((_events, planEvents) => {
+      planEvents.push(this.#appendPlanEvent(
+        task.planId!,
+        eventType,
+        {
+          nodeId: node.id,
+          profile: node.profile,
+          status,
+          ...(input.failureClass ? { failureClass: input.failureClass } : {}),
+          ...(input.reason ? { reason: input.reason } : {}),
+        },
+        task.id,
+        node.runId,
+      ));
+    });
+    return saved;
+  }
+
+  #setDagStepState(
+    planId: string,
+    revision: number,
+    stepId: string,
+    status: "running" | "completed" | "blocked",
+    now: string,
+    summary?: string,
+  ): void {
+    this.#database.prepare(`
+      UPDATE plan_step_states
+      SET status = ?, summary = COALESCE(?, summary),
+          started_at = CASE WHEN ? = 'running' THEN COALESCE(started_at, ?) ELSE started_at END,
+          completed_at = CASE WHEN ? = 'completed' THEN ? ELSE completed_at END,
+          updated_at = ?
+      WHERE plan_id = ? AND revision = ? AND step_id = ?
+    `).run(
+      status,
+      summary ?? null,
+      status,
+      now,
+      status,
+      now,
+      now,
+      planId,
+      revision,
+      stepId,
+    );
+  }
+
+  #dagUsage(graph: PlanExecutionGraph): TaskBudgetUsage {
+    const rows = graph.nodes.flatMap((node) => {
+      if (!node.taskId) return [];
+      return this.#database.prepare(`
+        SELECT * FROM runs WHERE task_id = ? ORDER BY attempt ASC
+      `).all(node.taskId) as unknown as RunRow[];
+    });
+    return {
+      workers: rows.length,
+      durationMs: rows.reduce((sum, row) => {
+        if (!row.started_at) return sum;
+        const end = row.finished_at ? Date.parse(row.finished_at) : Date.now();
+        return sum + Math.max(0, end - Date.parse(row.started_at));
+      }, 0),
+      inputTokens: rows.reduce((sum, row) => sum + row.input_tokens, 0),
+      outputTokens: rows.reduce((sum, row) => sum + row.output_tokens, 0),
+      toolCalls: rows.reduce((sum, row) => sum + row.tool_call_count, 0),
+      warningEmitted: graph.usage.warningEmitted,
+      exceeded: graph.usage.exceeded,
+    };
+  }
+
+  #dagReservations(graph: PlanExecutionGraph): PlanBudgetReservation {
+    return graph.nodes.reduce<PlanBudgetReservation>((sum, node) => {
+      if (!node.reservation) return sum;
+      const run = node.taskId
+        ? this.#database.prepare(`
+            SELECT * FROM runs WHERE task_id = ? ORDER BY attempt DESC LIMIT 1
+          `).get(node.taskId) as unknown as RunRow | undefined
+        : undefined;
+      const elapsed = run?.started_at
+        ? Math.max(0, (run.finished_at ? Date.parse(run.finished_at) : Date.now())
+          - Date.parse(run.started_at))
+        : 0;
+      return {
+        durationMs: sum.durationMs + Math.max(0, node.reservation.durationMs - elapsed),
+        inputTokens: sum.inputTokens
+          + Math.max(0, node.reservation.inputTokens - (run?.input_tokens ?? 0)),
+        outputTokens: sum.outputTokens
+          + Math.max(0, node.reservation.outputTokens - (run?.output_tokens ?? 0)),
+        toolCalls: sum.toolCalls
+          + Math.max(0, node.reservation.toolCalls - (run?.tool_call_count ?? 0)),
+      };
+    }, emptyBudgetReservation());
   }
 
   getPlanForPlanningTask(taskId: string): PlanRecord | undefined {
@@ -1875,6 +2537,13 @@ export class TaskStore {
           stateById.get(step.id)?.status === "running"
           || stateById.get(step.id)?.status === "blocked"
         ),
+        currentSteps: revision.steps.filter((step) =>
+          stateById.get(step.id)?.status === "running"
+          || stateById.get(step.id)?.status === "blocked"
+        ),
+        ...(this.getPlanExecutionGraph(plan.id)
+          ? { executionGraph: this.getPlanExecutionGraph(plan.id) }
+          : {}),
       });
     });
   }
@@ -1882,6 +2551,9 @@ export class TaskStore {
   approvePlan(planId: string, revisionNumber: number, input: {
     title: string;
     execution: PromptExecutionInput;
+    dag?: {
+      budget: PlanExecutionBudget;
+    };
   }): TaskRecord {
     const plan = this.#requirePlan(planId);
     if (plan.status !== "ready") throw new Error("只有待审阅计划可以批准");
@@ -1891,7 +2563,19 @@ export class TaskStore {
     if (planningTask.status !== "succeeded") {
       throw new Error("规划任务尚未成功完成，不能批准计划");
     }
-    this.#requirePlanRevision(planId, revisionNumber);
+    const approvedRevision = this.#requirePlanRevision(planId, revisionNumber);
+    const dagBudget = input.dag
+      ? planExecutionBudgetSchema.parse(input.dag.budget)
+      : undefined;
+    if (dagBudget) {
+      // Fail approval atomically before changing Plan state.
+      compilePlanExecutionGraph({
+        planId,
+        rootTaskId: plan.executionTaskId ?? randomUUID(),
+        revision: approvedRevision,
+        budget: dagBudget,
+      });
+    }
     const now = new Date().toISOString();
     let task: TaskRecord;
     this.#transaction((events, planEvents) => {
@@ -1918,6 +2602,16 @@ export class TaskStore {
           planId,
           execution: input.execution,
         }, events);
+      }
+      if (dagBudget) {
+        const graph = compilePlanExecutionGraph({
+          planId,
+          rootTaskId: task.id,
+          revision: approvedRevision,
+          budget: dagBudget,
+          now,
+        });
+        this.savePlanExecutionGraph(graph);
       }
       this.#database.prepare(`
         UPDATE plans
@@ -2081,7 +2775,14 @@ export class TaskStore {
   bindRun(
     taskId: string,
     runId: string,
-    input: { sessionId: string; modelProvider?: string; modelId?: string },
+    input: {
+      sessionId: string;
+      modelProvider?: string;
+      modelId?: string;
+      routeCandidateIndex?: number;
+      routeReason?: string;
+      budgetTier?: "normal" | "soft" | "critical";
+    },
   ): RunRecord {
     const task = this.#requireTask(taskId);
     const run = this.#requireRun(runId);
@@ -2091,12 +2792,16 @@ export class TaskStore {
       this.#database.prepare(`
         UPDATE runs
         SET status = 'running', session_id = ?, model_provider = ?,
-            model_id = ?, started_at = ?
+            model_id = ?, route_candidate_index = ?, route_reason = ?,
+            budget_tier = ?, started_at = ?
         WHERE id = ? AND task_id = ?
       `).run(
         input.sessionId,
         input.modelProvider ?? null,
         input.modelId ?? null,
+        input.routeCandidateIndex ?? null,
+        input.routeReason ?? null,
+        input.budgetTier ?? null,
         now,
         runId,
         taskId,
@@ -2216,11 +2921,13 @@ export class TaskStore {
         task.sessionId,
       ));
       if (plan && (plan.status === "executing" || plan.status === "approved")) {
+        const dagBlocked = status === "failed"
+          && this.getPlanExecutionGraph(plan.id)?.status === "blocked";
         const planStatus: PlanStatus = status === "succeeded"
           ? "completed"
           : status === "cancelled"
             ? "abandoned"
-            : "approved";
+            : dagBlocked ? "blocked" : "approved";
         this.#database.prepare(`
           UPDATE plans
           SET status = ?, executing_revision = NULL, updated_at = ?
@@ -2230,7 +2937,7 @@ export class TaskStore {
           ? "plan.completed"
           : status === "cancelled"
             ? "plan.abandoned"
-            : "plan.execution_failed";
+            : dagBlocked ? "plan.execution_blocked" : "plan.execution_failed";
         planEvents.push(this.#appendPlanEvent(
           plan.id,
           planEventType,
@@ -2837,6 +3544,45 @@ export class TaskStore {
         }
       });
     }
+    const graphRows = this.#database.prepare(`
+      SELECT graph_json FROM plan_execution_graphs WHERE status = 'running'
+    `).all() as Array<{ graph_json: string }>;
+    for (const graphRow of graphRows) {
+      const graph = planExecutionGraphSchema.parse(JSON.parse(graphRow.graph_json));
+      const now = new Date().toISOString();
+      for (const node of graph.nodes) {
+        delete node.reservation;
+        if (!["ready", "running", "interrupted"].includes(node.status)) continue;
+        delete node.runId;
+        node.status = node.taskId ? "ready" : "pending";
+        node.reason = "应用重启后恢复调度";
+        node.updatedAt = now;
+        if (node.taskId) {
+          this.#database.prepare(`
+            UPDATE tasks
+            SET status = 'queued', current_run_id = NULL,
+                updated_at = ?, completed_at = NULL
+            WHERE id = ? AND status = 'interrupted'
+          `).run(now, node.taskId);
+          const execution = this.getExecution(node.taskId);
+          if (execution.worktreeContext) {
+            const { worktreeContext: _staleWorktree, ...recoveredExecution } = execution;
+            this.updateExecution(node.taskId, recoveredExecution);
+          }
+        }
+      }
+      graph.status = "pending";
+      graph.reserved = emptyBudgetReservation();
+      delete graph.blockedReason;
+      graph.updatedAt = now;
+      this.savePlanExecutionGraph(graph);
+      this.#database.prepare(`
+        UPDATE tasks
+        SET status = 'queued', current_run_id = NULL,
+            updated_at = ?, completed_at = NULL
+        WHERE id = ? AND status = 'interrupted'
+      `).run(now, graph.rootTaskId);
+    }
     return tasks.length;
   }
 
@@ -2917,6 +3663,10 @@ export class TaskStore {
         (state) => state.status === "completed" || state.status === "skipped",
       ).length,
       totalSteps: revision.steps.length,
+      currentSteps: revision.steps.filter((step) => {
+        const status = stateById.get(step.id)?.status;
+        return status === "running" || status === "blocked";
+      }),
       ...(currentStep ? { currentStep } : {}),
       ...(plan.replanReason ? { replanReason: plan.replanReason } : {}),
     };
@@ -3289,6 +4039,11 @@ export class TaskStore {
           runner_id TEXT NOT NULL,
           model_provider TEXT,
           model_id TEXT,
+          route_candidate_index INTEGER,
+          route_reason TEXT,
+          budget_tier TEXT,
+          failure_class TEXT,
+          failure_detail_json TEXT,
           started_at TEXT,
           finished_at TEXT,
           error TEXT,
@@ -3490,7 +4245,18 @@ export class TaskStore {
         );
         CREATE INDEX artifact_files_uri_idx ON artifact_files(uri);
         CREATE INDEX artifact_files_sha_idx ON artifact_files(sha256);
-        PRAGMA user_version = 6;
+        CREATE TABLE plan_execution_graphs (
+          plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+          revision INTEGER NOT NULL,
+          graph_json TEXT NOT NULL,
+          status TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY(plan_id, revision)
+        );
+        CREATE INDEX plan_execution_graphs_status_idx
+          ON plan_execution_graphs(status, updated_at);
+        PRAGMA user_version = 7;
         COMMIT;
       `);
       return;
@@ -3717,6 +4483,57 @@ export class TaskStore {
         `);
       }
     }
+    if (version >= 1 && version <= 6) {
+      const runsTable = this.#database.prepare(`
+        SELECT 1 AS found FROM sqlite_master
+        WHERE type = 'table' AND name = 'runs'
+      `).get() as { found: number } | undefined;
+      if (runsTable) {
+        const runColumns = (
+          this.#database.prepare("PRAGMA table_info(runs)").all()
+        ) as unknown as Array<{ name: string }>;
+        const columns = new Set(runColumns.map((column) => column.name));
+        for (const [name, definition] of [
+          ["route_candidate_index", "INTEGER"],
+          ["route_reason", "TEXT"],
+          ["budget_tier", "TEXT"],
+          ["failure_class", "TEXT"],
+          ["failure_detail_json", "TEXT"],
+        ] as const) {
+          if (!columns.has(name)) {
+            this.#database.exec(`ALTER TABLE runs ADD COLUMN ${name} ${definition}`);
+          }
+        }
+      }
+      this.#database.exec(`
+        BEGIN;
+        CREATE TABLE IF NOT EXISTS plan_execution_graphs (
+          plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+          revision INTEGER NOT NULL,
+          graph_json TEXT NOT NULL,
+          status TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY(plan_id, revision)
+        );
+        CREATE INDEX IF NOT EXISTS plan_execution_graphs_status_idx
+          ON plan_execution_graphs(status, updated_at);
+        PRAGMA user_version = 7;
+        COMMIT;
+      `);
+    }
+    const runsTable = this.#database.prepare(`
+      SELECT 1 AS found FROM sqlite_master
+      WHERE type = 'table' AND name = 'runs'
+    `).get() as { found: number } | undefined;
+    if (runsTable) {
+      const columns = new Set((
+        this.#database.prepare("PRAGMA table_info(runs)").all()
+      ).map((column) => (column as { name: string }).name));
+      if (!columns.has("failure_detail_json")) {
+        this.#database.exec("ALTER TABLE runs ADD COLUMN failure_detail_json TEXT");
+      }
+    }
   }
 }
 
@@ -3823,6 +4640,7 @@ export class TaskOrchestrator {
     this.#unsubscribe = this.#store.subscribe((event) => {
       this.#onEvent?.(event);
       this.#handleWorkerTaskEvent(event);
+      this.#handleDagTaskEvent(event);
     });
     if (options.recoverOnStart !== false) this.#store.recoverInterrupted();
   }
@@ -4203,6 +5021,16 @@ export class TaskOrchestrator {
       return true;
     }
     const active = this.#active.get(taskId);
+    if (!active && task.kind === "plan-execution" && task.planId && task.currentRunId) {
+      const graph = this.#store.getPlanExecutionGraph(task.planId);
+      if (graph) {
+        graph.status = "cancelled";
+        graph.updatedAt = new Date().toISOString();
+        this.#store.savePlanExecutionGraph(graph);
+        this.#store.finishRun(task.id, task.currentRunId, "cancelled");
+        return true;
+      }
+    }
     if (!active) return false;
     active.cancelRequested = true;
     active.controller.abort();
@@ -4230,6 +5058,16 @@ export class TaskOrchestrator {
       return true;
     }
     const active = this.#active.get(taskId);
+    if (!active && task.kind === "plan-execution" && task.planId && task.currentRunId) {
+      const graph = this.#store.getPlanExecutionGraph(task.planId);
+      if (graph) {
+        graph.status = "pending";
+        graph.updatedAt = new Date().toISOString();
+        this.#store.savePlanExecutionGraph(graph);
+        this.#store.finishPausedRun(task.id, task.currentRunId);
+        return true;
+      }
+    }
     if (!active) return false;
     this.#store.requestPause(taskId);
     active.pauseRequested = true;
@@ -4328,6 +5166,23 @@ export class TaskOrchestrator {
   resumeTask(taskId: string): boolean {
     const task = this.#store.getTask(taskId);
     if (!task || (task.status !== "paused" && task.status !== "interrupted")) return false;
+    if (task.kind === "plan-execution" && task.planId) {
+      const graph = this.#store.getPlanExecutionGraph(task.planId);
+      if (graph) {
+        for (const node of graph.nodes) {
+          if (!node.taskId) continue;
+          const child = this.#store.getTask(node.taskId);
+          if (child?.status === "paused" || child?.status === "interrupted") {
+            this.#store.requeueTask(child.id, child.status);
+            node.status = "ready";
+            node.updatedAt = new Date().toISOString();
+          }
+        }
+        graph.status = "pending";
+        graph.updatedAt = new Date().toISOString();
+        this.#store.savePlanExecutionGraph(graph);
+      }
+    }
     this.#store.requeueTask(taskId, task.status);
     this.#markContinuation(taskId);
     this.#drain();
@@ -4337,6 +5192,9 @@ export class TaskOrchestrator {
   retryTask(taskId: string): boolean {
     const task = this.#store.getTask(taskId);
     if (!task || task.status !== "failed") return false;
+    if (task.kind === "plan-execution" && task.planId) {
+      if (!this.#store.preparePlanDagRetry(task.planId)) return false;
+    }
     this.#store.requeueTask(taskId, "failed");
     this.#markContinuation(taskId);
     this.#drain();
@@ -4539,6 +5397,21 @@ export class TaskOrchestrator {
       toolCalls: active.toolCallCount,
       durationMs: Math.max(0, Date.now() - active.startedAt),
     });
+    const task = this.#store.getTask(active.taskId);
+    if (task?.kind === "plan-step" && task.planId) {
+      const graph = this.#store.refreshPlanDagUsage(task.planId);
+      if (graph?.usage.exceeded) {
+        for (const candidate of this.#active.values()) {
+          const candidateTask = this.#store.getTask(candidate.taskId);
+          if (candidateTask?.kind !== "plan-step" || candidateTask.planId !== task.planId) {
+            continue;
+          }
+          candidate.budgetExceeded = "Plan 已达到硬预算上限";
+          candidate.controller.abort();
+          void candidate.handle?.cancel().catch(() => undefined);
+        }
+      }
+    }
     if (!usage?.exceeded || active.budgetExceeded) return;
     active.budgetExceeded = "Worker 已达到硬预算上限";
     active.controller.abort();
@@ -4555,6 +5428,7 @@ export class TaskOrchestrator {
       "task.failed",
       "task.cancelled",
       "task.interrupted",
+      "task.paused",
     ].includes(event.type)) return;
     const task = this.#store.getTask(event.taskId);
     if (task?.kind !== "worker") return;
@@ -4568,8 +5442,313 @@ export class TaskOrchestrator {
     this.#drain();
   }
 
+  #handleDagTaskEvent(event: TaskEvent): void {
+    if (![
+      "task.started",
+      "task.succeeded",
+      "task.failed",
+      "task.cancelled",
+      "task.interrupted",
+    ].includes(event.type)) return;
+    const task = this.#store.getTask(event.taskId);
+    if (task?.kind !== "plan-step" || !task.planId) return;
+    if (event.type === "task.started") {
+      this.#store.syncPlanDagNode(task.id, "running", {
+        ...(event.runId ? { runId: event.runId } : {}),
+      });
+      return;
+    }
+    const detail = this.#store.getTaskDetail(task.id);
+    const latestRun = detail?.runs.at(-1);
+    const error = latestRun?.error;
+    if (event.type === "task.failed") {
+      const failureClass = latestRun?.failureClass
+        ?? classifyExecutionFailure(error ?? "unknown");
+      if (event.runId && !latestRun?.failureClass) {
+        const detail = classifyExecutionFailureDetail(error ?? "unknown");
+        this.#store.setRunFailureDetail(event.runId, failureClass, {
+          source: detail.source,
+          ...(detail.code ? { code: detail.code } : {}),
+          ...(detail.status ? { status: detail.status } : {}),
+          ...(detail.errorName ? { errorName: detail.errorName } : {}),
+          retriable: detail.retriable,
+        });
+      }
+      const graph = this.#store.getPlanExecutionGraph(task.planId);
+      const node = graph?.nodes.find((candidate) => candidate.taskId === task.id);
+      const root = graph ? this.#store.getTask(graph.rootTaskId) : undefined;
+      const rootExecution = root ? this.#store.getExecution(root.id) : undefined;
+      const candidates = node
+        ? rootExecution?.dagModelRoutes?.[node.profile] ?? []
+        : [];
+      if (
+        graph
+        && node
+        && canFallbackFailure(failureClass)
+        && (node.routeCandidateIndex ?? 0) < Math.min(2, candidates.length - 1)
+      ) {
+        const route = selectModelRoute({
+          candidates,
+          usage: graph.usage,
+          budget: graph.budget,
+          reserved: graph.reserved,
+          risk: node.risk,
+          profile: node.profile,
+          ...(node.routeCandidateIndex === undefined
+            ? {}
+            : { previousCandidateIndex: node.routeCandidateIndex }),
+          fallback: true,
+        });
+        const execution = this.#store.getExecution(task.id);
+        this.#store.updateExecution(task.id, {
+          ...execution,
+          ...(route.model ? { requestedModel: route.model } : {}),
+          routeCandidateIndex: route.candidateIndex,
+          routeReason: route.reason,
+          budgetTier: route.budgetTier,
+          outputTokenScale: route.outputScale,
+          lowerThinking: route.lowerThinking,
+        });
+        node.status = "ready";
+        node.failureClass = failureClass;
+        node.reason = error;
+        node.routeCandidateIndex = route.candidateIndex;
+        node.routeReason = route.reason;
+        node.budgetTier = route.budgetTier;
+        node.attempt += 1;
+        node.updatedAt = new Date().toISOString();
+        graph.updatedAt = node.updatedAt;
+        this.#store.savePlanExecutionGraph(graph);
+        this.#store.requeueTask(task.id, "failed");
+        this.#drain();
+        return;
+      }
+      this.#store.syncPlanDagNode(task.id, "failed", {
+        ...(event.runId ? { runId: event.runId } : {}),
+        ...(error ? { reason: error } : {}),
+        failureClass,
+      });
+    } else {
+      const graph = this.#store.getPlanExecutionGraph(task.planId);
+      const node = graph?.nodes.find((candidate) => candidate.taskId === task.id);
+      const reviewVerdict = node?.syntheticKind === "reviewer"
+        ? detail?.workerResult?.review?.verdict
+        : undefined;
+      const status = event.type === "task.succeeded" && reviewVerdict
+        && reviewVerdict !== "approved"
+        ? "failed"
+        : event.type === "task.succeeded"
+        ? "succeeded"
+        : event.type === "task.cancelled" ? "cancelled" : "interrupted";
+      this.#store.syncPlanDagNode(task.id, status, {
+        ...(event.runId ? { runId: event.runId } : {}),
+        ...(status === "failed"
+          ? {
+              reason: `Reviewer verdict: ${reviewVerdict}`,
+              failureClass: "review" as const,
+            }
+          : {}),
+        ...(latestRun?.resultSummary
+          ? { summary: latestRun.resultSummary }
+          : {}),
+      });
+      if (
+        status === "succeeded"
+        && node?.syntheticKind === "reviewer"
+        && reviewVerdict === "approved"
+      ) {
+        this.#awaitSingleCommitApply(task.planId, node.sourceStepId);
+      }
+      if (status === "succeeded" && node?.syntheticKind === "integrator") {
+        this.#awaitIntegratedApply(task.planId);
+      }
+    }
+    this.#settleDagRoot(task.planId);
+    this.#drain();
+  }
+
+  #settleDagRoot(planId: string): void {
+    const graph = this.#store.getPlanExecutionGraph(planId);
+    if (!graph) return;
+    const root = this.#store.getTask(graph.rootTaskId);
+    if (!root?.currentRunId || root.status !== "running") return;
+    if (graph.status === "completed") {
+      this.#store.finishRun(root.id, root.currentRunId, "succeeded", undefined, "DAG 执行完成");
+      return;
+    }
+    const unfinishedActive = graph.nodes.some((node) =>
+      node.status === "pending"
+      || node.status === "ready"
+      || node.status === "running"
+      || node.status === "interrupted"
+    );
+    if (graph.status === "blocked" && !unfinishedActive) {
+      this.#store.finishRun(
+        root.id,
+        root.currentRunId,
+        "failed",
+        "Plan DAG 已阻塞",
+        "独立分支已完成，后继节点因失败而阻塞",
+      );
+    }
+  }
+
+  #awaitSingleCommitApply(planId: string, sourceStepId: string | undefined): void {
+    if (!sourceStepId) return;
+    const graph = this.#store.getPlanExecutionGraph(planId);
+    if (
+      !graph
+      || graph.nodes.some((node) => node.syntheticKind === "integrator")
+    ) return;
+    const primary = graph.nodes.find((node) =>
+      node.sourceStepId === sourceStepId
+      && node.profile === "implementer"
+      && !node.syntheticKind
+    );
+    const implementation = primary?.taskId
+      ? this.#store.getImplementationResult(primary.taskId)
+      : undefined;
+    const root = this.#store.getTask(graph.rootTaskId);
+    if (
+      !implementation?.commit
+      || !implementation.patchArtifactId
+      || !root?.currentRunId
+      || root.status !== "running"
+    ) return;
+    const integration = this.#store.createIntegration({
+      rootTaskId: root.rootTaskId,
+      taskId: root.id,
+      baselineCommit: implementation.baselineCommit,
+      predictedOverlaps: [],
+      workerTaskIds: [primary!.taskId!],
+      validationTargets: primary!.validationTargets,
+    });
+    this.#store.updateIntegration(integration.id, {
+      status: "awaiting_apply",
+      integrationCommit: implementation.commit,
+      patchArtifactId: implementation.patchArtifactId,
+      diffArtifactId: implementation.patchArtifactId,
+      validationArtifactIds: implementation.validationArtifactIds,
+      cleanupStatus: "cleaned",
+    });
+    this.#store.setIntegrationAwaitingApply(
+      root.id,
+      root.currentRunId,
+      randomUUID(),
+      {
+        integrationId: integration.id,
+        patchArtifactId: implementation.patchArtifactId,
+        diffArtifactId: implementation.patchArtifactId,
+        baselineCommit: implementation.baselineCommit,
+        integrationCommit: implementation.commit,
+        changedFiles: implementation.changedFiles,
+      },
+    );
+  }
+
+  #awaitIntegratedApply(planId: string): void {
+    const graph = this.#store.getPlanExecutionGraph(planId);
+    const root = graph ? this.#store.getTask(graph.rootTaskId) : undefined;
+    const integration = root ? this.#store.getIntegrationForTask(root.id) : undefined;
+    if (
+      !graph
+      || graph.status !== "completed"
+      || !root?.currentRunId
+      || root.status !== "running"
+      || !integration?.integrationCommit
+      || !integration.patchArtifactId
+      || !integration.diffArtifactId
+    ) return;
+    this.#store.setIntegrationAwaitingApply(
+      root.id,
+      root.currentRunId,
+      randomUUID(),
+      {
+        integrationId: integration.id,
+        patchArtifactId: integration.patchArtifactId,
+        diffArtifactId: integration.diffArtifactId,
+        baselineCommit: integration.baselineCommit,
+        integrationCommit: integration.integrationCommit,
+        changedFiles: integration.actualOverlaps,
+      },
+    );
+  }
+
+  #drainDagExecutions(): void {
+    const queuedRoots = this.#store.listQueuedTasks().filter((task) =>
+      task.kind === "plan-execution"
+      && task.planId
+      && this.#store.getPlanExecutionGraph(task.planId)
+    );
+    for (const root of queuedRoots) {
+      if (!this.#isWorkspaceAvailable(root) || !this.#store.isPlanExecutionApproved(root)) continue;
+      this.#store.startPlanDagExecution(root.id);
+    }
+    const runningRoots = this.#store.listTaskSummaries({
+      statuses: ["running"],
+      limit: 500,
+    }).map((summary) => summary.task).filter((task) =>
+      task.kind === "plan-execution"
+      && task.planId
+      && this.#store.getPlanExecutionGraph(task.planId)
+    );
+    for (const root of runningRoots) {
+      const graph = this.#store.refreshPlanDagUsage(root.planId!);
+      if (!graph || graph.status === "blocked" || graph.status === "completed") {
+        this.#settleDagRoot(root.planId!);
+        continue;
+      }
+      const activeNodes = graph.nodes.filter((node) =>
+        node.status === "running" || (node.status === "ready" && node.taskId)
+      ).length;
+      const capacity = Math.max(
+        0,
+        Math.min(
+          graph.budget.maxConcurrentSteps - activeNodes,
+          this.#concurrency - this.#heldSlots(),
+        ),
+      );
+      if (capacity <= 0) continue;
+      const rootExecution = this.#store.getExecution(root.id);
+      for (const node of computeRunnableNodes(graph, capacity)) {
+        if (node.taskId) continue;
+        const candidates = rootExecution.dagModelRoutes?.[node.profile] ?? [];
+        const route = selectModelRoute({
+          candidates,
+          usage: graph.usage,
+          budget: graph.budget,
+          reserved: graph.reserved,
+          risk: node.risk,
+          profile: node.profile,
+        });
+        const reservation = this.#store.reservePlanDagNode(
+          root.planId!,
+          node.id,
+          route.outputScale,
+        );
+        if (reservation === "waiting") break;
+        if (reservation === "blocked") {
+          this.#settleDagRoot(root.planId!);
+          break;
+        }
+        try {
+          this.#store.createPlanNodeTask(
+            root.id,
+            root.currentRunId!,
+            node.id,
+            route,
+          );
+        } catch (error) {
+          this.#store.releasePlanDagNodeReservation(root.planId!, node.id);
+          throw error;
+        }
+      }
+    }
+  }
+
   #drain(): void {
     if (!this.#started || this.#paused || this.#disposed) return;
+    this.#drainDagExecutions();
     while (this.#heldSlots() < this.#concurrency && this.#workerReady.length) {
       const waiter = this.#workerReady.shift()!;
       const active = this.#active.get(waiter.parentTaskId);
@@ -4610,6 +5789,11 @@ export class TaskOrchestrator {
       if (available <= 0) break;
       if (
         this.#active.has(task.id)
+        || (
+          task.kind === "plan-execution"
+          && task.planId
+          && Boolean(this.#store.getPlanExecutionGraph(task.planId))
+        )
         || !this.#isWorkspaceAvailable(task)
         || !this.#store.isPlanExecutionApproved(task)
       ) continue;
@@ -4648,10 +5832,11 @@ export class TaskOrchestrator {
     run: RunRecord,
   ): Promise<void> {
     try {
+      const execution = this.#store.getExecution(task.id);
       const handle = await this.#executor({
         task,
         run,
-        execution: this.#store.getExecution(task.id),
+        execution,
         signal: active.controller.signal,
       });
       active.handle = handle;
@@ -4659,9 +5844,16 @@ export class TaskOrchestrator {
         sessionId: handle.sessionId,
         ...(handle.modelProvider ? { modelProvider: handle.modelProvider } : {}),
         ...(handle.modelId ? { modelId: handle.modelId } : {}),
+        ...(execution.routeCandidateIndex === undefined
+          ? {}
+          : { routeCandidateIndex: execution.routeCandidateIndex }),
+        ...(execution.routeReason ? { routeReason: execution.routeReason } : {}),
+        ...(execution.budgetTier ? { budgetTier: execution.budgetTier } : {}),
       });
       const workerBudget = task.kind === "worker"
         ? this.#store.getTaskBudget(task.id)?.budget
+        : task.kind === "plan-step"
+          ? execution.workerContext?.budget
         : undefined;
       if (workerBudget) {
         active.budgetTimer = setTimeout(() => {
@@ -4698,8 +5890,18 @@ export class TaskOrchestrator {
         if (task.kind === "planning" && !this.#store.getPlanForPlanningTask(task.id)) {
           throw new Error("Planning Task 未提交结构化计划");
         }
-        if (task.kind === "worker" && !this.#store.getWorkerResult(task.id, run.id)) {
+        if (
+          (task.kind === "worker" || task.kind === "plan-step")
+          && !this.#store.getWorkerResult(task.id, run.id)
+        ) {
           throw new Error("Worker 未提交结构化结果");
+        }
+        if (
+          task.kind === "plan-step"
+          && task.assignedProfile === "reviewer"
+          && !this.#store.getWorkerResult(task.id, run.id)?.review
+        ) {
+          throw new Error("Reviewer 未提交结构化审查结论");
         }
         if (active.budgetExceeded) throw new Error(active.budgetExceeded);
         this.#store.finishRun(
@@ -4725,6 +5927,17 @@ export class TaskOrchestrator {
         ) {
           this.#store.updateExecution(task.id, active.handle.captureContext());
         }
+        const effectiveError = active.budgetExceeded ?? error;
+        if (!active.cancelRequested && !active.interruptRequested) {
+          const detail = classifyExecutionFailureDetail(effectiveError);
+          this.#store.setRunFailureDetail(run.id, detail.failureClass, {
+            source: detail.source,
+            ...(detail.code ? { code: detail.code } : {}),
+            ...(detail.status ? { status: detail.status } : {}),
+            ...(detail.errorName ? { errorName: detail.errorName } : {}),
+            retriable: detail.retriable,
+          });
+        }
         this.#store.finishRun(
           task.id,
           run.id,
@@ -4735,7 +5948,7 @@ export class TaskOrchestrator {
               : "failed",
           active.cancelRequested || active.interruptRequested
             ? undefined
-            : active.budgetExceeded ?? formatError(error),
+            : formatError(effectiveError),
           summarize(active.summary),
         );
       }
@@ -4839,6 +6052,15 @@ function rowToRun(row: RunRow): RunRecord {
     runnerId: row.runner_id,
     ...(row.model_provider ? { modelProvider: row.model_provider } : {}),
     ...(row.model_id ? { modelId: row.model_id } : {}),
+    ...(row.route_candidate_index === null
+      ? {}
+      : { routeCandidateIndex: row.route_candidate_index }),
+    ...(row.route_reason ? { routeReason: row.route_reason } : {}),
+    ...(row.budget_tier ? { budgetTier: row.budget_tier } : {}),
+    ...(row.failure_class ? { failureClass: row.failure_class } : {}),
+    ...(row.failure_detail_json
+      ? { failureDetail: JSON.parse(row.failure_detail_json) }
+      : {}),
     ...(row.started_at ? { startedAt: row.started_at } : {}),
     ...(row.finished_at ? { finishedAt: row.finished_at } : {}),
     ...(row.error ? { error: row.error } : {}),
@@ -5031,6 +6253,78 @@ function workerProfileLabel(profile: WorkerProfileId): string {
   if (profile === "reviewer") return "Reviewer";
   if (profile === "implementer") return "Implementer";
   return "Integrator";
+}
+
+function renderDagNodeGoal(node: PlanExecutionNode): string {
+  const lines = [
+    node.title,
+    `Profile: ${node.profile}`,
+    `Risk: ${node.risk}`,
+  ];
+  if (node.syntheticKind === "reviewer") {
+    lines.push(
+      "审查对应 Implementer 的 Patch、验证结果、范围边界和回归风险。",
+      "结论必须明确为 approved、changes_requested 或 blocked，并给出证据。",
+    );
+  } else if (node.syntheticKind === "integrator") {
+    lines.push(
+      "审查同一写入 wave 的提交能否安全集成；不得绕过冲突、范围或验证关卡。",
+    );
+  }
+  if (node.writeSet.length) {
+    lines.push(`Write set: ${node.writeSet.map((entry) => entry.path).join(", ")}`);
+  }
+  if (node.validationTargets.length) {
+    lines.push(
+      `Validation: ${node.validationTargets.map((target) =>
+        `${target.cwd ?? "."}:${target.script}`).join(", ")}`,
+    );
+  }
+  return lines.join("\n");
+}
+
+function dagNodeReservation(
+  graph: PlanExecutionGraph,
+  outputScale: 1 | 0.75 | 0.5,
+): PlanBudgetReservation {
+  const count = Math.max(1, graph.nodes.length);
+  return {
+    durationMs: Math.max(10_000, Math.floor(graph.budget.maxDurationMs / count)),
+    inputTokens: Math.max(1_000, Math.floor(graph.budget.maxInputTokens / count)),
+    outputTokens: Math.max(
+      256,
+      Math.floor((graph.budget.maxOutputTokens / count) * outputScale),
+    ),
+    toolCalls: Math.max(1, Math.floor(graph.budget.maxToolCalls / count)),
+  };
+}
+
+function dagReservationFits(
+  graph: PlanExecutionGraph,
+  reservation: PlanBudgetReservation,
+): boolean {
+  return graph.usage.durationMs + graph.reserved.durationMs + reservation.durationMs
+      <= graph.budget.maxDurationMs
+    && graph.usage.inputTokens + graph.reserved.inputTokens + reservation.inputTokens
+      <= graph.budget.maxInputTokens
+    && graph.usage.outputTokens + graph.reserved.outputTokens + reservation.outputTokens
+      <= graph.budget.maxOutputTokens
+    && graph.usage.toolCalls + graph.reserved.toolCalls + reservation.toolCalls
+      <= graph.budget.maxToolCalls;
+}
+
+function dagBudgetExceeded(graph: PlanExecutionGraph): boolean {
+  return graph.usage.durationMs >= graph.budget.maxDurationMs
+    || graph.usage.inputTokens >= graph.budget.maxInputTokens
+    || graph.usage.outputTokens >= graph.budget.maxOutputTokens
+    || graph.usage.toolCalls >= graph.budget.maxToolCalls;
+}
+
+function hasActiveDagReservations(graph: PlanExecutionGraph): boolean {
+  return graph.nodes.some((node) =>
+    node.reservation
+    && (node.status === "ready" || node.status === "running")
+  );
 }
 
 function formatError(error: unknown): string {

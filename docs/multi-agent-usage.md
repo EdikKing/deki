@@ -25,11 +25,22 @@ Deki 当前已经实现第一阶段的“只读主从式多 Agent”：
 | Tester | 分析测试，并在临时工作区副本中运行受控验证 | 只读工具 + 受控 `test`/`lint`/`typecheck` |
 | Reviewer | 审查实现、安全性、边界条件和回归风险 | 只读文件与搜索工具 |
 
-以下能力仍属于后续规划，当前不能依赖：
+以下能力默认仍关闭；启用“实验性 Plan DAG”后可在批准的结构化 Plan 中使用：
 
 - Implementer Worker 在独立 worktree 中修改代码。
-- 多个写入 Agent 并行实现。
-- Integrator 自动合并 Patch、处理冲突和应用结果。
+- 写集不重叠的 Plan Step 并行实现。
+- Reviewer 自动审查写入结果，多个并行 Commit 由 Integrator 生成集成产物。
+
+不安全冲突、Reviewer 拒绝和最终应用仍会阻塞或等待用户处理，不会因实验开关而绕过质量关卡。
+
+DAG 调度会在派发前持久化 Token、运行时间和 Tool Call 预留。模型路由使用“已结算用量
++ 活动预留”计算 70%/90% 档位；应用重启后，遗留 Run 会标记为 interrupted，释放旧预留，
+并只重新排队未完成节点。
+
+Provider 的超时、限流、5xx、连接失败、模型不可用、能力不匹配和上下文溢出可以切换到
+后续候选模型。权限拒绝、Tool 失败、验证失败、范围越界、Reviewer 拒绝、预算耗尽和
+不安全集成冲突不会触发模型回退。具体分类、候选序号和路由原因可在 Task Center 的 Run
+记录中审计。
 - Worker 递归创建更多 Worker。
 - 桌面应用退出后由独立 daemon 继续运行。
 

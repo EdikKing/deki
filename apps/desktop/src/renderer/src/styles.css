@@ -3650,6 +3650,11 @@ html[data-theme="light"] .settings-error {
   color: var(--accent);
 }
 
+.plan-status.blocked {
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+}
+
 .plan-progress {
   color: var(--text-muted);
   font-size: 12px;
@@ -3709,6 +3714,35 @@ html[data-theme="light"] .settings-error {
 
 .plan-step.blocked {
   border-color: var(--danger);
+}
+
+.plan-step-row {
+  display: flex;
+  gap: 8px;
+  padding: 7px 8px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--bg-elevated);
+}
+
+.plan-step-row.running {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+}
+
+.plan-step-row.failed,
+.plan-step-row.blocked {
+  border-color: var(--danger);
+}
+
+.plan-step-index {
+  color: var(--accent);
+  font-weight: 750;
+}
+
+.plan-step-content {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
 }
 
 .plan-step summary {

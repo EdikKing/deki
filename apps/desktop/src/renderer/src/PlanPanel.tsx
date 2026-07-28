@@ -174,6 +174,66 @@ export function PlanPanel(props: PlanPanelProps) {
               />
             ))}
           </div>
+          {detail.executionGraph && (
+            <details className="plan-context" open>
+              <summary>
+                {zh ? "DAG 执行图" : "DAG execution graph"}
+                {" · "}{detail.executionGraph.nodes.filter((node) =>
+                  node.status === "succeeded").length}/{detail.executionGraph.nodes.length}
+              </summary>
+              <p>
+                {zh ? "预算" : "Budget"}:{" "}
+                {detail.executionGraph.usage.inputTokens}
+                +{detail.executionGraph.reserved.inputTokens}
+                /{detail.executionGraph.budget.maxInputTokens} in ·{" "}
+                {detail.executionGraph.usage.outputTokens}
+                +{detail.executionGraph.reserved.outputTokens}
+                /{detail.executionGraph.budget.maxOutputTokens} out ·{" "}
+                {detail.executionGraph.usage.toolCalls}
+                +{detail.executionGraph.reserved.toolCalls}
+                /{detail.executionGraph.budget.maxToolCalls} tools
+              </p>
+              {detail.executionGraph.blockedReason && (
+                <p className="error">
+                  {zh ? "阻塞原因" : "Blocked by"}: {detail.executionGraph.blockedReason}
+                </p>
+              )}
+              <div className="plan-step-list">
+                {detail.executionGraph.nodes.map((node) => (
+                  <div className={`plan-step-row ${node.status}`} key={node.id}>
+                    <div className="plan-step-index">
+                      {node.syntheticKind === "reviewer"
+                        ? "R"
+                        : node.syntheticKind === "integrator" ? "I" : "•"}
+                    </div>
+                    <div className="plan-step-content">
+                      <strong>{node.title}</strong>
+                      <small>
+                        {node.profile} · {node.status} · {node.budgetTier ?? "normal"}
+                        {node.attempt > 0 ? ` · #${node.attempt}` : ""}
+                      </small>
+                      {(node.modelProvider || node.modelId) && (
+                        <small>{[node.modelProvider, node.modelId].filter(Boolean).join("/")}</small>
+                      )}
+                      {node.routeReason && <small>{node.routeReason}</small>}
+                      {node.reservation && (
+                        <small>
+                          {zh ? "预留" : "Reserved"}: {node.reservation.inputTokens} in ·{" "}
+                          {node.reservation.outputTokens} out · {node.reservation.toolCalls} tools
+                        </small>
+                      )}
+                      {node.dependencies.length > 0 && (
+                        <small>{zh ? "依赖" : "Depends on"}: {node.dependencies
+                          .map((id) => detail.executionGraph!.nodes.find((item) =>
+                            item.id === id)?.title ?? id.slice(0, 8)).join(", ")}</small>
+                      )}
+                      {node.reason && <small className="error">{node.reason}</small>}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </details>
+          )}
         </>
       )}
 
@@ -208,6 +268,7 @@ export function PlanPanel(props: PlanPanelProps) {
           </button>
         )}
         {(detail.plan.status === "executing"
+          || detail.plan.status === "blocked"
           || (detail.plan.status === "approved"
             && detail.executionTask
             && ["paused", "interrupted", "failed"].includes(detail.executionTask.status))
@@ -458,6 +519,7 @@ function planStatusLabel(status: PlanDetail["plan"]["status"], zh: boolean): str
     ready: ["待审阅", "Ready"],
     approved: ["已批准", "Approved"],
     executing: ["执行中", "Executing"],
+    blocked: ["已阻塞", "Blocked"],
     completed: ["已完成", "Completed"],
     abandoned: ["已放弃", "Abandoned"],
   } as const;

@@ -593,6 +593,26 @@ export function TaskCenter(props: TaskCenterProps) {
                         <strong>Attempt {run.attempt}</strong>
                         <span>{run.status}</span>
                         <time>{formatDuration(run.startedAt, run.finishedAt, props.zh)}</time>
+                        {(run.modelProvider || run.modelId) && (
+                          <p>{[run.modelProvider, run.modelId].filter(Boolean).join("/")}</p>
+                        )}
+                        {run.routeReason && (
+                          <p>
+                            {props.zh ? "路由：" : "Route: "}
+                            {run.routeReason}
+                            {run.routeCandidateIndex === undefined
+                              ? ""
+                              : ` · #${run.routeCandidateIndex + 1}`}
+                          </p>
+                        )}
+                        {run.failureClass && (
+                          <p className="error">
+                            {props.zh ? "失败分类：" : "Failure: "}
+                            {run.failureClass}
+                            {run.failureDetail?.code ? ` · ${run.failureDetail.code}` : ""}
+                            {run.failureDetail?.status ? ` · HTTP ${run.failureDetail.status}` : ""}
+                          </p>
+                        )}
                         {run.error && <p className="error">{run.error}</p>}
                         {run.resultSummary && (
                           <div className="task-result markdown-body">
@@ -783,6 +803,7 @@ function taskKindLabel(kind: TaskDetail["task"]["kind"], zh: boolean): string {
     worker: zh ? "Worker" : "Worker",
     planning: zh ? "规划" : "Planning",
     "plan-execution": zh ? "计划执行" : "Plan execution",
+    "plan-step": zh ? "计划步骤" : "Plan step",
     integration: zh ? "集成" : "Integration",
   };
   return labels[kind];

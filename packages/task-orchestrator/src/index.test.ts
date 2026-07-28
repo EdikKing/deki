@@ -94,7 +94,7 @@ describe("TaskStore", () => {
 
     const verified = new DatabaseSync(databasePath);
     expect((verified.prepare("PRAGMA user_version").get() as { user_version: number }).user_version)
-      .toBe(6);
+      .toBe(7);
     const taskColumns = verified.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
     const planColumns = verified.prepare("PRAGMA table_info(plans)").all() as Array<{ name: string }>;
     const tables = verified.prepare(`
@@ -142,10 +142,15 @@ describe("TaskStore", () => {
 
     const verified = new DatabaseSync(databasePath);
     expect((verified.prepare("PRAGMA user_version").get() as { user_version: number }).user_version)
-      .toBe(6);
+      .toBe(7);
     expect(verified.prepare(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'plans'",
     ).get()).toBeTruthy();
+    expect(verified.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'plan_execution_graphs'",
+    ).get()).toBeTruthy();
+    const runColumns = verified.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>;
+    expect(runColumns.map((column) => column.name)).toContain("failure_detail_json");
     verified.close();
   });
 
@@ -953,6 +958,99 @@ describe("TaskOrchestrator", () => {
       task: { id: task.id, status: "queued" },
       runnable: false,
       attentionReason: "workspace_missing",
+    });
+    await orchestrator.dispose();
+  });
+
+  it("runs independent DAG steps in parallel without consuming a root agent slot", async () => {
+    const store = await createStore();
+    const planning = store.createTask({
+      workspaceId: "workspace-a",
+      workspacePath: "/tmp/workspace-a",
+      kind: "planning",
+      title: "plan",
+      goal: "parallel plan",
+      execution: { ...promptExecution(), interactionMode: "plan" },
+    });
+    const steps = ["left", "right"].map((id) => ({
+      id,
+      title: id,
+      description: id,
+      dependencies: [],
+      candidateFiles: [],
+      validation: ["result submitted"],
+      risk: "low" as const,
+      parallelizable: true,
+      executionProfile: "explorer" as const,
+    }));
+    const plan = store.createPlan({
+      workspaceId: "workspace-a",
+      workspacePath: "/tmp/workspace-a",
+      sessionId: "plan-session",
+      planningTaskId: planning.id,
+      goal: "parallel plan",
+      assumptions: [],
+      constraints: [],
+      steps,
+    });
+    succeedPlanningTask(store, planning.id);
+    const root = store.approvePlan(plan.id, 1, {
+      title: "execute dag",
+      execution: {
+        ...promptExecution(true),
+        interactionMode: "plan-execution",
+        planId: plan.id,
+        planRevision: 1,
+        dagModelRoutes: {
+          coordinator: [],
+          explorer: ["test/quality", "test/economy"],
+          implementer: [],
+          tester: [],
+          reviewer: [],
+          integrator: [],
+        },
+      },
+      dag: {
+        budget: {
+          maxConcurrentSteps: 2,
+          maxDurationMs: 60_000,
+          maxInputTokens: 10_000,
+          maxOutputTokens: 2_000,
+          maxToolCalls: 20,
+        },
+      },
+    });
+    const handles: Array<ReturnType<typeof deferredHandle>> = [];
+    const orchestrator = new TaskOrchestrator({
+      store,
+      concurrency: 2,
+      executor: async ({ task, run }) => {
+        expect(task.kind).toBe("plan-step");
+        store.saveWorkerResult(task.id, run.id, workerResult(`${task.title} done`));
+        const handle = deferredHandle(`session-${task.title}`);
+        handles.push(handle);
+        return handle;
+      },
+    });
+    orchestrator.start();
+    await settle();
+    expect(handles).toHaveLength(2);
+    expect(store.getTask(root.id)?.status).toBe("running");
+    expect(store.getPlanExecutionGraph(plan.id)?.nodes.filter((node) =>
+      node.status === "running")).toHaveLength(2);
+    expect(store.getPlanExecutionGraph(plan.id)?.nodes.every((node) =>
+      node.reservation !== undefined)).toBe(true);
+    expect(store.getPlanExecutionGraph(plan.id)?.reserved.inputTokens).toBeGreaterThan(0);
+    handles.forEach((handle) => handle.resolve());
+    await settle();
+    await settle();
+    expect(store.getTask(root.id)?.status).toBe("succeeded");
+    expect(store.getPlan(plan.id)?.plan.status).toBe("completed");
+    expect(store.getPlanExecutionGraph(plan.id)?.reserved).toEqual({
+      durationMs: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      toolCalls: 0,
     });
     await orchestrator.dispose();
   });

@@ -824,6 +824,21 @@ function AgentSettings({ value, source, zh, update, providers }: SettingsCompone
     value: `${provider.id}/${model.id}`,
     label: `${model.name ?? model.id} · ${provider.name ?? provider.id}`,
   })));
+  const routeProfiles = [
+    "coordinator", "explorer", "implementer", "tester", "reviewer", "integrator",
+  ] as const;
+  const updateRoute = (
+    profile: typeof routeProfiles[number],
+    index: number,
+    model: string,
+  ) => {
+    const next = structuredClone(value.agent.planModelRoutes);
+    const route = [...next[profile]];
+    if (model) route[index] = model;
+    else route.splice(index, 1);
+    next[profile] = route.filter(Boolean).slice(0, 3);
+    return update({ agent: { planModelRoutes: next } });
+  };
   return <>
     <Toggle title={zh ? "自动命名会话" : "Auto-name sessions"} path="agent.autoNameSessions" checked={value.agent.autoNameSessions} source={source} onChange={(autoNameSessions) => update({ agent: { autoNameSessions } })} />
     <Toggle title={zh ? "上下文压缩" : "Context compaction"} path="agent.compactionEnabled" checked={value.agent.compactionEnabled} source={source} onChange={(compactionEnabled) => update({ agent: { compactionEnabled } })} />
@@ -835,6 +850,24 @@ function AgentSettings({ value, source, zh, update, providers }: SettingsCompone
     <Range title={zh ? "Worker 输出 Token 上限" : "Worker output token limit"} path="agent.workerMaxOutputTokens" value={value.agent.workerMaxOutputTokens} min={256} max={262144} step={256} source={source} onChange={(workerMaxOutputTokens) => update({ agent: { workerMaxOutputTokens } })} />
     <Range title={zh ? "Worker Tool 调用上限" : "Worker tool-call limit"} path="agent.workerMaxToolCalls" value={value.agent.workerMaxToolCalls} min={1} max={1000} source={source} onChange={(workerMaxToolCalls) => update({ agent: { workerMaxToolCalls } })} />
     <Setting title={zh ? "Worker 模型" : "Worker model"} source={source("agent.workerModel")}><select value={value.agent.workerModel} onChange={(event) => void update({ agent: { workerModel: event.target.value } })}><option value="">{zh ? "继承主 Agent" : "Inherit main agent"}</option>{modelOptions.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select></Setting>
+    <Toggle title={zh ? "实验性 Plan DAG" : "Experimental Plan DAG"} description={zh ? "批准后由持久化 DAG 自动并行调度，并插入 Reviewer/Integrator。" : "Compile approved Plans into a persistent parallel DAG with Reviewer/Integrator gates."} path="agent.dagExecutionEnabled" checked={value.agent.dagExecutionEnabled} source={source} onChange={(dagExecutionEnabled) => update({ agent: { dagExecutionEnabled } })} />
+    {value.agent.dagExecutionEnabled && <>
+      <Range title={zh ? "Plan 最大并发步骤" : "Maximum parallel Plan steps"} path="agent.planMaxConcurrentSteps" value={value.agent.planMaxConcurrentSteps} min={1} max={8} source={source} onChange={(planMaxConcurrentSteps) => update({ agent: { planMaxConcurrentSteps } })} />
+      <Range title={zh ? "Plan 时长预算（秒）" : "Plan duration budget (seconds)"} path="agent.planMaxDurationMs" value={Math.round(value.agent.planMaxDurationMs / 1000)} min={10} max={86400} step={10} source={source} onChange={(seconds) => update({ agent: { planMaxDurationMs: seconds * 1000 } })} />
+      <Range title={zh ? "Plan 输入 Token 预算" : "Plan input token budget"} path="agent.planMaxInputTokens" value={value.agent.planMaxInputTokens} min={1000} max={100000000} step={1000} source={source} onChange={(planMaxInputTokens) => update({ agent: { planMaxInputTokens } })} />
+      <Range title={zh ? "Plan 输出 Token 预算" : "Plan output token budget"} path="agent.planMaxOutputTokens" value={value.agent.planMaxOutputTokens} min={256} max={10000000} step={256} source={source} onChange={(planMaxOutputTokens) => update({ agent: { planMaxOutputTokens } })} />
+      <Range title={zh ? "Plan Tool 调用预算" : "Plan tool-call budget"} path="agent.planMaxToolCalls" value={value.agent.planMaxToolCalls} min={1} max={100000} source={source} onChange={(planMaxToolCalls) => update({ agent: { planMaxToolCalls } })} />
+      {routeProfiles.map((profile) => <Setting
+        key={profile}
+        title={`${profile[0]!.toUpperCase()}${profile.slice(1)} ${zh ? "模型链" : "model route"}`}
+        description={zh ? "从高质量到经济型；空项继承 Worker/项目模型。" : "Quality to economy; empty entries inherit the worker/project model."}
+        source={source(`agent.planModelRoutes.${profile}`)}
+      ><div className="button-group">{[0, 1, 2].map((index) => <select
+        key={index}
+        value={value.agent.planModelRoutes[profile][index] ?? ""}
+        onChange={(event) => void updateRoute(profile, index, event.target.value)}
+      ><option value="">{index === 0 ? (zh ? "继承" : "Inherit") : "—"}</option>{modelOptions.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select>)}</div></Setting>)}
+    </>}
     <Toggle title={zh ? "显示思考摘要" : "Show thinking summary"} path="agent.showThinkingSummary" checked={value.agent.showThinkingSummary} source={source} onChange={(showThinkingSummary) => update({ agent: { showThinkingSummary } })} />
     <Range title={zh ? "会话保留天数" : "Session retention days"} path="agent.sessionRetentionDays" value={value.agent.sessionRetentionDays} min={1} max={3650} source={source} onChange={(sessionRetentionDays) => update({ agent: { sessionRetentionDays } })} />
   </>;

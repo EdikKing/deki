@@ -156,6 +156,9 @@ export interface AgentPromptContext {
   planRevision?: number;
   workerProfile?: WorkerProfileId;
   workerContext?: import("@deki-ai/shared").WorkerContextPackage;
+  requestedModel?: string;
+  outputTokenScale?: 1 | 0.75 | 0.5;
+  lowerThinking?: boolean;
 }
 
 export interface AgentPromptRunHandle {
@@ -704,6 +707,15 @@ export class DekiAgentRuntime {
         ...(input.context.planRevision
           ? { planRevision: input.context.planRevision }
           : {}),
+        ...(input.context.requestedModel
+          ? { requestedModel: input.context.requestedModel }
+          : {}),
+        ...(input.context.outputTokenScale
+          ? { outputTokenScale: input.context.outputTokenScale }
+          : {}),
+        ...(input.context.lowerThinking === undefined
+          ? {}
+          : { lowerThinking: input.context.lowerThinking }),
       }),
       captureUsage: () => {
         const stats = runtime.session.getSessionStats();
@@ -1210,12 +1222,23 @@ export class DekiAgentRuntime {
         profile: input.context.workerProfile,
         context: input.context.workerContext,
       });
+      sessionManager.appendCustomEntry("deki.model-route", {
+        version: 1,
+        requestedModel: input.context.requestedModel,
+        outputTokenScale: input.context.outputTokenScale ?? 1,
+        lowerThinking: input.context.lowerThinking ?? false,
+      });
       const sourceSession = this.#sessionById(input.context.sourceSessionId);
       const configuredWorkerModel = this.#options.settings.agent.workerModel
         ? this.#models.find((model) =>
           `${model.provider}/${model.id}` === this.#options.settings.agent.workerModel)
         : undefined;
-      const inheritedModel = configuredWorkerModel
+      const requestedModel = input.context.requestedModel
+        ? this.#models.find((model) =>
+            `${model.provider}/${model.id}` === input.context.requestedModel)
+        : undefined;
+      const inheritedModel = requestedModel
+        ?? configuredWorkerModel
         ?? this.#sessionModels.get(input.context.sourceSessionId)
         ?? sourceSession?.model
         ?? this.#selectedModel;
@@ -1223,8 +1246,13 @@ export class DekiAgentRuntime {
         sessionManager.appendModelChange(inheritedModel.provider, inheritedModel.id);
       }
       sessionManager.appendThinkingLevelChange(
-        sourceSession?.thinkingLevel
-          ?? this.#options.settings.models.thinkingLevel,
+        input.context.lowerThinking
+          ? lowerThinkingLevel(
+              sourceSession?.thinkingLevel
+                ?? this.#options.settings.models.thinkingLevel,
+            )
+          : sourceSession?.thinkingLevel
+            ?? this.#options.settings.models.thinkingLevel,
       );
       sessionManager.appendCustomEntry("deki.permission-policies", {
         version: 1,
@@ -1409,11 +1437,28 @@ export class DekiAgentRuntime {
         ? this.#models.find((model) =>
           `${model.provider}/${model.id}` === this.#options.settings.agent.workerModel)
         : undefined;
-      const sessionModel = resolveSessionModel(
+      const baseSessionModel = resolveSessionModel(
         this.#models,
         sessionManager,
         workerModel ?? selectedModel,
       );
+      const route = readModelRoute(sessionManager);
+      const outputScale = route?.outputTokenScale ?? 1;
+      const sessionModel: ModelType = outputScale === 1
+        ? baseSessionModel
+        : {
+            ...baseSessionModel,
+            maxTokens: Math.max(
+              256,
+              Math.floor(
+                Math.min(
+                  baseSessionModel.maxTokens
+                    ?? this.#options.settings.models.maxOutputTokens,
+                  this.#options.settings.models.maxOutputTokens,
+                ) * outputScale,
+              ),
+            ),
+          };
       const contextFiles = this.#projectFeaturesEnabled() && !workerProfile
         ? await loadConfiguredContextFiles(
             cwd,
@@ -2255,9 +2300,42 @@ function readWorkerProfile(
   );
   if (entry?.type !== "custom" || !isRecord(entry.data)) return undefined;
   const profile = entry.data.profile;
-  return profile === "explorer" || profile === "tester" || profile === "reviewer"
+  return profile === "explorer"
+    || profile === "tester"
+    || profile === "reviewer"
+    || profile === "implementer"
+    || profile === "integrator"
     ? profile
     : undefined;
+}
+
+function readModelRoute(
+  manager: Pick<SessionManager, "getBranch">,
+): {
+  outputTokenScale: 1 | 0.75 | 0.5;
+  lowerThinking: boolean;
+} | undefined {
+  const entry = [...manager.getBranch()].reverse().find(
+    (candidate) => candidate.type === "custom"
+      && candidate.customType === "deki.model-route",
+  );
+  if (entry?.type !== "custom" || !isRecord(entry.data)) return undefined;
+  const scale = entry.data.outputTokenScale;
+  if (scale !== 1 && scale !== 0.75 && scale !== 0.5) return undefined;
+  return {
+    outputTokenScale: scale,
+    lowerThinking: entry.data.lowerThinking === true,
+  };
+}
+
+function lowerThinkingLevel(
+  level: DekiSettings["models"]["thinkingLevel"] | "max",
+): DekiSettings["models"]["thinkingLevel"] {
+  if (level === "max") return "high";
+  if (level === "xhigh" || level === "high") return "medium";
+  if (level === "medium") return "low";
+  if (level === "low") return "minimal";
+  return level;
 }
 
 class ProjectInfoProvider implements CapabilityProvider {
@@ -2337,10 +2415,44 @@ class PlanToolsProvider implements CapabilityProvider {
         risk: { type: "string", enum: ["low", "medium", "high"] },
         parallelizable: { type: "boolean" },
         assignedProfile: { type: "string" },
+        executionProfile: {
+          type: "string",
+          enum: ["explorer", "implementer", "tester"],
+        },
+        writeSet: {
+          type: "array",
+          maxItems: 100,
+          items: {
+            type: "object",
+            properties: {
+              path: { type: "string", minLength: 1 },
+              kind: { type: "string", enum: ["file", "directory"] },
+              exclusive: { type: "boolean" },
+            },
+            required: ["path", "kind", "exclusive"],
+            additionalProperties: false,
+          },
+        },
+        validationTargets: {
+          type: "array",
+          maxItems: 30,
+          items: {
+            type: "object",
+            properties: {
+              cwd: { type: "string" },
+              script: {
+                type: "string",
+                pattern: "^(?:test(?::[A-Za-z0-9_.-]+)?|lint|typecheck)$",
+              },
+            },
+            required: ["script"],
+            additionalProperties: false,
+          },
+        },
       },
       required: [
         "id", "title", "description", "dependencies", "candidateFiles",
-        "validation", "risk", "parallelizable",
+        "validation", "risk", "parallelizable", "executionProfile",
       ],
       additionalProperties: false,
     };
@@ -2625,6 +2737,34 @@ class WorkerToolsProvider implements CapabilityProvider {
               type: "array",
               items: { type: "string" },
               maxItems: 100,
+            },
+            review: {
+              type: "object",
+              properties: {
+                verdict: {
+                  type: "string",
+                  enum: ["approved", "changes_requested", "blocked"],
+                },
+                findings: {
+                  type: "array",
+                  maxItems: 100,
+                  items: {
+                    type: "object",
+                    properties: {
+                      severity: {
+                        type: "string",
+                        enum: ["low", "medium", "high", "critical"],
+                      },
+                      summary: { type: "string", minLength: 1, maxLength: 5_000 },
+                      evidence: { type: "array", items: evidenceSchema, maxItems: 30 },
+                    },
+                    required: ["severity", "summary", "evidence"],
+                    additionalProperties: false,
+                  },
+                },
+              },
+              required: ["verdict", "findings"],
+              additionalProperties: false,
             },
           },
           required: [

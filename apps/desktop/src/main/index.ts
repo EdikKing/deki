@@ -41,6 +41,7 @@ import {
   scheduleWriteWaves,
   validateWriteSet,
   writeSetsOverlap,
+  type ConflictInspection,
   type WorktreeResource,
 } from "@deki-ai/runner";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
@@ -491,6 +492,7 @@ class DesktopController {
         return { ok: false, error: "规划任务尚未成功完成，不能批准计划" };
       }
       const context = await this.#resolvePlanCheckpoint(detail, true);
+      const agentSettings = this.#settings.snapshot().effective.agent;
       taskStore!.approvePlan(planId, revision, {
         title: `执行计划：${createTaskTitle(detail.plan.goal)}`,
         execution: {
@@ -505,7 +507,23 @@ class DesktopController {
           planId,
           planRevision: revision,
           deliveryMode: "background",
+          ...(agentSettings.dagExecutionEnabled
+            ? { dagModelRoutes: agentSettings.planModelRoutes }
+            : {}),
         },
+        ...(agentSettings.dagExecutionEnabled
+          ? {
+              dag: {
+                budget: {
+                  maxConcurrentSteps: agentSettings.planMaxConcurrentSteps,
+                  maxDurationMs: agentSettings.planMaxDurationMs,
+                  maxInputTokens: agentSettings.planMaxInputTokens,
+                  maxOutputTokens: agentSettings.planMaxOutputTokens,
+                  maxToolCalls: agentSettings.planMaxToolCalls,
+                },
+              },
+            }
+          : {}),
       });
       this.#tasks.start();
       return { ok: true };
@@ -676,7 +694,11 @@ class DesktopController {
       ? renderPlanExecutionPrompt(taskStore?.getPlan(input.task.planId), input.task.goal)
       : input.execution.interactionMode === "plan"
         ? renderPlanningPrompt(input.task.goal, input.execution.planId, taskStore)
-        : (input.task.kind === "worker" || input.task.kind === "integration")
+        : (
+          input.task.kind === "worker"
+          || input.task.kind === "integration"
+          || input.task.kind === "plan-step"
+        )
           && input.execution.workerContext
           ? renderWorkerPrompt(
             input.execution.workerProfile!,
@@ -710,10 +732,25 @@ class DesktopController {
         ...(input.execution.workerContext
           ? { workerContext: input.execution.workerContext }
           : {}),
+        ...(input.execution.requestedModel
+          ? { requestedModel: input.execution.requestedModel }
+          : {}),
+        ...(input.execution.outputTokenScale
+          ? { outputTokenScale: input.execution.outputTokenScale }
+          : {}),
+        ...(input.execution.lowerThinking === undefined
+          ? {}
+          : { lowerThinking: input.execution.lowerThinking }),
       },
     });
     if (input.signal.aborted) await handle.cancel();
-    return handle;
+    return {
+      ...handle,
+      captureContext: () => ({
+        ...input.execution,
+        ...handle.captureContext(),
+      }),
+    };
   }
 
   async openTaskSession(sessionId: string): Promise<CommandResult> {
@@ -2806,19 +2843,23 @@ async function initializeDesktopState(
     executor: async (input) => {
       const host = workspaceControllers.get(input.task.workspaceId);
       if (!host) throw new Error("任务所属工作区尚未加载");
-      if (input.execution.worktreeContext) {
+      const preparedExecution = input.task.kind === "plan-step"
+        && !input.execution.worktreeContext
+        ? await prepareDagPlanStepExecution(input)
+        : input.execution;
+      if (preparedExecution.worktreeContext) {
         return agentSupervisor!.track(
           input.task,
           input.run,
           await executeWorktreeTask(host, {
             ...input,
-            execution: input.execution as PromptExecutionInput,
+            execution: preparedExecution as PromptExecutionInput,
           }),
         );
       }
       const handle = await host.executeTask({
         ...input,
-        execution: input.execution as PromptExecutionInput,
+        execution: preparedExecution as PromptExecutionInput,
       });
       return agentSupervisor!.track(input.task, input.run, handle);
     },
@@ -3718,6 +3759,354 @@ async function restoreQueuedWorkspaceHosts(): Promise<void> {
   }));
 }
 
+async function prepareDagPlanStepExecution(input: {
+  task: import("@deki-ai/shared").TaskRecord;
+  run: import("@deki-ai/shared").RunRecord;
+  execution: PromptExecutionInput;
+  signal: AbortSignal;
+}): Promise<PromptExecutionInput> {
+  if (!input.task.workspacePath || !input.task.planId || !input.execution.dagNodeId) {
+    return input.execution;
+  }
+  const graph = taskStore?.getPlanExecutionGraph(input.task.planId);
+  const node = graph?.nodes.find((candidate) => candidate.id === input.execution.dagNodeId);
+  if (!graph || !node) return input.execution;
+  const runner = new WorktreeRunner(input.task.workspacePath, {
+    worktreesRoot: join(getDekiPaths().worktreesRoot, input.task.workspaceId),
+    timeoutMs: 600_000,
+  });
+  if (node.profile === "implementer") {
+    const release = await acquireRepositoryWriteLock(
+      `${input.task.workspacePath}:dag-baseline:${graph.id}`,
+    );
+    try {
+      const currentGraph = taskStore!.getPlanExecutionGraph(input.task.planId);
+      const existing = currentGraph?.nodes.flatMap((candidate) => {
+        if (candidate.profile !== "implementer" || !candidate.taskId) return [];
+        const context = taskStore!.getExecution(candidate.taskId).worktreeContext;
+        return context ? [context] : [];
+      })[0];
+      const baseline = existing
+        ? {
+            commit: existing.baselineCommit,
+            ref: existing.baselineRef,
+            repository: {
+              repositoryRoot: existing.repositoryRoot,
+              commonDirectory: existing.commonDirectory,
+              workspaceRelativePath: existing.workspaceRelativePath,
+            },
+          }
+        : await runner.createBaseline(
+            `Deki DAG ${input.task.planId}`,
+            (created) => {
+              taskStore!.createArtifact({
+                id: created.artifactId,
+                taskId: input.task.id,
+                runId: input.run.id,
+                kind: "commit",
+                title: `DAG Baseline ${created.commit.slice(0, 12)}`,
+                content: created.commit,
+                metadata: {
+                  ref: created.ref,
+                  commit: created.commit,
+                  syntheticBaseline: true,
+                },
+              });
+            },
+          );
+      const execution: PromptExecutionInput = {
+        ...input.execution,
+        worktreeContext: {
+          baselineCommit: baseline.commit,
+          baseCommit: baseline.commit,
+          baselineRef: baseline.ref,
+          repositoryRoot: baseline.repository.repositoryRoot,
+          commonDirectory: baseline.repository.commonDirectory,
+          workspaceRelativePath: baseline.repository.workspaceRelativePath,
+          writeSet: node.writeSet,
+          validationTargets: node.validationTargets,
+          wave: 0,
+        },
+      };
+      taskStore!.updateExecution(input.task.id, execution);
+      return execution;
+    } finally {
+      release();
+    }
+  }
+  if (node.syntheticKind === "reviewer" && node.sourceStepId) {
+    const primary = graph.nodes.find((candidate) =>
+      candidate.sourceStepId === node.sourceStepId
+      && !candidate.syntheticKind
+      && candidate.profile === "implementer"
+    );
+    const resource = primary?.taskId
+      ? taskStore!.listRunnerResources().find((candidate) =>
+          candidate.taskId === primary.taskId
+          && candidate.kind === "worker"
+          && candidate.status === "finalized")
+      : undefined;
+    const primaryExecution = primary?.taskId
+      ? taskStore!.getExecution(primary.taskId)
+      : undefined;
+    if (!resource || !primaryExecution?.worktreeContext) {
+      throw new Error("Reviewer 找不到待审查的 Implementer worktree");
+    }
+    const repository = await runner.inspectRepository();
+    const branch = resource.branchRef.replace(/^refs\/heads\//u, "");
+    const execution: PromptExecutionInput = {
+      ...input.execution,
+      workerProfile: "reviewer",
+      worktreeContext: {
+        ...primaryExecution.worktreeContext,
+        integratorMode: "review",
+        integrationResource: {
+          id: resource.id,
+          path: resource.path,
+          cwd: repository.workspaceRelativePath
+            ? join(resource.path, repository.workspaceRelativePath)
+            : resource.path,
+          branch,
+          branchRef: resource.branchRef,
+          baseCommit: resource.baseCommit,
+        },
+      },
+    };
+    taskStore!.updateExecution(input.task.id, execution);
+    return execution;
+  }
+  if (node.syntheticKind === "integrator") {
+    const reviewNodes = node.dependencies.flatMap((dependencyId) => {
+      const review = graph.nodes.find((candidate) => candidate.id === dependencyId);
+      return review?.sourceStepId ? [review] : [];
+    });
+    const implementations = reviewNodes.flatMap((review) => {
+      const primary = graph.nodes.find((candidate) =>
+        candidate.sourceStepId === review.sourceStepId
+        && candidate.profile === "implementer"
+        && !candidate.syntheticKind
+      );
+      const result = primary?.taskId
+        ? taskStore!.getImplementationResult(primary.taskId)
+        : undefined;
+      return primary?.taskId && result?.commit ? [{ primary, result }] : [];
+    });
+    if (implementations.length < 2) {
+      throw new Error("Integrator 缺少两个已审查的 Implementer Commit");
+    }
+    const baselineCommit = implementations[0]!.result.baselineCommit;
+    if (implementations.some(({ result }) => result.baselineCommit !== baselineCommit)) {
+      throw new Error("Integrator 的 Implementer baseline 不一致");
+    }
+    const repository = await runner.inspectRepository();
+    let allocated: WorktreeResource | undefined;
+    const resource = await runner.createWorktree({
+      rootTaskId: input.task.rootTaskId,
+      resourceId: input.task.id,
+      kind: "integration",
+      baseCommit: baselineCommit,
+      repository,
+      onAllocated: (created) => {
+        allocated = created;
+        taskStore!.saveRunnerResource({
+          id: created.id,
+          rootTaskId: input.task.rootTaskId,
+          taskId: input.task.id,
+          runId: input.run.id,
+          kind: "integration",
+          path: created.path,
+          branchRef: created.branchRef,
+          baseCommit: created.baseCommit,
+          status: "allocating",
+        });
+      },
+    }).catch(async (error) => {
+      if (allocated) await runner.cleanup(allocated).catch(() => undefined);
+      throw error;
+    });
+    taskStore!.updateRunnerResource(resource.id, "active");
+    const integration = taskStore!.createIntegration({
+      rootTaskId: input.task.rootTaskId,
+      taskId: graph.rootTaskId,
+      integrationTaskId: input.task.id,
+      baselineCommit,
+      predictedOverlaps: [],
+      workerTaskIds: implementations.map(({ primary }) => primary.taskId!),
+      validationTargets: node.validationTargets,
+    });
+    let integratorGuard: Awaited<ReturnType<WorktreeRunner["captureIntegratorGuard"]>>
+      | undefined;
+    let conflictArtifactIds: string[] = [];
+    let pendingIntegrationCommits: string[] = [];
+    for (const [index, { result }] of implementations.entries()) {
+      const picked = await runner.cherryPick(resource, result.commit!);
+      if (!picked.ok) {
+        const inspected = await runner.inspectConflicts(
+          resource,
+          picked,
+          node.writeSet,
+          input.signal,
+        );
+        const inspection = node.risk === "high"
+          ? {
+              safeForIntegrator: false,
+              files: inspected.files.map((file) => ({
+                ...file,
+                safeForIntegrator: false,
+                reasons: [...file.reasons, "冲突属于高风险 DAG 节点"],
+              })),
+            }
+          : inspected;
+        conflictArtifactIds = await persistDagConflictEvidence({
+          runner,
+          resource,
+          task: input.task,
+          run: input.run,
+          inspection,
+          conflictKinds: picked.conflictKinds,
+          signal: input.signal,
+        });
+        taskStore!.updateIntegration(integration.id, {
+          status: inspection.safeForIntegrator ? "conflicted" : "paused",
+          conflictFiles: picked.conflictFiles,
+          actualOverlaps: inspection.files.map((file) => file.workspacePath),
+          conflictArtifactIds,
+          ...(!inspection.safeForIntegrator
+            ? {
+                pausedReason: inspection.files
+                  .map((file) => `${file.workspacePath}: ${file.reasons.join("；")}`)
+                  .join(", "),
+              }
+            : {}),
+        });
+        if (!inspection.safeForIntegrator) {
+          taskStore!.updateRunnerResource(resource.id, "cleanup_pending");
+          await runner.cleanup(resource).catch(() => undefined);
+          taskStore!.updateRunnerResource(resource.id, "cleaned");
+          taskStore!.updateIntegration(integration.id, { cleanupStatus: "cleaned" });
+          const error = new Error(
+            `Integrator 检测到不安全冲突：${picked.conflictFiles.join(", ")}`,
+          );
+          error.name = "IntegrationConflictError";
+          throw error;
+        }
+        integratorGuard = await runner.captureIntegratorGuard(
+          resource,
+          picked.conflictFiles,
+          input.signal,
+        );
+        pendingIntegrationCommits = implementations
+          .slice(index + 1)
+          .map(({ result: pending }) => pending.commit!);
+        break;
+      }
+    }
+    const execution: PromptExecutionInput = {
+      ...input.execution,
+      workerProfile: "integrator",
+      worktreeContext: {
+        baselineCommit,
+        baseCommit: baselineCommit,
+        baselineRef: `refs/deki/dag/${graph.id}`,
+        repositoryRoot: repository.repositoryRoot,
+        commonDirectory: repository.commonDirectory,
+        workspaceRelativePath: repository.workspaceRelativePath,
+        writeSet: node.writeSet,
+        validationTargets: node.validationTargets,
+        wave: 0,
+        integratorMode: integratorGuard ? "resolve" : "review",
+        ...(integratorGuard ? { integratorGuard } : {}),
+        ...(conflictArtifactIds.length ? { conflictArtifactIds } : {}),
+        ...(pendingIntegrationCommits.length ? { pendingIntegrationCommits } : {}),
+        integrationResource: {
+          id: resource.id,
+          path: resource.path,
+          cwd: resource.cwd,
+          branch: resource.branch,
+          branchRef: resource.branchRef,
+          baseCommit: resource.baseCommit,
+        },
+      },
+    };
+    taskStore!.updateExecution(input.task.id, execution);
+    return execution;
+  }
+  return input.execution;
+}
+
+async function persistDagConflictEvidence(input: {
+  runner: WorktreeRunner;
+  resource: WorktreeResource;
+  task: import("@deki-ai/shared").TaskRecord;
+  run: import("@deki-ai/shared").RunRecord;
+  inspection: ConflictInspection;
+  conflictKinds: Record<string, string>;
+  signal: AbortSignal;
+}): Promise<string[]> {
+  const artifactStore = new ArtifactStore(getDekiPaths().artifactsRoot);
+  const ids: string[] = [];
+  for (const file of input.inspection.files) {
+    for (const stage of file.stages) {
+      const id = randomUUID();
+      const content = await input.runner.readConflictStage(
+        input.resource,
+        stage,
+        input.signal,
+      );
+      const stored = await artifactStore.write(
+        input.task.workspaceId,
+        input.task.rootTaskId,
+        id,
+        "bin",
+        content,
+      );
+      taskStore!.createArtifact({
+        id,
+        taskId: input.task.id,
+        runId: input.run.id,
+        kind: "evidence",
+        title: `${file.workspacePath} (${stage.stage})`,
+        uri: stored.uri,
+        metadata: {
+          sha256: stored.sha256,
+          size: stored.size,
+          path: file.path,
+          workspacePath: file.workspacePath,
+          stage: stage.stage,
+          mode: stage.mode,
+          objectId: stage.objectId,
+        },
+      });
+      ids.push(id);
+    }
+  }
+  const inspectionId = randomUUID();
+  const stored = await artifactStore.write(
+    input.task.workspaceId,
+    input.task.rootTaskId,
+    inspectionId,
+    "json",
+    JSON.stringify(input.inspection, null, 2),
+  );
+  taskStore!.createArtifact({
+    id: inspectionId,
+    taskId: input.task.id,
+    runId: input.run.id,
+    kind: "evidence",
+    title: "DAG Integration Conflict",
+    uri: stored.uri,
+    metadata: {
+      sha256: stored.sha256,
+      size: stored.size,
+      conflictFiles: input.inspection.files.map((file) => file.workspacePath),
+      conflictKinds: input.conflictKinds,
+      automaticResolution: input.inspection.safeForIntegrator,
+    },
+  });
+  ids.push(inspectionId);
+  return ids;
+}
+
 async function executeWorktreeTask(
   host: DesktopController,
   input: {
@@ -3732,7 +4121,13 @@ async function executeWorktreeTask(
   if (!context || !workspace) {
     throw new Error("Worktree Runner 任务缺少完整上下文");
   }
-  if (input.execution.workerProfile === "integrator") {
+  if (
+    input.execution.workerProfile === "integrator"
+    || (
+      input.execution.workerProfile === "reviewer"
+      && input.task.kind === "plan-step"
+    )
+  ) {
     const descriptor = context.integrationResource;
     const recorded = descriptor
       ? taskStore!.listRunnerResources().find((resource) => resource.id === descriptor.id)
@@ -3740,12 +4135,16 @@ async function executeWorktreeTask(
     if (
       !descriptor
       || !recorded
-      || recorded.kind !== "integration"
+      || (
+        input.execution.workerProfile === "integrator"
+          ? recorded.kind !== "integration"
+          : recorded.kind !== "worker"
+      )
       || recorded.path !== descriptor.path
       || recorded.branchRef !== descriptor.branchRef
       || !["active", "finalized"].includes(recorded.status)
     ) {
-      throw new Error("Integrator 只能附加到已记录的活动 Integration worktree");
+      throw new Error("Reviewer/Integrator 只能附加到已记录的活动 worktree");
     }
     const ephemeral = await DesktopController.create(descriptor.cwd, {
       tasks: requireTaskOrchestrator(),
@@ -3759,7 +4158,192 @@ async function executeWorktreeTask(
       await ephemeral.dispose();
       throw error;
     }
-    const completion = handle.completion.finally(() => ephemeral.dispose());
+    const completion = (async () => {
+      let succeeded = false;
+      try {
+        await handle.completion;
+        if (
+          input.execution.workerProfile === "integrator"
+          && input.execution.dagNodeId
+          && workspace
+        ) {
+          const runner = new WorktreeRunner(workspace, {
+            worktreesRoot: join(getDekiPaths().worktreesRoot, input.task.workspaceId),
+            timeoutMs: 600_000,
+          });
+          const repository = await runner.inspectRepository();
+          const resource: WorktreeResource = {
+            id: recorded.id,
+            kind: "integration",
+            path: descriptor.path,
+            cwd: descriptor.cwd,
+            branch: descriptor.branch,
+            branchRef: descriptor.branchRef,
+            baseCommit: descriptor.baseCommit,
+            repository,
+          };
+          if (context.integratorMode === "resolve") {
+            if (!context.integratorGuard) {
+              throw new Error("Integrator 缺少持久化冲突 Guard");
+            }
+            await runner.continueCherryPick(
+              resource,
+              context.integratorGuard,
+              input.signal,
+            );
+            for (const commit of context.pendingIntegrationCommits ?? []) {
+              const picked = await runner.cherryPick(resource, commit, input.signal);
+              if (picked.ok) continue;
+              const inspection = await runner.inspectConflicts(
+                resource,
+                picked,
+                context.writeSet,
+                input.signal,
+              );
+              const artifactIds = await persistDagConflictEvidence({
+                runner,
+                resource,
+                task: input.task,
+                run: input.run,
+                inspection,
+                conflictKinds: picked.conflictKinds,
+                signal: input.signal,
+              });
+              const integration = taskStore!.getIntegrationForTask(input.task.id);
+              if (integration) {
+                taskStore!.updateIntegration(integration.id, {
+                  status: "paused",
+                  conflictFiles: picked.conflictFiles,
+                  conflictArtifactIds: [
+                    ...integration.conflictArtifactIds,
+                    ...artifactIds,
+                  ],
+                  pausedReason: "后续提交产生新的冲突，需要 Replan 后重新集成",
+                });
+              }
+              const error = new Error(
+                `Integrator 后续提交产生冲突：${picked.conflictFiles.join(", ")}`,
+              );
+              error.name = "IntegrationConflictError";
+              throw error;
+            }
+          }
+          const validations = await runner.validateIntegration(
+            resource,
+            context.validationTargets,
+            input.signal,
+          );
+          if (validations.some((validation) => validation.exitCode !== 0)) {
+            throw new Error("Integrator 聚合验证失败");
+          }
+          const finalized = await runner.integrationPatch(resource, context.baselineCommit);
+          const artifactStore = new ArtifactStore(getDekiPaths().artifactsRoot);
+          const patchId = randomUUID();
+          const patchFile = await artifactStore.write(
+            input.task.workspaceId,
+            input.task.rootTaskId,
+            patchId,
+            "patch",
+            finalized.patch,
+          );
+          taskStore!.createArtifact({
+            id: patchId,
+            taskId: input.task.id,
+            runId: input.run.id,
+            kind: "patch",
+            title: "DAG Integration Patch",
+            uri: patchFile.uri,
+            metadata: {
+              sha256: patchFile.sha256,
+              size: patchFile.size,
+              baselineCommit: context.baselineCommit,
+              integrationCommit: finalized.commit,
+              changedFiles: finalized.changedFiles,
+            },
+          });
+          const diffId = randomUUID();
+          taskStore!.createArtifact({
+            id: diffId,
+            taskId: input.task.id,
+            runId: input.run.id,
+            kind: "diff",
+            title: "DAG Integration Diff",
+            content: finalized.patch,
+            metadata: { changedFiles: finalized.changedFiles },
+          });
+          const integration = taskStore!.getIntegrationForTask(input.task.id);
+          if (integration) {
+            taskStore!.updateIntegration(integration.id, {
+              status: "awaiting_apply",
+              integrationCommit: finalized.commit,
+              patchArtifactId: patchId,
+              diffArtifactId: diffId,
+              cleanupStatus: "pending",
+            });
+          }
+          taskStore!.updateRunnerResource(recorded.id, "finalized");
+        }
+        succeeded = true;
+      } finally {
+        if (input.execution.workerProfile === "reviewer" && workspace) {
+          const runner = new WorktreeRunner(workspace, {
+            worktreesRoot: join(getDekiPaths().worktreesRoot, input.task.workspaceId),
+            timeoutMs: 600_000,
+          });
+          try {
+            taskStore!.updateRunnerResource(recorded.id, "cleanup_pending");
+            const repository = await runner.inspectRepository();
+            await runner.cleanup({
+              id: recorded.id,
+              kind: "worker",
+              path: descriptor.path,
+              cwd: descriptor.cwd,
+              branch: descriptor.branch,
+              branchRef: descriptor.branchRef,
+              baseCommit: descriptor.baseCommit,
+              repository,
+            });
+            taskStore!.updateRunnerResource(recorded.id, "cleaned");
+          } catch (error) {
+            taskStore!.updateRunnerResource(recorded.id, "cleanup_failed", formatError(error));
+          }
+        } else if (
+          input.execution.workerProfile === "integrator"
+          && input.execution.dagNodeId
+          && workspace
+        ) {
+          const runner = new WorktreeRunner(workspace, {
+            worktreesRoot: join(getDekiPaths().worktreesRoot, input.task.workspaceId),
+            timeoutMs: 600_000,
+          });
+          try {
+            taskStore!.updateRunnerResource(recorded.id, "cleanup_pending");
+            const repository = await runner.inspectRepository();
+            await runner.cleanup({
+              id: recorded.id,
+              kind: "integration",
+              path: descriptor.path,
+              cwd: descriptor.cwd,
+              branch: descriptor.branch,
+              branchRef: descriptor.branchRef,
+              baseCommit: descriptor.baseCommit,
+              repository,
+            });
+            taskStore!.updateRunnerResource(recorded.id, "cleaned");
+            const integration = taskStore!.getIntegrationForTask(input.task.id);
+            if (integration) {
+              taskStore!.updateIntegration(integration.id, {
+                cleanupStatus: "cleaned",
+                ...(!succeeded ? { status: "failed" as const } : {}),
+              });
+            }
+          } catch (error) {
+            taskStore!.updateRunnerResource(recorded.id, "cleanup_failed", formatError(error));
+          }
+        }
+        await ephemeral.dispose();
+      }
+    })();
     return {
       sessionId: handle.sessionId,
       ...(handle.modelProvider ? { modelProvider: handle.modelProvider } : {}),
@@ -3841,6 +4425,7 @@ async function executeWorktreeTask(
   }
   const completion = (async () => {
     let agentError: unknown;
+    let retainForDagReview = false;
     try {
       await handle.completion;
     } catch (error) {
@@ -3942,17 +4527,20 @@ async function executeWorktreeTask(
       }
       if (!finalized.commit) throw new Error("Runner 未生成 Implementer Commit");
       if (agentError) throw agentError;
+      retainForDagReview = Boolean(input.execution.dagNodeId);
     } finally {
-      try {
-        taskStore!.updateRunnerResource(resource.id, "cleanup_pending");
-        await runner.cleanup(resource);
-        taskStore!.updateRunnerResource(resource.id, "cleaned");
-      } catch (cleanupError) {
-        taskStore!.updateRunnerResource(
-          resource.id,
-          "cleanup_failed",
-          formatError(cleanupError),
-        );
+      if (!retainForDagReview) {
+        try {
+          taskStore!.updateRunnerResource(resource.id, "cleanup_pending");
+          await runner.cleanup(resource);
+          taskStore!.updateRunnerResource(resource.id, "cleaned");
+        } catch (cleanupError) {
+          taskStore!.updateRunnerResource(
+            resource.id,
+            "cleanup_failed",
+            formatError(cleanupError),
+          );
+        }
       }
       await ephemeral.dispose();
     }
@@ -3993,6 +4581,21 @@ async function cleanupStaleRunnerResources(
     "cleanup_failed",
   ])) {
     const task = store.getTask(record.taskId);
+    if (
+      record.kind === "worker"
+      && record.status === "finalized"
+      && task?.planId
+    ) {
+      const graph = store.getPlanExecutionGraph(task.planId);
+      const implementationNode = graph?.nodes.find((node) => node.taskId === task.id);
+      const reviewerPending = implementationNode?.sourceStepId
+        ? graph?.nodes.some((node) =>
+            node.syntheticKind === "reviewer"
+            && node.sourceStepId === implementationNode.sourceStepId
+            && ["pending", "ready", "running", "interrupted"].includes(node.status))
+        : false;
+      if (reviewerPending) continue;
+    }
     if (!task?.workspacePath) {
       store.updateRunnerResource(record.id, "cleanup_failed", "任务工作区路径不可用");
       continue;
@@ -4600,6 +5203,7 @@ function renderPlanningPrompt(
     "充分检查项目结构、现有实现和约束后，生成可直接交给工程师实施的结构化计划。",
     "完成分析后必须调用 plan__submit；不要只在聊天中输出 Markdown 计划。",
     "步骤 ID 必须稳定且唯一，依赖必须构成无环图，每一步都要包含验证方式。",
+    "每一步必须声明 executionProfile。Implementer 还必须声明精确 writeSet 和 validationTargets；不要手工添加 Reviewer/Integrator，执行器会插入质量关卡。",
     `目标：${goal}`,
   ].join("\n\n");
 }
@@ -4647,6 +5251,9 @@ function renderWorkerPrompt(
     "不得修改真实工作区，不得调用 Bash、写入、删除、安装依赖或 Git 写操作。",
     "只处理给定子任务，不要尝试创建其他 Worker，也不要假装已经执行未运行的验证。",
     "完成调查后必须调用 worker__submit_result 提交结构化结果；证据必须能定位到文件、命令、Artifact 或 URL。",
+    ...(profile === "reviewer"
+      ? ["Reviewer 的结果必须包含 review.verdict（approved、changes_requested 或 blocked）和分级 findings。"]
+      : []),
     `上下文包：${JSON.stringify(context)}`,
   ].join("\n\n");
 }

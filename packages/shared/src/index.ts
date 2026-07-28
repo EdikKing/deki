@@ -61,6 +61,16 @@ const agentSettingsSchema = z.object({
   workerMaxOutputTokens: z.number().int(),
   workerMaxToolCalls: z.number().int(),
   workerModel: z.string(),
+  dagExecutionEnabled: z.boolean(),
+  planMaxConcurrentSteps: z.number().int(),
+  planMaxDurationMs: z.number().int(),
+  planMaxInputTokens: z.number().int(),
+  planMaxOutputTokens: z.number().int(),
+  planMaxToolCalls: z.number().int(),
+  planModelRoutes: z.record(
+    z.enum(["coordinator", "explorer", "implementer", "tester", "reviewer", "integrator"]),
+    z.array(z.string()),
+  ),
   showThinkingSummary: z.boolean(),
   sessionRetentionDays: z.number().int(),
 }).strict();
@@ -312,6 +322,7 @@ export const taskKindSchema = z.enum([
   "planning",
   "worker",
   "plan-execution",
+  "plan-step",
   "integration",
 ]);
 export type TaskKind = z.infer<typeof taskKindSchema>;
@@ -324,6 +335,7 @@ export const planStatusSchema = z.enum([
   "ready",
   "approved",
   "executing",
+  "blocked",
   "completed",
   "abandoned",
 ]);
@@ -338,6 +350,13 @@ export const planStepStatusSchema = z.enum([
 ]);
 export type PlanStepStatus = z.infer<typeof planStepStatusSchema>;
 
+export const planExecutionProfileSchema = z.enum([
+  "explorer",
+  "implementer",
+  "tester",
+]);
+export type PlanExecutionProfile = z.infer<typeof planExecutionProfileSchema>;
+
 export const planStepSchema = z.object({
   id: z.string().trim().min(1).max(100),
   title: z.string().trim().min(1).max(200),
@@ -348,6 +367,16 @@ export const planStepSchema = z.object({
   risk: z.enum(["low", "medium", "high"]),
   parallelizable: z.boolean().default(false),
   assignedProfile: z.string().trim().min(1).max(100).optional(),
+  executionProfile: planExecutionProfileSchema.optional(),
+  writeSet: z.array(z.object({
+    path: z.string().trim().min(1).max(2_000),
+    kind: z.enum(["file", "directory"]),
+    exclusive: z.boolean().default(false),
+  }).strict()).max(100).optional(),
+  validationTargets: z.array(z.object({
+    cwd: z.string().trim().min(1).max(2_000).optional(),
+    script: z.string().regex(/^(?:test(?::[A-Za-z0-9_.-]+)?|lint|typecheck)$/),
+  }).strict()).max(30).optional(),
 }).strict();
 export type PlanStep = z.infer<typeof planStepSchema>;
 
@@ -404,6 +433,13 @@ export const planEventTypeSchema = z.enum([
   "plan.execution_started",
   "plan.execution_paused",
   "plan.execution_failed",
+  "plan.execution_blocked",
+  "plan.node_ready",
+  "plan.node_started",
+  "plan.node_completed",
+  "plan.node_failed",
+  "plan.node_blocked",
+  "plan.route_selected",
   "plan.step_started",
   "plan.step_completed",
   "plan.step_blocked",
@@ -500,6 +536,29 @@ export const runRecordSchema = z.object({
   runnerId: z.string().min(1),
   modelProvider: z.string().optional(),
   modelId: z.string().optional(),
+  routeCandidateIndex: z.number().int().nonnegative().optional(),
+  routeReason: z.string().optional(),
+  budgetTier: z.enum(["normal", "soft", "critical"]).optional(),
+  failureClass: z.enum([
+    "provider_transient",
+    "provider_unavailable",
+    "context_overflow",
+    "permission",
+    "tool",
+    "validation",
+    "scope",
+    "review",
+    "budget",
+    "integration",
+    "unknown",
+  ]).optional(),
+  failureDetail: z.object({
+    source: z.enum(["provider", "runtime", "permission", "tool", "validation", "review", "budget", "integration", "unknown"]),
+    code: z.string().max(200).optional(),
+    status: z.number().int().min(100).max(599).optional(),
+    errorName: z.string().max(200).optional(),
+    retriable: z.boolean(),
+  }).strict().optional(),
   startedAt: z.string().datetime().optional(),
   finishedAt: z.string().datetime().optional(),
   error: z.string().optional(),
@@ -576,6 +635,87 @@ export const taskBudgetUsageSchema = z.object({
 }).strict();
 export type TaskBudgetUsage = z.infer<typeof taskBudgetUsageSchema>;
 
+export const planExecutionBudgetSchema = z.object({
+  maxConcurrentSteps: z.number().int().min(1).max(8),
+  maxDurationMs: z.number().int().min(10_000).max(86_400_000),
+  maxInputTokens: z.number().int().min(1_000).max(100_000_000),
+  maxOutputTokens: z.number().int().min(256).max(10_000_000),
+  maxToolCalls: z.number().int().min(1).max(100_000),
+}).strict();
+export type PlanExecutionBudget = z.infer<typeof planExecutionBudgetSchema>;
+
+export const planBudgetReservationSchema = z.object({
+  durationMs: z.number().int().nonnegative(),
+  inputTokens: z.number().int().nonnegative(),
+  outputTokens: z.number().int().nonnegative(),
+  toolCalls: z.number().int().nonnegative(),
+}).strict();
+export type PlanBudgetReservation = z.infer<typeof planBudgetReservationSchema>;
+
+export const planExecutionNodeStatusSchema = z.enum([
+  "pending",
+  "ready",
+  "running",
+  "succeeded",
+  "failed",
+  "blocked",
+  "cancelled",
+  "interrupted",
+]);
+export type PlanExecutionNodeStatus = z.infer<typeof planExecutionNodeStatusSchema>;
+
+export const planExecutionNodeSchema = z.object({
+  id: z.string().uuid(),
+  planId: z.string().uuid(),
+  revision: z.number().int().positive(),
+  sourceStepId: z.string().min(1).max(100).optional(),
+  syntheticKind: z.enum(["reviewer", "integrator"]).optional(),
+  profile: z.enum(["explorer", "implementer", "tester", "reviewer", "integrator"]),
+  title: z.string().min(1).max(300),
+  dependencies: z.array(z.string().uuid()).max(100),
+  status: planExecutionNodeStatusSchema,
+  parallelizable: z.boolean(),
+  risk: z.enum(["low", "medium", "high"]),
+  writeSet: z.array(workerWriteSetEntrySchema).max(100).default([]),
+  validationTargets: z.array(validationTargetSchema).max(30).default([]),
+  taskId: z.string().uuid().optional(),
+  runId: z.string().uuid().optional(),
+  attempt: z.number().int().nonnegative().default(0),
+  modelProvider: z.string().optional(),
+  modelId: z.string().optional(),
+  routeCandidateIndex: z.number().int().nonnegative().optional(),
+  routeReason: z.string().optional(),
+  budgetTier: z.enum(["normal", "soft", "critical"]).optional(),
+  failureClass: runRecordSchema.shape.failureClass,
+  reservation: planBudgetReservationSchema.optional(),
+  summary: z.string().max(20_000).optional(),
+  reason: z.string().max(20_000).optional(),
+  createdAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+}).strict();
+export type PlanExecutionNode = z.infer<typeof planExecutionNodeSchema>;
+
+export const planExecutionGraphSchema = z.object({
+  id: z.string().uuid(),
+  planId: z.string().uuid(),
+  revision: z.number().int().positive(),
+  rootTaskId: z.string().uuid(),
+  status: z.enum(["pending", "running", "blocked", "completed", "cancelled"]),
+  budget: planExecutionBudgetSchema,
+  usage: taskBudgetUsageSchema,
+  reserved: planBudgetReservationSchema.default({
+    durationMs: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    toolCalls: 0,
+  }),
+  blockedReason: z.enum(["budget", "dependency", "review", "integration"]).optional(),
+  nodes: z.array(planExecutionNodeSchema),
+  createdAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+}).strict();
+export type PlanExecutionGraph = z.infer<typeof planExecutionGraphSchema>;
+
 export const workerEvidenceSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("file"),
@@ -617,6 +757,14 @@ export const workerResultSchema = z.object({
   risks: z.array(z.string().max(5_000)).max(100),
   unresolved: z.array(z.string().max(5_000)).max(100),
   recommendedNextActions: z.array(z.string().max(5_000)).max(100),
+  review: z.object({
+    verdict: z.enum(["approved", "changes_requested", "blocked"]),
+    findings: z.array(z.object({
+      severity: z.enum(["low", "medium", "high", "critical"]),
+      summary: z.string().min(1).max(5_000),
+      evidence: z.array(workerEvidenceSchema).max(30).default([]),
+    }).strict()).max(100),
+  }).strict().optional(),
 }).strict();
 export type WorkerResult = z.infer<typeof workerResultSchema>;
 
@@ -776,6 +924,8 @@ export const taskEventTypeSchema = z.enum([
   "integration.failed",
   "budget.warning",
   "budget.exceeded",
+  "route.selected",
+  "route.fallback",
 ]);
 export type TaskEventType = z.infer<typeof taskEventTypeSchema>;
 
@@ -799,6 +949,7 @@ export const taskPlanContextSchema = z.object({
   completedSteps: z.number().int().nonnegative(),
   totalSteps: z.number().int().nonnegative(),
   currentStep: planStepSchema.optional(),
+  currentSteps: z.array(planStepSchema).default([]),
   replanReason: z.string().max(10_000).optional(),
 }).strict();
 export type TaskPlanContext = z.infer<typeof taskPlanContextSchema>;
@@ -846,6 +997,7 @@ export const planDetailSchema = z.object({
   events: z.array(planEventSchema),
   planningTask: taskRecordSchema.optional(),
   executionTask: taskRecordSchema.optional(),
+  executionGraph: planExecutionGraphSchema.optional(),
 }).strict();
 export type PlanDetail = z.infer<typeof planDetailSchema>;
 
@@ -855,6 +1007,8 @@ export const planSummarySchema = z.object({
   completedSteps: z.number().int().nonnegative(),
   totalSteps: z.number().int().nonnegative(),
   currentStep: planStepSchema.optional(),
+  currentSteps: z.array(planStepSchema).default([]),
+  executionGraph: planExecutionGraphSchema.optional(),
 }).strict();
 export type PlanSummary = z.infer<typeof planSummarySchema>;
 

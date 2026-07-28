@@ -641,7 +641,7 @@ Deki 是“本地优先”而不是“完全离线”：会话、设置、记忆
 另外，当前项目仍处于 `0.0.0`：
 
 - 配置和数据库迁移策略可能继续调整。
-- 部分 Task、Plan 和 Worker 能力属于实验性基础设施。
+- 智能 Plan DAG、按 Profile 的模型路由、持久化预算预留和自动 Reviewer/Integrator 属于默认关闭的实验性能力，可在 Agent 设置中启用；不安全集成冲突会保留证据并要求 Replan。
 - 自动更新和正式安装包依赖仓库 Release 流水线与平台签名配置。
 
 规划中的功能请以[产品规划](docs/deki-product-plan.md)和[多 Agent / 后台任务 / Plan 模式规划](docs/multi-agent-background-tasks-plan-mode.md)为参考，不应视为当前版本承诺。

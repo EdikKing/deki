@@ -5,6 +5,11 @@
   "type": "module",
   "description": "Deki local-first AI development workspace",
   "author": "Edik Labs",
+  "homepage": "https://github.com/EdikKing/deki",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/EdikKing/deki.git"
+  },
   "main": "./out/main/index.js",
   "license": "AGPL-3.0-or-later",
   "scripts": {
@@ -76,7 +81,7 @@
     "publish": [
       {
         "provider": "github",
-        "owner": "edik-labs",
+        "owner": "EdikKing",
         "repo": "deki",
         "releaseType": "release"
       }

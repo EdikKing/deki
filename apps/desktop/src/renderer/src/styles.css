@@ -3505,27 +3505,39 @@ html[data-theme="light"] .settings-error {
 
 .interaction-mode-switch {
   display: inline-flex;
-  padding: 2px;
-  border: 1px solid var(--border);
-  border-radius: 9px;
-  background: var(--bg-input);
+  align-items: center;
+  gap: 2px;
+  padding: 0;
+  border: 0;
+  background: transparent;
 }
 
 .interaction-mode-switch button {
-  min-height: 28px;
-  padding: 0 10px;
+  min-height: 0;
+  padding: 6px 8px;
   border: 0;
-  border-radius: 7px;
+  border-radius: 8px;
   background: transparent;
-  color: var(--text-muted);
-  font-size: 12px;
-  font-weight: 650;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 550;
+  line-height: normal;
 }
 
 .interaction-mode-switch button.active {
   color: var(--text-primary);
-  background: var(--bg-elevated);
-  box-shadow: 0 1px 3px rgb(0 0 0 / 10%);
+  background: var(--bg-hover);
+  box-shadow: none;
+}
+
+.interaction-mode-switch button:hover:not(:disabled) {
+  color: var(--text-primary);
+  background: var(--bg-hover);
+}
+
+.interaction-mode-switch button:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  outline-offset: 2px;
 }
 
 .plan-panel {

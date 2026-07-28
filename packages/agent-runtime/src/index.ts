@@ -38,6 +38,7 @@ import {
   type MemoryScope,
   type ModelSummary,
   type PermissionPolicies,
+  type PlanStep,
   type SessionSummary,
   type SessionHistoryState,
   type ThinkingLevel,
@@ -62,6 +63,37 @@ export interface DekiAgentRuntimeOptions {
     grantKey?: string,
   ) => Promise<void>;
   onEvent: (event: AgentEvent) => void;
+  planTools?: {
+    submit(input: {
+      goal: string;
+      assumptions: string[];
+      constraints: string[];
+      steps: PlanStep[];
+    }, context: ToolCallContext): Promise<unknown>;
+    revise(input: {
+      planId: string;
+      basedOnRevision: number;
+      feedback?: string;
+      assumptions: string[];
+      constraints: string[];
+      steps: PlanStep[];
+    }, context: ToolCallContext): Promise<unknown>;
+    updateStep(input: {
+      planId: string;
+      revision: number;
+      stepId: string;
+      status: "running" | "completed" | "blocked";
+      summary?: string;
+      evidence?: string[];
+      reason?: string;
+    }, context: ToolCallContext): Promise<unknown>;
+    requestReplan(input: {
+      planId: string;
+      reason: string;
+      affectedStepIds: string[];
+      evidence?: string[];
+    }, context: ToolCallContext): Promise<unknown>;
+  };
   resumeLatest?: boolean;
 }
 
@@ -74,6 +106,7 @@ export interface RuntimeSnapshot {
   sessionConfiguration?: {
     permissionPolicies: PermissionPolicies;
     thinkingLevel: ThinkingLevel;
+    interactionMode: "act" | "plan";
   };
   recalledMemories: MemoryRecord[];
   skills: string[];
@@ -95,6 +128,9 @@ export interface AgentPromptContext {
   sourceSessionFile?: string;
   sourceEntryId?: string;
   preferFork: boolean;
+  interactionMode?: "act" | "plan" | "plan-execution";
+  planId?: string;
+  planRevision?: number;
 }
 
 export interface AgentPromptRunHandle {
@@ -118,6 +154,9 @@ interface AgentExecutionContext {
   sessionId: string;
   taskId: string;
   runId: string;
+  interactionMode: "act" | "plan" | "plan-execution";
+  planId?: string;
+  planRevision?: number;
 }
 
 export class AgentSessionEventSubscription {
@@ -145,6 +184,7 @@ export class DekiAgentRuntime {
   #selectedModel: ModelType | undefined;
   readonly #sessionModels = new Map<string, ModelType>();
   readonly #sessionPermissionPolicies = new Map<string, PermissionPolicies>();
+  readonly #sessionInteractionModes = new Map<string, "act" | "plan">();
   #runtime: AgentSessionRuntime | undefined;
   readonly #sessionEvents = new AgentSessionEventSubscription();
   #recalledMemories: MemoryRecord[] = [];
@@ -268,6 +308,9 @@ export class DekiAgentRuntime {
         : [];
 
       await this.#gateway.register(new ProjectInfoProvider(this.#options.workspace));
+      if (this.#options.planTools) {
+        await this.#gateway.register(new PlanToolsProvider(this.#options.planTools));
+      }
 
       if (this.#options.settings.mcp.startEnabledServers) {
         const mcpConfig = await this.#loadRuntimeMcpConfig();
@@ -371,6 +414,7 @@ export class DekiAgentRuntime {
             sessionConfiguration: {
               permissionPolicies: this.#permissionPoliciesForSession(sessionId),
               thinkingLevel: this.#runtime.session.thinkingLevel as ThinkingLevel,
+              interactionMode: this.#interactionModeForSession(sessionId),
             },
           }
         : {}),
@@ -459,6 +503,11 @@ export class DekiAgentRuntime {
       sessionId: runtime.session.sessionId,
       taskId: input.taskId,
       runId: input.runId,
+      interactionMode: input.context.interactionMode ?? "act",
+      ...(input.context.planId ? { planId: input.context.planId } : {}),
+      ...(input.context.planRevision
+        ? { planRevision: input.context.planRevision }
+        : {}),
     };
     this.#runContextsBySession.set(execution.sessionId, execution);
     this.#lastPrompt = trimmed;
@@ -505,6 +554,11 @@ export class DekiAgentRuntime {
           ? { sourceEntryId: runtime.session.sessionManager.getLeafId()! }
           : {}),
         preferFork: true,
+        interactionMode: input.context.interactionMode ?? "act",
+        ...(input.context.planId ? { planId: input.context.planId } : {}),
+        ...(input.context.planRevision
+          ? { planRevision: input.context.planRevision }
+          : {}),
       }),
     };
   }
@@ -738,6 +792,9 @@ export class DekiAgentRuntime {
     const inheritedPermissionPolicies = this.#permissionPoliciesForSession(
       runtime.session.sessionId,
     );
+    const inheritedInteractionMode = this.#interactionModeForSession(
+      runtime.session.sessionId,
+    );
     const result = await runtime.fork(entryId, { position: "at" });
     if (result.cancelled) return;
     if (inheritedModel) await runtime.session.setModel(inheritedModel);
@@ -746,6 +803,11 @@ export class DekiAgentRuntime {
       runtime.session,
       inheritedPermissionPolicies,
     );
+    runtime.session.sessionManager.appendCustomEntry("deki.interaction-mode", {
+      version: 1,
+      mode: inheritedInteractionMode,
+    });
+    this.#sessionInteractionModes.set(runtime.session.sessionId, inheritedInteractionMode);
     this.#registerSessionConfiguration(runtime.session);
     runtime.session.setSessionName(
       `${runtime.session.sessionName ?? "会话"} · 分叉`,
@@ -871,6 +933,13 @@ export class DekiAgentRuntime {
     if (input.thinkingLevel) {
       session.setThinkingLevel(input.thinkingLevel);
     }
+    if (input.interactionMode) {
+      session.sessionManager.appendCustomEntry("deki.interaction-mode", {
+        version: 1,
+        mode: input.interactionMode,
+      });
+      this.#sessionInteractionModes.set(session.sessionId, input.interactionMode);
+    }
   }
 
   async abort(): Promise<void> {
@@ -978,6 +1047,11 @@ export class DekiAgentRuntime {
       sessionId: background.session.sessionId,
       taskId: input.taskId,
       runId: input.runId,
+      interactionMode: input.context.interactionMode ?? "act",
+      ...(input.context.planId ? { planId: input.context.planId } : {}),
+      ...(input.context.planRevision
+        ? { planRevision: input.context.planRevision }
+        : {}),
     };
     this.#runContextsBySession.set(execution.sessionId, execution);
     this.#backgroundRuntimes.add(background);
@@ -1039,6 +1113,7 @@ export class DekiAgentRuntime {
         this.#runCancellers.delete(input.taskId);
         this.#sessionModels.delete(background.session.sessionId);
         this.#sessionPermissionPolicies.delete(background.session.sessionId);
+        this.#sessionInteractionModes.delete(background.session.sessionId);
         await background.dispose();
       });
     const cancel = async () => {
@@ -1067,6 +1142,11 @@ export class DekiAgentRuntime {
           ? { sourceEntryId: background.session.sessionManager.getLeafId()! }
           : {}),
         preferFork: true,
+        interactionMode: input.context.interactionMode ?? "act",
+        ...(input.context.planId ? { planId: input.context.planId } : {}),
+        ...(input.context.planRevision
+          ? { planRevision: input.context.planRevision }
+          : {}),
       }),
     };
   }
@@ -1291,6 +1371,16 @@ export class DekiAgentRuntime {
         ? { ...parsedPolicies.data }
         : { ...this.#options.settings.permissions.policies },
     );
+    const savedMode = [...entries].reverse().find(
+      (entry) => entry.type === "custom"
+        && entry.customType === "deki.interaction-mode",
+    );
+    const mode = savedMode?.type === "custom"
+      && isRecord(savedMode.data)
+      && (savedMode.data.mode === "act" || savedMode.data.mode === "plan")
+      ? savedMode.data.mode
+      : "act";
+    this.#sessionInteractionModes.set(sessionId, mode);
   }
 
   #permissionPoliciesForSession(sessionId: string | undefined): PermissionPolicies {
@@ -1300,6 +1390,10 @@ export class DekiAgentRuntime {
     return {
       ...(policies ?? this.#options.settings.permissions.policies),
     };
+  }
+
+  #interactionModeForSession(sessionId: string | undefined): "act" | "plan" {
+    return sessionId ? this.#sessionInteractionModes.get(sessionId) ?? "act" : "act";
   }
 
   #persistSessionPermissionPolicies(
@@ -1323,14 +1417,25 @@ export class DekiAgentRuntime {
       execute: async (toolCallId, params, signal) => {
         const effectiveSessionId = sessionId();
         const execute = async () => {
+        const executionContext = this.#runContextsBySession.get(effectiveSessionId)
+          ?? this.#executionContext.getStore();
         const context: ToolCallContext = {
           callId: toolCallId,
           workspace: this.#options.workspace,
+          ...(executionContext?.sessionId
+            ? { sessionId: executionContext.sessionId }
+            : {}),
+          ...(executionContext?.taskId ? { taskId: executionContext.taskId } : {}),
+          ...(executionContext?.runId ? { runId: executionContext.runId } : {}),
+          ...(executionContext?.planId ? { planId: executionContext.planId } : {}),
+          interactionMode: executionContext?.interactionMode ?? "act",
           ...(signal ? { signal } : {}),
         };
+        this.#gateway.assertAllowed(tool.modelName, params, context);
         const permissionControlled = tool.providerId !== "workspace"
           && tool.providerId !== "deki"
-          && tool.providerId !== "interaction";
+          && tool.providerId !== "interaction"
+          && tool.providerId !== "plan";
         if (permissionControlled) {
           const readOnly = tool.readOnlyHint === true;
           const policy = this.#options.settings.mcp.toolPolicies[tool.internalName]
@@ -1873,6 +1978,7 @@ class ProjectInfoProvider implements CapabilityProvider {
         properties: {},
         additionalProperties: false,
       },
+      effect: "read",
     }];
   }
 
@@ -1894,6 +2000,148 @@ class ProjectInfoProvider implements CapabilityProvider {
         }, null, 2),
       }],
       details: { readOnly: true },
+    };
+  }
+
+  async healthCheck() {
+    return { state: "ready" as const };
+  }
+
+  async dispose(): Promise<void> {}
+}
+
+type PlanToolHandlers = NonNullable<DekiAgentRuntimeOptions["planTools"]>;
+
+class PlanToolsProvider implements CapabilityProvider {
+  readonly id = "plan";
+  readonly #handlers: PlanToolHandlers;
+
+  constructor(handlers: PlanToolHandlers) {
+    this.#handlers = handlers;
+  }
+
+  async listTools(): Promise<ToolDefinition[]> {
+    const stepSchema = {
+      type: "object",
+      properties: {
+        id: { type: "string", minLength: 1, maxLength: 100 },
+        title: { type: "string", minLength: 1, maxLength: 200 },
+        description: { type: "string", minLength: 1, maxLength: 10_000 },
+        dependencies: { type: "array", items: { type: "string" }, maxItems: 30 },
+        candidateFiles: { type: "array", items: { type: "string" }, maxItems: 100 },
+        validation: {
+          type: "array",
+          items: { type: "string", minLength: 1 },
+          minItems: 1,
+          maxItems: 30,
+        },
+        risk: { type: "string", enum: ["low", "medium", "high"] },
+        parallelizable: { type: "boolean" },
+        assignedProfile: { type: "string" },
+      },
+      required: [
+        "id", "title", "description", "dependencies", "candidateFiles",
+        "validation", "risk", "parallelizable",
+      ],
+      additionalProperties: false,
+    };
+    const planContent = {
+      goal: { type: "string", minLength: 1, maxLength: 100_000 },
+      assumptions: { type: "array", items: { type: "string" }, maxItems: 100 },
+      constraints: { type: "array", items: { type: "string" }, maxItems: 100 },
+      steps: { type: "array", items: stepSchema, minItems: 1, maxItems: 30 },
+    };
+    return [
+      {
+        name: "submit",
+        description: "提交当前只读分析得到的结构化实施计划，供用户审阅。",
+        inputSchema: {
+          type: "object",
+          properties: planContent,
+          required: ["goal", "assumptions", "constraints", "steps"],
+          additionalProperties: false,
+        },
+        effect: "plan-control",
+      },
+      {
+        name: "revise",
+        description: "根据反馈创建计划的新版本，不修改历史版本。",
+        inputSchema: {
+          type: "object",
+          properties: {
+            planId: { type: "string", format: "uuid" },
+            basedOnRevision: { type: "integer", minimum: 1 },
+            feedback: { type: "string", maxLength: 10_000 },
+            ...planContent,
+          },
+          required: [
+            "planId", "basedOnRevision", "goal", "assumptions", "constraints", "steps",
+          ],
+          additionalProperties: false,
+        },
+        effect: "plan-control",
+      },
+      {
+        name: "update_step",
+        description: "更新当前执行版本中的计划步骤状态。",
+        inputSchema: {
+          type: "object",
+          properties: {
+            planId: { type: "string", format: "uuid" },
+            revision: { type: "integer", minimum: 1 },
+            stepId: { type: "string", minLength: 1 },
+            status: { type: "string", enum: ["running", "completed", "blocked"] },
+            summary: { type: "string", maxLength: 10_000 },
+            evidence: { type: "array", items: { type: "string" }, maxItems: 100 },
+            reason: { type: "string", maxLength: 10_000 },
+          },
+          required: ["planId", "revision", "stepId", "status"],
+          additionalProperties: false,
+        },
+        effect: "plan-control",
+      },
+      {
+        name: "request_replan",
+        description: "执行条件偏离已批准计划时暂停执行并请求重新规划。",
+        inputSchema: {
+          type: "object",
+          properties: {
+            planId: { type: "string", format: "uuid" },
+            reason: { type: "string", minLength: 1, maxLength: 10_000 },
+            affectedStepIds: {
+              type: "array",
+              items: { type: "string" },
+              minItems: 1,
+              maxItems: 30,
+            },
+            evidence: { type: "array", items: { type: "string" }, maxItems: 100 },
+          },
+          required: ["planId", "reason", "affectedStepIds"],
+          additionalProperties: false,
+        },
+        effect: "plan-control",
+      },
+    ];
+  }
+
+  async callTool(
+    name: string,
+    input: unknown,
+    context: ToolCallContext,
+  ): Promise<ToolResult> {
+    const value = input as any;
+    let result: unknown;
+    if (name === "submit") result = await this.#handlers.submit(value, context);
+    else if (name === "revise") result = await this.#handlers.revise(value, context);
+    else if (name === "update_step") result = await this.#handlers.updateStep(value, context);
+    else if (name === "request_replan") {
+      result = await this.#handlers.requestReplan(value, context);
+    } else {
+      throw new Error(`未知 Plan Tool: ${name}`);
+    }
+    return {
+      content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      details: result,
     };
   }
 
@@ -1945,6 +2193,7 @@ class TaskInteractionProvider implements CapabilityProvider {
         additionalProperties: false,
       },
       readOnlyHint: true,
+      effect: "interaction",
       timeoutMs: 86_400_000,
     }];
   }

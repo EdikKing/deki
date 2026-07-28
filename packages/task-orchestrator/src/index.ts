@@ -2,6 +2,12 @@ import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import {
   artifactRecordSchema,
+  planDetailSchema,
+  planEventSchema,
+  planRecordSchema,
+  planRevisionRecordSchema,
+  planStepStateSchema,
+  planSummarySchema,
   runRecordSchema,
   taskDetailSchema,
   taskEventSchema,
@@ -11,6 +17,15 @@ import {
   type AgentEvent,
   type ArtifactKind,
   type ArtifactRecord,
+  type PlanDetail,
+  type PlanEvent,
+  type PlanEventType,
+  type PlanRecord,
+  type PlanRevisionRecord,
+  type PlanStatus,
+  type PlanStep,
+  type PlanStepState,
+  type PlanSummary,
   type RunRecord,
   type RunStatus,
   type TaskDetail,
@@ -32,6 +47,9 @@ export const promptExecutionInputSchema = z.object({
   sourceEntryId: z.string().min(1).optional(),
   preferFork: z.boolean(),
   continuation: z.boolean().optional(),
+  interactionMode: z.enum(["act", "plan", "plan-execution"]).optional(),
+  planId: z.string().uuid().optional(),
+  planRevision: z.number().int().positive().optional(),
 }).strict();
 export type PromptExecutionInput = z.infer<typeof promptExecutionInputSchema>;
 export type TaskExecutionInput = PromptExecutionInput;
@@ -128,6 +146,56 @@ interface RequestRow {
   resolved_at: string | null;
 }
 
+interface PlanRow {
+  id: string;
+  workspace_id: string;
+  workspace_path: string | null;
+  session_id: string;
+  planning_task_id: string | null;
+  execution_task_id: string | null;
+  goal: string;
+  status: string;
+  current_revision: number;
+  approved_revision: number | null;
+  executing_revision: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
+interface PlanRevisionRow {
+  plan_id: string;
+  revision: number;
+  feedback: string | null;
+  assumptions_json: string;
+  constraints_json: string;
+  steps_json: string;
+  created_at: string;
+}
+
+interface PlanStepStateRow {
+  plan_id: string;
+  revision: number;
+  step_id: string;
+  status: string;
+  summary: string | null;
+  evidence_json: string;
+  reason: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  updated_at: string;
+}
+
+interface PlanEventRow {
+  event_id: string;
+  plan_id: string;
+  task_id: string | null;
+  run_id: string | null;
+  timestamp: string;
+  sequence: number;
+  type: string;
+  payload_json: string;
+}
+
 const taskTransitions: Record<TaskStatus, ReadonlySet<TaskStatus>> = {
   queued: new Set(["running", "paused", "cancelled"]),
   running: new Set([
@@ -158,9 +226,19 @@ const runTransitions: Record<RunStatus, ReadonlySet<RunStatus>> = {
   interrupted: new Set(),
 };
 
+const planTransitions: Record<PlanStatus, ReadonlySet<PlanStatus>> = {
+  draft: new Set(["ready", "abandoned"]),
+  ready: new Set(["draft", "approved", "abandoned"]),
+  approved: new Set(["executing", "draft", "abandoned"]),
+  executing: new Set(["draft", "completed", "abandoned"]),
+  completed: new Set(),
+  abandoned: new Set(),
+};
+
 export class TaskStore {
   readonly #database: DatabaseSync;
   readonly #listeners = new Set<(event: TaskEvent) => void>();
+  readonly #planListeners = new Set<(event: PlanEvent) => void>();
 
   constructor(databasePath: string) {
     this.#database = new DatabaseSync(databasePath);
@@ -172,6 +250,11 @@ export class TaskStore {
   subscribe(listener: (event: TaskEvent) => void): () => void {
     this.#listeners.add(listener);
     return () => this.#listeners.delete(listener);
+  }
+
+  subscribePlans(listener: (event: PlanEvent) => void): () => void {
+    this.#planListeners.add(listener);
+    return () => this.#planListeners.delete(listener);
   }
 
   createTask(input: {
@@ -355,6 +438,410 @@ export class TaskStore {
       WHERE workspace_id = ? AND workspace_path IS NULL
     `).run(workspacePath, workspaceId);
     return Number(result.changes);
+  }
+
+  createPlan(input: {
+    workspaceId: string;
+    workspacePath?: string;
+    sessionId: string;
+    planningTaskId?: string;
+    goal: string;
+    assumptions: string[];
+    constraints: string[];
+    steps: PlanStep[];
+  }): PlanRecord {
+    validatePlanSteps(input.steps);
+    const id = randomUUID();
+    const now = new Date().toISOString();
+    const plan = planRecordSchema.parse({
+      id,
+      workspaceId: input.workspaceId,
+      ...(input.workspacePath ? { workspacePath: input.workspacePath } : {}),
+      sessionId: input.sessionId,
+      ...(input.planningTaskId ? { planningTaskId: input.planningTaskId } : {}),
+      goal: input.goal,
+      status: "ready",
+      currentRevision: 1,
+      createdAt: now,
+      updatedAt: now,
+    });
+    const revision = planRevisionRecordSchema.parse({
+      planId: id,
+      revision: 1,
+      assumptions: input.assumptions,
+      constraints: input.constraints,
+      steps: input.steps,
+      createdAt: now,
+    });
+    this.#transaction((_events, planEvents) => {
+      this.#database.prepare(`
+        INSERT INTO plans (
+          id, workspace_id, workspace_path, session_id, planning_task_id,
+          execution_task_id, goal, status, current_revision, approved_revision,
+          executing_revision, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, NULL, ?, 'ready', 1, NULL, NULL, ?, ?)
+      `).run(
+        plan.id,
+        plan.workspaceId,
+        plan.workspacePath ?? null,
+        plan.sessionId,
+        plan.planningTaskId ?? null,
+        plan.goal,
+        now,
+        now,
+      );
+      this.#insertPlanRevision(revision);
+      this.#initializePlanStepStates(revision);
+      if (plan.planningTaskId) {
+        this.#database.prepare(
+          "UPDATE tasks SET plan_id = ?, updated_at = ? WHERE id = ?",
+        ).run(plan.id, now, plan.planningTaskId);
+      }
+      planEvents.push(this.#appendPlanEvent(
+        plan.id,
+        "plan.created",
+        { revision: 1, goal: plan.goal },
+        plan.planningTaskId,
+      ));
+      planEvents.push(this.#appendPlanEvent(
+        plan.id,
+        "plan.submitted",
+        { revision: 1, stepCount: revision.steps.length },
+        plan.planningTaskId,
+      ));
+    });
+    return plan;
+  }
+
+  revisePlan(planId: string, input: {
+    planningTaskId?: string;
+    feedback?: string;
+    assumptions: string[];
+    constraints: string[];
+    steps: PlanStep[];
+  }): PlanRecord {
+    const plan = this.#requirePlan(planId);
+    if (!["draft", "ready"].includes(plan.status)) {
+      throw new Error(`计划当前状态为 ${plan.status}，不能修订`);
+    }
+    validatePlanSteps(input.steps);
+    const revisionNumber = plan.currentRevision + 1;
+    const now = new Date().toISOString();
+    const revision = planRevisionRecordSchema.parse({
+      planId,
+      revision: revisionNumber,
+      ...(input.feedback ? { feedback: input.feedback } : {}),
+      assumptions: input.assumptions,
+      constraints: input.constraints,
+      steps: input.steps,
+      createdAt: now,
+    });
+    const previous = this.#requirePlanRevision(planId, plan.currentRevision);
+    const previousStates = this.#listPlanStepStates(planId, plan.currentRevision);
+    this.#transaction((_events, planEvents) => {
+      this.#insertPlanRevision(revision);
+      this.#initializePlanStepStates(revision, previous, previousStates);
+      this.#database.prepare(`
+        UPDATE plans
+        SET status = 'ready', current_revision = ?, planning_task_id = ?,
+            updated_at = ?
+        WHERE id = ?
+      `).run(revisionNumber, input.planningTaskId ?? null, now, planId);
+      planEvents.push(this.#appendPlanEvent(
+        planId,
+        "plan.revised",
+        { revision: revisionNumber, basedOnRevision: plan.currentRevision },
+        input.planningTaskId,
+      ));
+    });
+    return this.#requirePlan(planId);
+  }
+
+  requestPlanRevision(planId: string, feedback: string): PlanRecord {
+    const plan = this.#requirePlan(planId);
+    if (!["ready", "approved", "executing"].includes(plan.status)) {
+      throw new Error(`计划当前状态为 ${plan.status}，不能请求修订`);
+    }
+    this.#assertPlanTransition(plan.status, "draft");
+    const now = new Date().toISOString();
+    this.#transaction((_events, planEvents) => {
+      this.#database.prepare(
+        "UPDATE plans SET status = 'draft', updated_at = ? WHERE id = ?",
+      ).run(now, planId);
+      planEvents.push(this.#appendPlanEvent(
+        planId,
+        "plan.replan_requested",
+        { feedback },
+        plan.executionTaskId,
+      ));
+    });
+    return this.#requirePlan(planId);
+  }
+
+  getPlan(planId: string): PlanDetail | undefined {
+    const plan = this.#getPlanRecord(planId);
+    if (!plan) return undefined;
+    const revisions = this.#database.prepare(`
+      SELECT * FROM plan_revisions
+      WHERE plan_id = ? ORDER BY revision ASC
+    `).all(planId) as unknown as PlanRevisionRow[];
+    const states = this.#database.prepare(`
+      SELECT * FROM plan_step_states
+      WHERE plan_id = ? ORDER BY revision ASC, step_id ASC
+    `).all(planId) as unknown as PlanStepStateRow[];
+    const events = this.#database.prepare(`
+      SELECT * FROM plan_events
+      WHERE plan_id = ? ORDER BY sequence ASC
+    `).all(planId) as unknown as PlanEventRow[];
+    return planDetailSchema.parse({
+      plan,
+      revisions: revisions.map(rowToPlanRevision),
+      stepStates: states.map(rowToPlanStepState),
+      events: events.map(rowToPlanEvent),
+      ...(plan.executionTaskId
+        ? { executionTask: this.getTask(plan.executionTaskId) }
+        : {}),
+    });
+  }
+
+  getPlanForPlanningTask(taskId: string): PlanRecord | undefined {
+    const row = this.#database.prepare(
+      "SELECT * FROM plans WHERE planning_task_id = ? ORDER BY updated_at DESC LIMIT 1",
+    ).get(taskId) as unknown as PlanRow | undefined;
+    return row ? rowToPlan(row) : undefined;
+  }
+
+  listPlans(options: {
+    statuses?: PlanStatus[];
+    workspaceIds?: string[];
+    query?: string;
+    limit?: number;
+  } = {}): PlanSummary[] {
+    const limit = Math.min(500, Math.max(1, options.limit ?? 100));
+    if (options.statuses?.length === 0 || options.workspaceIds?.length === 0) return [];
+    const clauses: string[] = [];
+    const values: Array<string | number> = [];
+    if (options.statuses?.length) {
+      clauses.push(`status IN (${options.statuses.map(() => "?").join(", ")})`);
+      values.push(...options.statuses);
+    }
+    if (options.workspaceIds?.length) {
+      clauses.push(`workspace_id IN (${options.workspaceIds.map(() => "?").join(", ")})`);
+      values.push(...options.workspaceIds);
+    }
+    if (options.query?.trim()) {
+      clauses.push("goal LIKE ?");
+      values.push(`%${options.query.trim()}%`);
+    }
+    const rows = this.#database.prepare(`
+      SELECT * FROM plans
+      ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
+      ORDER BY updated_at DESC LIMIT ?
+    `).all(...values, limit) as unknown as PlanRow[];
+    return rows.map((row) => {
+      const plan = rowToPlan(row);
+      const revision = this.#requirePlanRevision(plan.id, plan.currentRevision);
+      const states = this.#listPlanStepStates(plan.id, plan.currentRevision);
+      const stateById = new Map(states.map((state) => [state.stepId, state]));
+      return planSummarySchema.parse({
+        plan,
+        revision,
+        completedSteps: states.filter((state) =>
+          state.status === "completed" || state.status === "skipped"
+        ).length,
+        totalSteps: revision.steps.length,
+        currentStep: revision.steps.find((step) =>
+          stateById.get(step.id)?.status === "running"
+          || stateById.get(step.id)?.status === "blocked"
+        ),
+      });
+    });
+  }
+
+  approvePlan(planId: string, revisionNumber: number, input: {
+    title: string;
+    execution: PromptExecutionInput;
+  }): TaskRecord {
+    const plan = this.#requirePlan(planId);
+    if (plan.status !== "ready") throw new Error("只有待审阅计划可以批准");
+    if (revisionNumber !== plan.currentRevision) throw new Error("只能批准最新计划版本");
+    this.#requirePlanRevision(planId, revisionNumber);
+    const now = new Date().toISOString();
+    let task: TaskRecord;
+    this.#transaction((events, planEvents) => {
+      if (plan.executionTaskId) {
+        const existing = this.#requireTask(plan.executionTaskId);
+        if (!["paused", "interrupted", "failed"].includes(existing.status)) {
+          throw new Error(`执行任务当前状态为 ${existing.status}，不能恢复`);
+        }
+        this.#database.prepare(`
+          UPDATE tasks
+          SET status = 'queued', execution_json = ?, updated_at = ?, completed_at = NULL
+          WHERE id = ?
+        `).run(JSON.stringify(promptExecutionInputSchema.parse(input.execution)), now, existing.id);
+        events.push(this.#appendEvent(existing.id, "task.resumed", { planId, revision: revisionNumber }));
+        events.push(this.#appendEvent(existing.id, "task.queued", { planId, revision: revisionNumber }));
+        task = { ...existing, status: "queued", updatedAt: now, completedAt: undefined };
+      } else {
+        task = this.#insertTask({
+          workspaceId: plan.workspaceId,
+          ...(plan.workspacePath ? { workspacePath: plan.workspacePath } : {}),
+          kind: "plan-execution",
+          title: input.title,
+          goal: plan.goal,
+          planId,
+          execution: input.execution,
+        }, events);
+      }
+      this.#database.prepare(`
+        UPDATE plans
+        SET status = 'approved', approved_revision = ?, execution_task_id = ?, updated_at = ?
+        WHERE id = ?
+      `).run(revisionNumber, task.id, now, planId);
+      planEvents.push(this.#appendPlanEvent(
+        planId,
+        "plan.approved",
+        { revision: revisionNumber },
+        task.id,
+      ));
+    });
+    return task!;
+  }
+
+  markPlanExecuting(planId: string, taskId: string, runId: string): void {
+    const plan = this.#requirePlan(planId);
+    if (plan.status === "executing") return;
+    if (plan.status !== "approved") throw new Error("计划尚未批准");
+    const now = new Date().toISOString();
+    this.#transaction((_events, planEvents) => {
+      this.#database.prepare(`
+        UPDATE plans SET status = 'executing', executing_revision = approved_revision,
+          updated_at = ? WHERE id = ?
+      `).run(now, planId);
+      planEvents.push(this.#appendPlanEvent(
+        planId,
+        "plan.execution_started",
+        { revision: plan.approvedRevision },
+        taskId,
+        runId,
+      ));
+    });
+  }
+
+  updatePlanStep(planId: string, input: {
+    revision: number;
+    stepId: string;
+    status: "running" | "completed" | "blocked";
+    summary?: string;
+    evidence?: string[];
+    reason?: string;
+    taskId?: string;
+    runId?: string;
+  }): PlanStepState {
+    const plan = this.#requirePlan(planId);
+    if (plan.status !== "executing") throw new Error("计划当前未在执行");
+    if (plan.executingRevision !== input.revision) throw new Error("不能更新非执行版本");
+    const revision = this.#requirePlanRevision(planId, input.revision);
+    const step = revision.steps.find((candidate) => candidate.id === input.stepId);
+    if (!step) throw new Error("未找到计划步骤");
+    const states = this.#listPlanStepStates(planId, input.revision);
+    const current = states.find((state) => state.stepId === input.stepId);
+    if (!current) throw new Error("未找到步骤状态");
+    if (input.status === "running") {
+      if (current.status !== "pending" && current.status !== "blocked") {
+        throw new Error(`步骤当前状态为 ${current.status}，不能开始`);
+      }
+      if (states.some((state) => state.status === "running" && state.stepId !== input.stepId)) {
+        throw new Error("当前已有正在执行的计划步骤");
+      }
+      const completed = new Set(states
+        .filter((state) => state.status === "completed" || state.status === "skipped")
+        .map((state) => state.stepId));
+      if (step.dependencies.some((dependency) => !completed.has(dependency))) {
+        throw new Error("步骤依赖尚未完成");
+      }
+    } else if (current.status !== "running") {
+      throw new Error("只有正在执行的步骤可以完成或阻塞");
+    }
+    const now = new Date().toISOString();
+    const next = planStepStateSchema.parse({
+      ...current,
+      status: input.status,
+      ...(input.summary ? { summary: input.summary } : {}),
+      evidence: input.evidence ?? current.evidence,
+      ...(input.reason ? { reason: input.reason } : {}),
+      ...(input.status === "running" ? { startedAt: now } : {}),
+      ...(input.status === "completed" ? { completedAt: now } : {}),
+      updatedAt: now,
+    });
+    this.#transaction((_events, planEvents) => {
+      this.#database.prepare(`
+        UPDATE plan_step_states
+        SET status = ?, summary = ?, evidence_json = ?, reason = ?,
+          started_at = ?, completed_at = ?, updated_at = ?
+        WHERE plan_id = ? AND revision = ? AND step_id = ?
+      `).run(
+        next.status,
+        next.summary ?? null,
+        JSON.stringify(next.evidence),
+        next.reason ?? null,
+        next.startedAt ?? null,
+        next.completedAt ?? null,
+        next.updatedAt,
+        planId,
+        input.revision,
+        input.stepId,
+      );
+      const type: PlanEventType = input.status === "running"
+        ? "plan.step_started"
+        : input.status === "completed"
+          ? "plan.step_completed"
+          : "plan.step_blocked";
+      planEvents.push(this.#appendPlanEvent(
+        planId,
+        type,
+        { revision: input.revision, stepId: input.stepId, ...(input.reason ? { reason: input.reason } : {}) },
+        input.taskId,
+        input.runId,
+      ));
+    });
+    return next;
+  }
+
+  completePlan(planId: string, taskId?: string, runId?: string): void {
+    const plan = this.#requirePlan(planId);
+    if (plan.status !== "executing" || !plan.executingRevision) return;
+    const states = this.#listPlanStepStates(planId, plan.executingRevision);
+    if (states.some((state) => state.status !== "completed" && state.status !== "skipped")) {
+      throw new Error("计划仍有未完成步骤");
+    }
+    const now = new Date().toISOString();
+    this.#transaction((_events, planEvents) => {
+      this.#database.prepare(
+        "UPDATE plans SET status = 'completed', updated_at = ? WHERE id = ?",
+      ).run(now, planId);
+      planEvents.push(this.#appendPlanEvent(planId, "plan.completed", {}, taskId, runId));
+    });
+  }
+
+  abandonPlan(planId: string): PlanRecord {
+    const plan = this.#requirePlan(planId);
+    if (plan.status === "completed" || plan.status === "abandoned") {
+      throw new Error("计划已经结束");
+    }
+    const now = new Date().toISOString();
+    this.#transaction((_events, planEvents) => {
+      this.#database.prepare(
+        "UPDATE plans SET status = 'abandoned', updated_at = ? WHERE id = ?",
+      ).run(now, planId);
+      planEvents.push(this.#appendPlanEvent(
+        planId,
+        "plan.abandoned",
+        {},
+        plan.executionTaskId,
+      ));
+    });
+    return this.#requirePlan(planId);
   }
 
   createRun(taskId: string, runnerId = "local"): RunRecord {
@@ -900,20 +1387,208 @@ export class TaskStore {
     }
   }
 
-  #transaction<T>(operation: (events: TaskEvent[]) => T): T {
+  #assertPlanTransition(from: PlanStatus, to: PlanStatus): void {
+    if (!planTransitions[from].has(to)) {
+      throw new Error(`非法计划状态转换: ${from} -> ${to}`);
+    }
+  }
+
+  #getPlanRecord(id: string): PlanRecord | undefined {
+    const row = this.#database.prepare(
+      "SELECT * FROM plans WHERE id = ?",
+    ).get(id) as unknown as PlanRow | undefined;
+    return row ? rowToPlan(row) : undefined;
+  }
+
+  #requirePlan(id: string): PlanRecord {
+    const plan = this.#getPlanRecord(id);
+    if (!plan) throw new Error(`未找到计划: ${id}`);
+    return plan;
+  }
+
+  #requirePlanRevision(planId: string, revision: number): PlanRevisionRecord {
+    const row = this.#database.prepare(`
+      SELECT * FROM plan_revisions WHERE plan_id = ? AND revision = ?
+    `).get(planId, revision) as unknown as PlanRevisionRow | undefined;
+    if (!row) throw new Error(`未找到计划版本: ${planId}@${revision}`);
+    return rowToPlanRevision(row);
+  }
+
+  #listPlanStepStates(planId: string, revision: number): PlanStepState[] {
+    const rows = this.#database.prepare(`
+      SELECT * FROM plan_step_states
+      WHERE plan_id = ? AND revision = ? ORDER BY step_id ASC
+    `).all(planId, revision) as unknown as PlanStepStateRow[];
+    return rows.map(rowToPlanStepState);
+  }
+
+  #insertPlanRevision(revision: PlanRevisionRecord): void {
+    this.#database.prepare(`
+      INSERT INTO plan_revisions (
+        plan_id, revision, feedback, assumptions_json, constraints_json,
+        steps_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      revision.planId,
+      revision.revision,
+      revision.feedback ?? null,
+      JSON.stringify(revision.assumptions),
+      JSON.stringify(revision.constraints),
+      JSON.stringify(revision.steps),
+      revision.createdAt,
+    );
+  }
+
+  #initializePlanStepStates(
+    revision: PlanRevisionRecord,
+    previous?: PlanRevisionRecord,
+    previousStates: PlanStepState[] = [],
+  ): void {
+    const now = new Date().toISOString();
+    const previousSteps = new Map(previous?.steps.map((step) => [step.id, step]) ?? []);
+    const previousStateById = new Map(previousStates.map((state) => [state.stepId, state]));
+    const insert = this.#database.prepare(`
+      INSERT INTO plan_step_states (
+        plan_id, revision, step_id, status, summary, evidence_json, reason,
+        started_at, completed_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const step of revision.steps) {
+      const oldStep = previousSteps.get(step.id);
+      const oldState = previousStateById.get(step.id);
+      const preserved = oldStep
+        && oldState?.status === "completed"
+        && JSON.stringify(oldStep) === JSON.stringify(step);
+      insert.run(
+        revision.planId,
+        revision.revision,
+        step.id,
+        preserved ? "completed" : "pending",
+        preserved ? oldState.summary ?? null : null,
+        JSON.stringify(preserved ? oldState.evidence : []),
+        null,
+        preserved ? oldState.startedAt ?? null : null,
+        preserved ? oldState.completedAt ?? null : null,
+        now,
+      );
+    }
+  }
+
+  #insertTask(input: {
+    workspaceId: string;
+    workspacePath?: string;
+    kind: TaskKind;
+    title: string;
+    goal: string;
+    execution: TaskExecutionInput;
+    priority?: number;
+    planId?: string;
+  }, events: TaskEvent[]): TaskRecord {
+    const id = randomUUID();
+    const now = new Date().toISOString();
+    const task = taskRecordSchema.parse({
+      id,
+      workspaceId: input.workspaceId,
+      ...(input.workspacePath ? { workspacePath: input.workspacePath } : {}),
+      rootTaskId: id,
+      kind: input.kind,
+      title: input.title.trim(),
+      goal: input.goal.trim(),
+      status: "queued",
+      priority: input.priority ?? 0,
+      ...(input.planId ? { planId: input.planId } : {}),
+      createdAt: now,
+      updatedAt: now,
+    });
+    this.#database.prepare(`
+      INSERT INTO tasks (
+        id, workspace_id, workspace_path, root_task_id, parent_task_id, kind,
+        title, goal, status, priority, session_id, plan_id, current_run_id,
+        assigned_profile, execution_json, created_at, updated_at, completed_at
+      ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, 'queued', ?, NULL, ?, NULL, NULL, ?, ?, ?, NULL)
+    `).run(
+      task.id,
+      task.workspaceId,
+      task.workspacePath ?? null,
+      task.rootTaskId,
+      task.kind,
+      task.title,
+      task.goal,
+      task.priority,
+      task.planId ?? null,
+      JSON.stringify(promptExecutionInputSchema.parse(input.execution)),
+      task.createdAt,
+      task.updatedAt,
+    );
+    events.push(this.#appendEvent(task.id, "task.created", {
+      kind: task.kind,
+      title: task.title,
+      ...(task.planId ? { planId: task.planId } : {}),
+    }));
+    events.push(this.#appendEvent(task.id, "task.queued", {
+      ...(task.planId ? { planId: task.planId } : {}),
+    }));
+    return task;
+  }
+
+  #transaction<T>(
+    operation: (events: TaskEvent[], planEvents: PlanEvent[]) => T,
+  ): T {
     const events: TaskEvent[] = [];
+    const planEvents: PlanEvent[] = [];
     this.#database.exec("BEGIN IMMEDIATE");
     try {
-      const result = operation(events);
+      const result = operation(events, planEvents);
       this.#database.exec("COMMIT");
       for (const event of events) {
         for (const listener of this.#listeners) listener(event);
+      }
+      for (const event of planEvents) {
+        for (const listener of this.#planListeners) listener(event);
       }
       return result;
     } catch (error) {
       this.#database.exec("ROLLBACK");
       throw error;
     }
+  }
+
+  #appendPlanEvent(
+    planId: string,
+    type: PlanEventType,
+    payload: Record<string, unknown>,
+    taskId?: string,
+    runId?: string,
+  ): PlanEvent {
+    const sequenceRow = this.#database.prepare(`
+      SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence
+      FROM plan_events WHERE plan_id = ?
+    `).get(planId) as { sequence: number };
+    const event = planEventSchema.parse({
+      eventId: randomUUID(),
+      planId,
+      ...(taskId ? { taskId } : {}),
+      ...(runId ? { runId } : {}),
+      timestamp: new Date().toISOString(),
+      sequence: sequenceRow.sequence,
+      type,
+      payload,
+    });
+    this.#database.prepare(`
+      INSERT INTO plan_events (
+        event_id, plan_id, task_id, run_id, timestamp, sequence, type, payload_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      event.eventId,
+      event.planId,
+      event.taskId ?? null,
+      event.runId ?? null,
+      event.timestamp,
+      event.sequence,
+      event.type,
+      JSON.stringify(event.payload),
+    );
+    return event;
   }
 
   #appendEvent(
@@ -1046,7 +1721,64 @@ export class TaskStore {
         );
         CREATE INDEX task_requests_pending_idx
           ON task_requests(task_id, status, created_at);
-        PRAGMA user_version = 2;
+        CREATE TABLE plans (
+          id TEXT PRIMARY KEY,
+          workspace_id TEXT NOT NULL,
+          workspace_path TEXT,
+          session_id TEXT NOT NULL,
+          planning_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+          execution_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+          goal TEXT NOT NULL,
+          status TEXT NOT NULL,
+          current_revision INTEGER NOT NULL,
+          approved_revision INTEGER,
+          executing_revision INTEGER,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE INDEX plans_workspace_updated_idx
+          ON plans(workspace_id, updated_at DESC);
+        CREATE INDEX plans_status_updated_idx
+          ON plans(status, updated_at DESC);
+        CREATE TABLE plan_revisions (
+          plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+          revision INTEGER NOT NULL,
+          feedback TEXT,
+          assumptions_json TEXT NOT NULL,
+          constraints_json TEXT NOT NULL,
+          steps_json TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          PRIMARY KEY(plan_id, revision)
+        );
+        CREATE TABLE plan_step_states (
+          plan_id TEXT NOT NULL,
+          revision INTEGER NOT NULL,
+          step_id TEXT NOT NULL,
+          status TEXT NOT NULL,
+          summary TEXT,
+          evidence_json TEXT NOT NULL,
+          reason TEXT,
+          started_at TEXT,
+          completed_at TEXT,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY(plan_id, revision, step_id),
+          FOREIGN KEY(plan_id, revision)
+            REFERENCES plan_revisions(plan_id, revision) ON DELETE CASCADE
+        );
+        CREATE TABLE plan_events (
+          event_id TEXT PRIMARY KEY,
+          plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+          task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+          run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+          timestamp TEXT NOT NULL,
+          sequence INTEGER NOT NULL,
+          type TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          UNIQUE(plan_id, sequence)
+        );
+        CREATE INDEX plan_events_plan_sequence_idx
+          ON plan_events(plan_id, sequence);
+        PRAGMA user_version = 3;
         COMMIT;
       `);
       return;
@@ -1073,6 +1805,70 @@ export class TaskStore {
         CREATE INDEX task_requests_pending_idx
           ON task_requests(task_id, status, created_at);
         PRAGMA user_version = 2;
+        COMMIT;
+      `);
+    }
+    if (version === 1 || version === 2) {
+      this.#database.exec(`
+        BEGIN;
+        CREATE TABLE plans (
+          id TEXT PRIMARY KEY,
+          workspace_id TEXT NOT NULL,
+          workspace_path TEXT,
+          session_id TEXT NOT NULL,
+          planning_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+          execution_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+          goal TEXT NOT NULL,
+          status TEXT NOT NULL,
+          current_revision INTEGER NOT NULL,
+          approved_revision INTEGER,
+          executing_revision INTEGER,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE INDEX plans_workspace_updated_idx
+          ON plans(workspace_id, updated_at DESC);
+        CREATE INDEX plans_status_updated_idx
+          ON plans(status, updated_at DESC);
+        CREATE TABLE plan_revisions (
+          plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+          revision INTEGER NOT NULL,
+          feedback TEXT,
+          assumptions_json TEXT NOT NULL,
+          constraints_json TEXT NOT NULL,
+          steps_json TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          PRIMARY KEY(plan_id, revision)
+        );
+        CREATE TABLE plan_step_states (
+          plan_id TEXT NOT NULL,
+          revision INTEGER NOT NULL,
+          step_id TEXT NOT NULL,
+          status TEXT NOT NULL,
+          summary TEXT,
+          evidence_json TEXT NOT NULL,
+          reason TEXT,
+          started_at TEXT,
+          completed_at TEXT,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY(plan_id, revision, step_id),
+          FOREIGN KEY(plan_id, revision)
+            REFERENCES plan_revisions(plan_id, revision) ON DELETE CASCADE
+        );
+        CREATE TABLE plan_events (
+          event_id TEXT PRIMARY KEY,
+          plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+          task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+          run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+          timestamp TEXT NOT NULL,
+          sequence INTEGER NOT NULL,
+          type TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          UNIQUE(plan_id, sequence)
+        );
+        CREATE INDEX plan_events_plan_sequence_idx
+          ON plan_events(plan_id, sequence);
+        PRAGMA user_version = 3;
         COMMIT;
       `);
     }
@@ -1151,9 +1947,10 @@ export class TaskOrchestrator {
     workspacePath?: string;
     title: string;
     prompt: string;
-    kind: "interactive" | "background";
+    kind: "interactive" | "background" | "planning";
     execution: PromptExecutionInput;
     priority?: number;
+    planId?: string;
   }): TaskRecord {
     if (this.#disposed) throw new Error("Task Orchestrator 已释放");
     const workspaceId = input.workspaceId ?? this.#defaultWorkspaceId;
@@ -1165,6 +1962,7 @@ export class TaskOrchestrator {
       goal: input.prompt,
       kind: input.kind,
       execution: input.execution,
+      ...(input.planId ? { planId: input.planId } : {}),
       ...(input.priority === undefined ? {} : { priority: input.priority }),
     });
     this.#drain();
@@ -1439,6 +2237,9 @@ export class TaskOrchestrator {
     run: RunRecord,
   ): Promise<void> {
     try {
+      if (task.kind === "plan-execution" && task.planId) {
+        this.#store.markPlanExecuting(task.planId, task.id, run.id);
+      }
       const handle = await this.#executor({
         task,
         run,
@@ -1459,6 +2260,12 @@ export class TaskOrchestrator {
         if (handle.captureContext) this.#store.updateExecution(task.id, handle.captureContext());
         this.#store.finishPausedRun(task.id, run.id);
       } else {
+        if (task.kind === "planning" && !this.#store.getPlanForPlanningTask(task.id)) {
+          throw new Error("Planning Task 未提交结构化计划");
+        }
+        if (task.kind === "plan-execution" && task.planId) {
+          this.#store.completePlan(task.planId, task.id, run.id);
+        }
         this.#store.finishRun(
           task.id,
           run.id,
@@ -1591,6 +2398,106 @@ function rowToRequest(row: RequestRow): TaskRequestRecord {
     createdAt: row.created_at,
     ...(row.resolved_at ? { resolvedAt: row.resolved_at } : {}),
   });
+}
+
+function rowToPlan(row: PlanRow): PlanRecord {
+  return planRecordSchema.parse({
+    id: row.id,
+    workspaceId: row.workspace_id,
+    ...(row.workspace_path ? { workspacePath: row.workspace_path } : {}),
+    sessionId: row.session_id,
+    ...(row.planning_task_id ? { planningTaskId: row.planning_task_id } : {}),
+    ...(row.execution_task_id ? { executionTaskId: row.execution_task_id } : {}),
+    goal: row.goal,
+    status: row.status,
+    currentRevision: row.current_revision,
+    ...(row.approved_revision ? { approvedRevision: row.approved_revision } : {}),
+    ...(row.executing_revision ? { executingRevision: row.executing_revision } : {}),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  });
+}
+
+function rowToPlanRevision(row: PlanRevisionRow): PlanRevisionRecord {
+  return planRevisionRecordSchema.parse({
+    planId: row.plan_id,
+    revision: row.revision,
+    ...(row.feedback ? { feedback: row.feedback } : {}),
+    assumptions: JSON.parse(row.assumptions_json),
+    constraints: JSON.parse(row.constraints_json),
+    steps: JSON.parse(row.steps_json),
+    createdAt: row.created_at,
+  });
+}
+
+function rowToPlanStepState(row: PlanStepStateRow): PlanStepState {
+  return planStepStateSchema.parse({
+    planId: row.plan_id,
+    revision: row.revision,
+    stepId: row.step_id,
+    status: row.status,
+    ...(row.summary ? { summary: row.summary } : {}),
+    evidence: JSON.parse(row.evidence_json),
+    ...(row.reason ? { reason: row.reason } : {}),
+    ...(row.started_at ? { startedAt: row.started_at } : {}),
+    ...(row.completed_at ? { completedAt: row.completed_at } : {}),
+    updatedAt: row.updated_at,
+  });
+}
+
+function rowToPlanEvent(row: PlanEventRow): PlanEvent {
+  return planEventSchema.parse({
+    eventId: row.event_id,
+    planId: row.plan_id,
+    ...(row.task_id ? { taskId: row.task_id } : {}),
+    ...(row.run_id ? { runId: row.run_id } : {}),
+    timestamp: row.timestamp,
+    sequence: row.sequence,
+    type: row.type,
+    payload: JSON.parse(row.payload_json),
+  });
+}
+
+export function validatePlanSteps(steps: PlanStep[]): void {
+  if (steps.length < 1 || steps.length > 30) {
+    throw new Error("计划步骤数量必须为 1 到 30");
+  }
+  const ids = new Set<string>();
+  for (const step of steps) {
+    if (ids.has(step.id)) throw new Error(`计划步骤 ID 重复: ${step.id}`);
+    ids.add(step.id);
+    for (const candidate of step.candidateFiles) {
+      const normalized = candidate.replaceAll("\\", "/");
+      if (
+        normalized.startsWith("/")
+        || /^[a-z]:\//i.test(normalized)
+        || normalized.split("/").includes("..")
+      ) {
+        throw new Error(`候选文件必须是工作区相对路径: ${candidate}`);
+      }
+    }
+    if (step.risk === "high" && step.validation.length === 0) {
+      throw new Error(`高风险步骤必须提供验证方式: ${step.id}`);
+    }
+  }
+  for (const step of steps) {
+    for (const dependency of step.dependencies) {
+      if (!ids.has(dependency)) throw new Error(`步骤依赖不存在: ${dependency}`);
+      if (dependency === step.id) throw new Error(`步骤不能依赖自身: ${step.id}`);
+    }
+  }
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const byId = new Map(steps.map((step) => [step.id, step]));
+  const visit = (id: string): void => {
+    if (visiting.has(id)) throw new Error("计划步骤依赖存在环");
+    if (visited.has(id)) return;
+    visiting.add(id);
+    for (const dependency of byId.get(id)?.dependencies ?? []) visit(dependency);
+    visiting.delete(id);
+    visited.add(id);
+  };
+  for (const id of ids) visit(id);
 }
 
 function isTerminalTaskStatus(status: TaskStatus): boolean {

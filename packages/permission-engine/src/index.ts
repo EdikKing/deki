@@ -809,7 +809,12 @@ function tool(
   description: string,
   inputSchema: Record<string, unknown>,
 ): ToolDefinition {
-  return { name, description, inputSchema };
+  const effect = ["read", "ls", "find", "grep"].includes(name)
+    ? "read" as const
+    : ["edit", "write", "delete", "move"].includes(name)
+      ? "write" as const
+      : "unknown" as const;
+  return { name, description, inputSchema, effect };
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

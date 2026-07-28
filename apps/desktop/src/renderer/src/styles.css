@@ -3493,6 +3493,191 @@ html[data-theme="light"] .settings-error {
   }
 }
 
+.composer-plan-notice {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 12px 0;
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.interaction-mode-switch {
+  display: inline-flex;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--bg-input);
+}
+
+.interaction-mode-switch button {
+  min-height: 28px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.interaction-mode-switch button.active {
+  color: var(--text-primary);
+  background: var(--bg-elevated);
+  box-shadow: 0 1px 3px rgb(0 0 0 / 10%);
+}
+
+.plan-panel {
+  margin: 10px;
+  padding: 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--border));
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--accent) 5%, var(--bg-elevated));
+}
+
+.plan-panel-heading,
+.plan-panel-heading > div,
+.plan-panel-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.plan-panel-heading {
+  justify-content: space-between;
+}
+
+.plan-status {
+  padding: 3px 6px;
+  border-radius: 6px;
+  background: var(--bg-input);
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 750;
+  text-transform: uppercase;
+}
+
+.plan-status.ready,
+.plan-status.executing {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
+}
+
+.plan-progress {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.plan-goal {
+  margin: 10px 0;
+  color: var(--text-primary);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.plan-context,
+.plan-revisions {
+  margin: 8px 0;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.plan-context p,
+.plan-revisions p {
+  margin: 5px 0;
+}
+
+.plan-step-list {
+  display: grid;
+  gap: 6px;
+}
+
+.plan-step {
+  padding: 7px 8px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--bg-elevated);
+}
+
+.plan-step.running {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+}
+
+.plan-step.blocked {
+  border-color: var(--danger);
+}
+
+.plan-step summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.plan-step summary > span:last-child {
+  display: grid;
+  gap: 2px;
+}
+
+.plan-step summary small,
+.plan-step > small {
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.plan-step-index {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--bg-input);
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.plan-step.completed .plan-step-index {
+  background: color-mix(in srgb, var(--success) 18%, transparent);
+  color: var(--success);
+}
+
+.plan-step p,
+.plan-step code {
+  display: block;
+  margin: 7px 0 0 30px;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
+.plan-panel-actions {
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+
+.plan-panel-actions button {
+  min-height: 30px;
+  padding: 0 9px;
+  border-radius: 8px;
+}
+
+.plan-revisions > div {
+  display: grid;
+  grid-template-columns: auto auto;
+  gap: 4px 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.plan-revisions p {
+  grid-column: 1 / -1;
+}
+
 @media (max-width: 520px) {
   .composer-toolbar {
     gap: 4px;

@@ -84,6 +84,114 @@ describe("TaskStore", () => {
     store.close();
   });
 
+  it("persists immutable Plan revisions and executes dependency-ordered steps", async () => {
+    const store = await createStore();
+    const planningTask = store.createTask({
+      workspaceId: "workspace-a",
+      workspacePath: "/tmp/workspace-a",
+      kind: "planning",
+      title: "规划功能",
+      goal: "规划并实施功能",
+      execution: { ...promptExecution(), interactionMode: "plan" },
+    });
+    const plan = store.createPlan({
+      workspaceId: "workspace-a",
+      workspacePath: "/tmp/workspace-a",
+      sessionId: "session-plan",
+      planningTaskId: planningTask.id,
+      goal: "规划并实施功能",
+      assumptions: ["现有测试可运行"],
+      constraints: ["保持兼容"],
+      steps: planSteps(),
+    });
+    expect(plan.status).toBe("ready");
+    expect(store.getPlan(plan.id)?.events.map((event) => event.sequence)).toEqual([1, 2]);
+
+    store.requestPlanRevision(plan.id, "补充回归测试");
+    store.revisePlan(plan.id, {
+      planningTaskId: planningTask.id,
+      feedback: "补充回归测试",
+      assumptions: ["现有测试可运行"],
+      constraints: ["保持兼容"],
+      steps: [
+        ...planSteps(),
+        {
+          id: "verify",
+          title: "回归验证",
+          description: "运行完整测试",
+          dependencies: ["implement"],
+          candidateFiles: [],
+          validation: ["全部测试通过"],
+          risk: "low",
+          parallelizable: false,
+        },
+      ],
+    });
+    const revised = store.getPlan(plan.id)!;
+    expect(revised.revisions).toHaveLength(2);
+    expect(revised.revisions[0]?.steps).toHaveLength(2);
+    expect(revised.revisions[1]?.steps).toHaveLength(3);
+
+    const executionTask = store.approvePlan(plan.id, 2, {
+      title: "执行计划",
+      execution: {
+        ...promptExecution(true),
+        interactionMode: "plan-execution",
+        planId: plan.id,
+        planRevision: 2,
+      },
+    });
+    const run = store.createRun(executionTask.id);
+    store.markPlanExecuting(plan.id, executionTask.id, run.id);
+    expect(() => store.updatePlanStep(plan.id, {
+      revision: 2,
+      stepId: "implement",
+      status: "running",
+    })).toThrow("依赖尚未完成");
+
+    for (const stepId of ["inspect", "implement", "verify"]) {
+      store.updatePlanStep(plan.id, {
+        revision: 2,
+        stepId,
+        status: "running",
+        taskId: executionTask.id,
+        runId: run.id,
+      });
+      store.updatePlanStep(plan.id, {
+        revision: 2,
+        stepId,
+        status: "completed",
+        summary: `${stepId} done`,
+        taskId: executionTask.id,
+        runId: run.id,
+      });
+    }
+    store.completePlan(plan.id, executionTask.id, run.id);
+    expect(store.getPlan(plan.id)?.plan.status).toBe("completed");
+    store.close();
+  });
+
+  it("rejects cyclic Plan dependencies and unsafe candidate paths", async () => {
+    const store = await createStore();
+    expect(() => store.createPlan({
+      workspaceId: "workspace-a",
+      sessionId: "session-plan",
+      goal: "非法计划",
+      assumptions: [],
+      constraints: [],
+      steps: [
+        {
+          ...planSteps()[0]!,
+          dependencies: ["implement"],
+          candidateFiles: ["../secret"],
+        },
+        planSteps()[1]!,
+      ],
+    })).toThrow(/相对路径|存在环/);
+    expect(store.listPlans()).toHaveLength(0);
+    store.close();
+  });
+
   it("interrupts active rows on recovery and leaves queued tasks intact", async () => {
     const database = await createDatabasePath();
     const first = new TaskStore(database);
@@ -541,6 +649,31 @@ function promptExecution(preferFork = false) {
     sourceEntryId: "entry-1",
     preferFork,
   };
+}
+
+function planSteps() {
+  return [
+    {
+      id: "inspect",
+      title: "检查现状",
+      description: "读取现有实现",
+      dependencies: [],
+      candidateFiles: ["src/index.ts"],
+      validation: ["确认接入点"],
+      risk: "low" as const,
+      parallelizable: false,
+    },
+    {
+      id: "implement",
+      title: "实现功能",
+      description: "完成代码修改",
+      dependencies: ["inspect"],
+      candidateFiles: ["src/index.ts"],
+      validation: ["单元测试通过"],
+      risk: "medium" as const,
+      parallelizable: false,
+    },
+  ];
 }
 
 function deferredHandle(sessionId: string): TaskExecutionHandle & {

@@ -69,6 +69,13 @@ import {
   memoryListInputSchema,
   memoryMoveInputSchema,
   openWorkspaceInputSchema,
+  approvePlanInputSchema,
+  planDetailSchema,
+  planEventSchema,
+  planIdInputSchema,
+  planListInputSchema,
+  planSummarySchema,
+  revisePlanInputSchema,
   modelProviderInputSchema,
   modelProviderCatalogResultSchema,
   redactedModelProviderSchema,
@@ -102,6 +109,9 @@ import {
   type CommandResult,
   type McpServerEditor,
   type MemoryScope,
+  type PlanDetail,
+  type PlanEvent,
+  type PlanListInput,
   type TaskEvent,
   type TaskListInput,
   type TaskSubmissionResult,
@@ -303,6 +313,7 @@ class DesktopController {
   async sendPrompt(
     prompt: string,
     mode: "foreground" | "background" = "foreground",
+    interactionMode: "act" | "plan" = "act",
   ): Promise<TaskSubmissionResult> {
     const trimmed = prompt.trim();
     if (trimmed.startsWith("/")) {
@@ -313,6 +324,9 @@ class DesktopController {
     }
     if (!this.#trusted) {
       return { ok: false, error: "请先信任当前工作区" };
+    }
+    if (interactionMode === "plan" && !this.#projectFeatures) {
+      return { ok: false, error: "Plan 模式只在受信任的项目会话中可用" };
     }
     const runtime = this.#runtime;
     if (!runtime) {
@@ -337,7 +351,9 @@ class DesktopController {
         ...(this.#workspace ? { workspacePath: this.#workspace } : {}),
         title: createTaskTitle(trimmed),
         prompt: trimmed,
-        kind: mode === "background" ? "background" : "interactive",
+        kind: interactionMode === "plan"
+          ? "planning"
+          : mode === "background" ? "background" : "interactive",
         execution: {
           type: "agent-prompt",
           sourceSessionId: context.sourceSessionId,
@@ -348,6 +364,7 @@ class DesktopController {
             ? { sourceEntryId: context.sourceEntryId }
             : {}),
           preferFork,
+          interactionMode,
         },
       });
       return { ok: true, task };
@@ -379,6 +396,114 @@ class DesktopController {
     return this.#tasks.getTask(taskId) ?? null;
   }
 
+  listPlans(input: PlanListInput) {
+    return taskStore?.listPlans({
+      limit: input.limit,
+      workspaceIds: input.workspaceIds ?? [this.#scopeId],
+      ...(input.statuses ? { statuses: input.statuses } : {}),
+      ...(input.query ? { query: input.query } : {}),
+    }) ?? [];
+  }
+
+  getPlan(planId: string) {
+    return taskStore?.getPlan(planId) ?? null;
+  }
+
+  approvePlan(planId: string, revision: number): CommandResult {
+    if (!this.#trusted || !this.#runtime) {
+      return { ok: false, error: "项目未受信任或 Runtime 尚未就绪" };
+    }
+    try {
+      const detail = taskStore?.getPlan(planId);
+      if (!detail || detail.plan.workspaceId !== this.#scopeId) {
+        return { ok: false, error: "未找到当前项目的计划" };
+      }
+      const context = this.#runtime.capturePromptContext(true);
+      taskStore!.approvePlan(planId, revision, {
+        title: `执行计划：${createTaskTitle(detail.plan.goal)}`,
+        execution: {
+          type: "agent-prompt",
+          sourceSessionId: context.sourceSessionId,
+          ...(context.sourceSessionFile
+            ? { sourceSessionFile: context.sourceSessionFile }
+            : {}),
+          ...(context.sourceEntryId ? { sourceEntryId: context.sourceEntryId } : {}),
+          preferFork: true,
+          interactionMode: "plan-execution",
+          planId,
+          planRevision: revision,
+        },
+      });
+      this.#tasks.start();
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: formatError(error) };
+    }
+  }
+
+  requestPlanRevision(
+    planId: string,
+    feedback: string,
+    mode: "foreground" | "background" = "foreground",
+  ): TaskSubmissionResult {
+    if (!this.#trusted || !this.#runtime) {
+      return { ok: false, error: "项目未受信任或 Runtime 尚未就绪" };
+    }
+    try {
+      const detail = taskStore?.getPlan(planId);
+      if (!detail || detail.plan.workspaceId !== this.#scopeId) {
+        return { ok: false, error: "未找到当前项目的计划" };
+      }
+      taskStore!.requestPlanRevision(planId, feedback);
+      const context = this.#runtime.capturePromptContext(mode === "background");
+      const task = this.#tasks.submitPrompt({
+        workspaceId: this.#scopeId,
+        ...(this.#workspace ? { workspacePath: this.#workspace } : {}),
+        title: `修订计划：${createTaskTitle(detail.plan.goal)}`,
+        prompt: detail.plan.goal,
+        kind: "planning",
+        planId,
+        execution: {
+          type: "agent-prompt",
+          sourceSessionId: context.sourceSessionId,
+          ...(context.sourceSessionFile
+            ? { sourceSessionFile: context.sourceSessionFile }
+            : {}),
+          ...(context.sourceEntryId ? { sourceEntryId: context.sourceEntryId } : {}),
+          preferFork: mode === "background",
+          interactionMode: "plan",
+          planId,
+          planRevision: detail.plan.currentRevision,
+        },
+      });
+      return { ok: true, task };
+    } catch (error) {
+      return { ok: false, error: formatError(error) };
+    }
+  }
+
+  async abandonPlan(planId: string): Promise<CommandResult> {
+    try {
+      const detail = taskStore?.getPlan(planId);
+      if (!detail || detail.plan.workspaceId !== this.#scopeId) {
+        return { ok: false, error: "未找到当前项目的计划" };
+      }
+      if (detail.plan.executionTaskId) {
+        await this.#tasks.cancelTask(detail.plan.executionTaskId);
+      }
+      taskStore!.abandonPlan(planId);
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: formatError(error) };
+    }
+  }
+
+  openPlanSession(planId: string): Promise<CommandResult> {
+    const plan = taskStore?.getPlan(planId)?.plan;
+    if (!plan) return Promise.resolve({ ok: false, error: "未找到计划" });
+    return this.openTaskSession(plan.sessionId);
+  }
+
   async cancelTask(taskId: string): Promise<CommandResult> {
     try {
       return await this.#tasks.cancelTask(taskId)
@@ -397,7 +522,11 @@ class DesktopController {
   }) {
     const runtime = this.#runtime;
     if (!runtime) throw new Error("任务所属工作区 Runtime 尚未就绪");
-    const prompt = input.execution.continuation
+    const prompt = input.task.kind === "plan-execution" && input.task.planId
+      ? renderPlanExecutionPrompt(taskStore?.getPlan(input.task.planId), input.task.goal)
+      : input.execution.interactionMode === "plan"
+        ? renderPlanningPrompt(input.task.goal, input.execution.planId, taskStore)
+        : input.execution.continuation
       ? [
           "继续完成此前任务。先检查当前会话和工作区状态，不要重复已经完成的步骤，",
           "也不要盲目重放可能产生副作用的工具调用。",
@@ -418,6 +547,11 @@ class DesktopController {
           ? { sourceEntryId: input.execution.sourceEntryId }
           : {}),
         preferFork: input.execution.preferFork,
+        interactionMode: input.execution.interactionMode ?? "act",
+        ...(input.execution.planId ? { planId: input.execution.planId } : {}),
+        ...(input.execution.planRevision
+          ? { planRevision: input.execution.planRevision }
+          : {}),
       },
     });
     if (input.signal.aborted) await handle.cancel();
@@ -1278,6 +1412,83 @@ class DesktopController {
           : {},
         persistProjectGrant: async (category, grantKey) =>
           this.#persistProjectGrant(category, grantKey),
+        planTools: {
+          submit: async (input, context) => {
+            if (
+              context.interactionMode !== "plan"
+              || !context.taskId
+              || !context.runId
+            ) {
+              throw new Error("plan.submit 只能在 Planning Task 中调用");
+            }
+            const task = taskStore?.getTask(context.taskId);
+            const sessionId = task?.sessionId ?? context.sessionId;
+            if (!task || task.kind !== "planning" || !sessionId) {
+              throw new Error("未找到当前 Planning Task");
+            }
+            if (task.planId) {
+              throw new Error("修订已有计划时必须调用 plan.revise");
+            }
+            return taskStore!.createPlan({
+              workspaceId: task.workspaceId,
+              ...(task.workspacePath ? { workspacePath: task.workspacePath } : {}),
+              sessionId,
+              planningTaskId: task.id,
+              goal: input.goal,
+              assumptions: input.assumptions,
+              constraints: input.constraints,
+              steps: input.steps,
+            });
+          },
+          revise: async (input, context) => {
+            if (context.interactionMode !== "plan" || !context.taskId) {
+              throw new Error("plan.revise 只能在 Planning Task 中调用");
+            }
+            const detail = taskStore?.getPlan(input.planId);
+            if (!detail || detail.plan.currentRevision !== input.basedOnRevision) {
+              throw new Error("计划版本已经变化，请基于最新版本重新修订");
+            }
+            return taskStore!.revisePlan(input.planId, {
+              planningTaskId: context.taskId,
+              ...(input.feedback ? { feedback: input.feedback } : {}),
+              assumptions: input.assumptions,
+              constraints: input.constraints,
+              steps: input.steps,
+            });
+          },
+          updateStep: async (input, context) => {
+            if (
+              context.interactionMode !== "plan-execution"
+              || context.planId !== input.planId
+            ) {
+              throw new Error("plan.update_step 只能更新当前执行计划");
+            }
+            return taskStore!.updatePlanStep(input.planId, {
+              revision: input.revision,
+              stepId: input.stepId,
+              status: input.status,
+              ...(input.summary ? { summary: input.summary } : {}),
+              ...(input.evidence ? { evidence: input.evidence } : {}),
+              ...(input.reason ? { reason: input.reason } : {}),
+              ...(context.taskId ? { taskId: context.taskId } : {}),
+              ...(context.runId ? { runId: context.runId } : {}),
+            });
+          },
+          requestReplan: async (input, context) => {
+            if (
+              context.interactionMode !== "plan-execution"
+              || context.planId !== input.planId
+              || !context.taskId
+            ) {
+              throw new Error("plan.request_replan 只能由当前计划执行任务调用");
+            }
+            taskStore!.requestPlanRevision(input.planId, input.reason);
+            setImmediate(() => {
+              void this.#tasks.pauseTask(context.taskId!);
+            });
+            return { paused: true, reason: input.reason };
+          },
+        },
         onEvent: (event) => {
           this.#tasks.handleAgentEvent(event);
           broadcastEvent(event);
@@ -1486,6 +1697,10 @@ async function initializeDesktopState(
   await ensureDekiDirectories(paths);
   taskStore = new TaskStore(paths.tasksDatabase);
   taskStore.recoverInterrupted();
+  taskStore.subscribePlans((event) => {
+    broadcastPlanEvent(event);
+    maybeNotifyPlanEvent(event);
+  });
   const knownWorkspaces = await listRecentWorkspaces(paths.configFile);
   for (const knownWorkspace of [
     ...knownWorkspaces,
@@ -1669,8 +1884,10 @@ function registerIpcHandlers(): void {
   });
   ipcMain.handle(IPC_CHANNELS.sendPrompt, async (event, raw) => {
     assertTrustedSender(event);
-    const { prompt, mode } = sendPromptInputSchema.parse(raw);
-    return taskSubmissionResultSchema.parse(await controller?.sendPrompt(prompt, mode));
+    const { prompt, mode, interactionMode } = sendPromptInputSchema.parse(raw);
+    return taskSubmissionResultSchema.parse(
+      await controller?.sendPrompt(prompt, mode, interactionMode),
+    );
   });
   ipcMain.handle(IPC_CHANNELS.abortRun, async (event) => {
     assertTrustedSender(event);
@@ -1766,6 +1983,60 @@ function registerIpcHandlers(): void {
       input.requestId,
       input.value,
     ));
+  });
+  ipcMain.handle(IPC_CHANNELS.listPlans, (event, raw) => {
+    assertTrustedSender(event);
+    const input = planListInputSchema.parse(raw ?? {});
+    return planSummarySchema.array().parse(taskStore?.listPlans({
+      limit: input.limit,
+      ...(input.statuses ? { statuses: input.statuses } : {}),
+      ...(input.workspaceIds ? { workspaceIds: input.workspaceIds } : {}),
+      ...(input.query ? { query: input.query } : {}),
+    }) ?? []);
+  });
+  ipcMain.handle(IPC_CHANNELS.getPlan, (event, raw) => {
+    assertTrustedSender(event);
+    const { planId } = planIdInputSchema.parse(raw);
+    return planDetailSchema.nullable().parse(taskStore?.getPlan(planId) ?? null);
+  });
+  ipcMain.handle(IPC_CHANNELS.approvePlan, (event, raw) => {
+    assertTrustedSender(event);
+    const { planId, revision } = approvePlanInputSchema.parse(raw);
+    const plan = taskStore?.getPlan(planId)?.plan;
+    const host = plan ? workspaceControllers.get(plan.workspaceId) : undefined;
+    return commandResultSchema.parse(
+      host?.approvePlan(planId, revision)
+      ?? { ok: false, error: "计划所属项目尚未加载" },
+    );
+  });
+  ipcMain.handle(IPC_CHANNELS.revisePlan, (event, raw) => {
+    assertTrustedSender(event);
+    const { planId, feedback, mode } = revisePlanInputSchema.parse(raw);
+    const plan = taskStore?.getPlan(planId)?.plan;
+    const host = plan ? workspaceControllers.get(plan.workspaceId) : undefined;
+    return taskSubmissionResultSchema.parse(
+      host?.requestPlanRevision(planId, feedback, mode)
+      ?? { ok: false, error: "计划所属项目尚未加载" },
+    );
+  });
+  ipcMain.handle(IPC_CHANNELS.abandonPlan, async (event, raw) => {
+    assertTrustedSender(event);
+    const { planId } = planIdInputSchema.parse(raw);
+    const plan = taskStore?.getPlan(planId)?.plan;
+    const host = plan ? workspaceControllers.get(plan.workspaceId) : undefined;
+    return commandResultSchema.parse(
+      await host?.abandonPlan(planId)
+      ?? { ok: false, error: "计划所属项目尚未加载" },
+    );
+  });
+  ipcMain.handle(IPC_CHANNELS.openPlanSession, async (event, raw) => {
+    assertTrustedSender(event);
+    const { planId } = planIdInputSchema.parse(raw);
+    const plan = taskStore?.getPlan(planId)?.plan;
+    if (!plan) return commandResultSchema.parse({ ok: false, error: "未找到计划" });
+    const host = await getOrCreateController(plan.workspacePath);
+    controller = host;
+    return commandResultSchema.parse(await host.openPlanSession(planId));
   });
   ipcMain.handle(IPC_CHANNELS.newSession, async (event) => {
     assertTrustedSender(event);
@@ -2324,6 +2595,42 @@ function broadcastTaskEvent(raw: TaskEvent): void {
   }
 }
 
+function broadcastPlanEvent(raw: PlanEvent): void {
+  const event = planEventSchema.parse(raw);
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.isDestroyed()) {
+      window.webContents.send(IPC_CHANNELS.planEvent, event);
+    }
+  }
+}
+
+function maybeNotifyPlanEvent(event: PlanEvent): void {
+  if (
+    quitting
+    || !Notification.isSupported()
+    || !["plan.submitted", "plan.completed", "plan.replan_requested"].includes(event.type)
+  ) return;
+  const plan = taskStore?.getPlan(event.planId)?.plan;
+  if (!plan) return;
+  const body = event.type === "plan.submitted"
+    ? "计划已生成，等待审阅"
+    : event.type === "plan.completed"
+      ? "计划执行完成"
+      : "计划需要重新规划";
+  const notification = new Notification({
+    title: createTaskTitle(plan.goal),
+    body,
+  });
+  notification.on("click", () => {
+    let window = BrowserWindow.getAllWindows()[0];
+    if (!window || window.isDestroyed()) window = createWindow();
+    window.show();
+    window.focus();
+    window.webContents.send(IPC_CHANNELS.openPlan, plan.id);
+  });
+  notification.show();
+}
+
 function maybeNotifyTaskEvent(event: TaskEvent): void {
   if (quitting) return;
   const detail = taskOrchestrator?.getTask(event.taskId);
@@ -2365,6 +2672,61 @@ function broadcastSettings(raw: SettingsSnapshot): void {
 function createTaskTitle(prompt: string): string {
   const firstLine = prompt.split("\n", 1)[0]?.trim() ?? prompt;
   return firstLine.length > 42 ? `${firstLine.slice(0, 42)}…` : firstLine;
+}
+
+function renderPlanningPrompt(
+  goal: string,
+  planId: string | undefined,
+  store: TaskStore | undefined,
+): string {
+  if (planId) {
+    const detail = store?.getPlan(planId);
+    const revision = detail?.revisions.find(
+      (candidate) => candidate.revision === detail.plan.currentRevision,
+    );
+    const feedback = [...(detail?.events ?? [])].reverse().find(
+      (event) => event.type === "plan.replan_requested",
+    )?.payload.feedback;
+    return [
+      "你处于 Plan 模式。只允许读取和分析，不得修改文件或执行有副作用的工具。",
+      "检查项目实际状态后，基于当前计划和反馈生成完整的新版本。",
+      `必须调用 plan__revise，planId=${planId}，basedOnRevision=${detail?.plan.currentRevision ?? 1}。`,
+      typeof feedback === "string" ? `用户反馈：${feedback}` : "",
+      revision ? `当前版本：${JSON.stringify(revision)}` : "",
+      `目标：${goal}`,
+    ].filter(Boolean).join("\n\n");
+  }
+  return [
+    "你处于 Plan 模式。只允许读取和分析，不得修改文件或执行有副作用的工具。",
+    "充分检查项目结构、现有实现和约束后，生成可直接交给工程师实施的结构化计划。",
+    "完成分析后必须调用 plan__submit；不要只在聊天中输出 Markdown 计划。",
+    "步骤 ID 必须稳定且唯一，依赖必须构成无环图，每一步都要包含验证方式。",
+    `目标：${goal}`,
+  ].join("\n\n");
+}
+
+function renderPlanExecutionPrompt(
+  detail: PlanDetail | undefined,
+  fallbackGoal: string,
+): string {
+  if (!detail) throw new Error("未找到已批准计划");
+  const revisionNumber = detail.plan.approvedRevision ?? detail.plan.currentRevision;
+  const revision = detail.revisions.find(
+    (candidate) => candidate.revision === revisionNumber,
+  );
+  if (!revision) throw new Error("未找到已批准计划版本");
+  const states = detail.stepStates.filter((state) => state.revision === revisionNumber);
+  return [
+    "执行下面已由用户批准的计划。严格按依赖顺序串行执行，一次只执行一个步骤。",
+    "开始步骤前调用 plan__update_step 标记 running；完成后标记 completed 并提供摘要和证据。",
+    "若关键假设失效、风险显著变化或步骤无法完成，调用 plan__request_replan，不要自行改写计划。",
+    "恢复执行时先检查工作区和会话实际状态，不要重复已完成步骤，也不要盲目重放有副作用的调用。",
+    `planId=${detail.plan.id}`,
+    `revision=${revisionNumber}`,
+    `目标：${detail.plan.goal || fallbackGoal}`,
+    `计划：${JSON.stringify(revision)}`,
+    `当前步骤状态：${JSON.stringify(states)}`,
+  ].join("\n\n");
 }
 
 function applyNativeSettings(snapshot: SettingsSnapshot): void {

@@ -83,6 +83,16 @@ export class ToolGateway {
     return [...this.#tools.values()];
   }
 
+  assertAllowed(
+    modelName: string,
+    input: unknown,
+    context: ToolCallContext,
+  ): void {
+    const tool = this.#tools.get(modelName);
+    if (!tool) throw new Error(`未知 Tool: ${modelName}`);
+    assertToolAllowed(tool, input, context);
+  }
+
   async unregister(providerId: string, dispose = true): Promise<boolean> {
     const provider = this.#providers.get(providerId);
     if (!provider) return false;
@@ -115,6 +125,7 @@ export class ToolGateway {
     if (!provider) {
       throw new Error(`Tool Provider 不可用: ${tool.providerId}`);
     }
+    assertToolAllowed(tool, input, context);
 
     const validator = this.#validators.get(modelName);
     if (validator && !validator(input)) {
@@ -241,6 +252,46 @@ export class ToolGateway {
       }
     }
   }
+}
+
+export class PlanModePolicyError extends Error {
+  readonly code = "PLAN_MODE_READ_ONLY";
+  readonly toolName: string;
+
+  constructor(toolName: string) {
+    super(`Plan 模式仅允许读取和分析操作：${toolName}`);
+    this.name = "PlanModePolicyError";
+    this.toolName = toolName;
+  }
+}
+
+function assertToolAllowed(
+  tool: GatewayTool,
+  input: unknown,
+  context: ToolCallContext,
+): void {
+  if (context.interactionMode !== "plan") return;
+  if (tool.effect === "write") {
+    throw new PlanModePolicyError(tool.modelName);
+  }
+  if (tool.effect === "read"
+    || tool.effect === "network-read"
+    || tool.effect === "interaction"
+    || tool.effect === "plan-control"
+    || tool.readOnlyHint === true) {
+    return;
+  }
+  if (tool.providerToolName === "bash" && isReadOnlyShellInput(input)) return;
+  throw new PlanModePolicyError(tool.modelName);
+}
+
+function isReadOnlyShellInput(input: unknown): boolean {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return false;
+  const command = (input as Record<string, unknown>).command;
+  if (typeof command !== "string") return false;
+  const value = command.trim().toLocaleLowerCase();
+  if (/[|;&><`$]/.test(value)) return false;
+  return /^(?:pwd|ls|find|rg|grep|git\s+(?:status|diff|log|show))\b/.test(value);
 }
 
 function isSafeSegment(value: string): boolean {

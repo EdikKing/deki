@@ -11,6 +11,7 @@ interface TaskCenterProps {
   zh: boolean;
   initialTaskId?: string;
   onOpenSession(taskId: string): Promise<void>;
+  onOpenPlan(planId: string): void;
 }
 
 const statusCopy: Record<TaskStatus, { zh: string; en: string }> = {
@@ -219,6 +220,7 @@ export function TaskCenter(props: TaskCenterProps) {
                 <TaskActions
                   detail={detail}
                   zh={props.zh}
+                  onOpenPlan={props.onOpenPlan}
                   onCommand={command}
                   onOpen={() => props.onOpenSession(detail.task.id)}
                 />
@@ -367,6 +369,7 @@ function TaskActions(props: {
   zh: boolean;
   onCommand(operation: Promise<{ ok: boolean; error?: string | undefined }>): Promise<void>;
   onOpen(): Promise<void>;
+  onOpenPlan(planId: string): void;
 }) {
   const { task } = props.detail;
   return (
@@ -374,6 +377,11 @@ function TaskActions(props: {
       {task.sessionId && (
         <button onClick={() => void props.onOpen()}>
           {props.zh ? "打开会话" : "Open chat"}
+        </button>
+      )}
+      {task.planId && (
+        <button onClick={() => props.onOpenPlan(task.planId!)}>
+          {props.zh ? "打开计划" : "Open plan"}
         </button>
       )}
       {task.status === "queued" && (

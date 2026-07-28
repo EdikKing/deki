@@ -35,6 +35,13 @@ import {
   taskSummarySchema,
   taskSubmissionResultSchema,
   promptSubmissionOptionsSchema,
+  approvePlanInputSchema,
+  planDetailSchema,
+  planEventSchema,
+  planIdInputSchema,
+  planListInputSchema,
+  planSummarySchema,
+  revisePlanInputSchema,
   taskInputResponseSchema,
   settingsPatchSchema,
   settingsScopeSchema,
@@ -75,6 +82,7 @@ const api: DekiDesktopApi = {
       await ipcRenderer.invoke(IPC_CHANNELS.sendPrompt, {
         prompt,
         mode: parsedOptions.mode,
+        interactionMode: parsedOptions.interactionMode,
       }),
     );
   },
@@ -152,6 +160,58 @@ const api: DekiDesktopApi = {
       await ipcRenderer.invoke(
         IPC_CHANNELS.respondToTaskInput,
         taskInputResponseSchema.parse({ taskId, requestId, value }),
+      ),
+    );
+  },
+  async listPlans(input) {
+    return planSummarySchema.array().parse(
+      await ipcRenderer.invoke(
+        IPC_CHANNELS.listPlans,
+        planListInputSchema.parse(input ?? {}),
+      ),
+    );
+  },
+  async getPlan(planId) {
+    return planDetailSchema.nullable().parse(
+      await ipcRenderer.invoke(
+        IPC_CHANNELS.getPlan,
+        planIdInputSchema.parse({ planId }),
+      ),
+    );
+  },
+  async approvePlan(planId, revision) {
+    return commandResultSchema.parse(
+      await ipcRenderer.invoke(
+        IPC_CHANNELS.approvePlan,
+        approvePlanInputSchema.parse({ planId, revision }),
+      ),
+    );
+  },
+  async requestPlanRevision(planId, feedback, options) {
+    return taskSubmissionResultSchema.parse(
+      await ipcRenderer.invoke(
+        IPC_CHANNELS.revisePlan,
+        revisePlanInputSchema.parse({
+          planId,
+          feedback,
+          mode: options?.mode ?? "foreground",
+        }),
+      ),
+    );
+  },
+  async abandonPlan(planId) {
+    return commandResultSchema.parse(
+      await ipcRenderer.invoke(
+        IPC_CHANNELS.abandonPlan,
+        planIdInputSchema.parse({ planId }),
+      ),
+    );
+  },
+  async openPlanSession(planId) {
+    return commandResultSchema.parse(
+      await ipcRenderer.invoke(
+        IPC_CHANNELS.openPlanSession,
+        planIdInputSchema.parse({ planId }),
       ),
     );
   },
@@ -522,12 +582,26 @@ const api: DekiDesktopApi = {
     ipcRenderer.on(IPC_CHANNELS.taskEvent, handler);
     return () => ipcRenderer.removeListener(IPC_CHANNELS.taskEvent, handler);
   },
+  subscribePlanEvents(listener) {
+    const handler = (_event: Electron.IpcRendererEvent, raw: unknown) => {
+      listener(planEventSchema.parse(raw));
+    };
+    ipcRenderer.on(IPC_CHANNELS.planEvent, handler);
+    return () => ipcRenderer.removeListener(IPC_CHANNELS.planEvent, handler);
+  },
   subscribeOpenTask(listener) {
     const wrapped = (_event: Electron.IpcRendererEvent, taskId: unknown) => {
       if (typeof taskId === "string") listener(taskId);
     };
     ipcRenderer.on(IPC_CHANNELS.openTask, wrapped);
     return () => ipcRenderer.removeListener(IPC_CHANNELS.openTask, wrapped);
+  },
+  subscribeOpenPlan(listener) {
+    const wrapped = (_event: Electron.IpcRendererEvent, planId: unknown) => {
+      if (typeof planId === "string") listener(planId);
+    };
+    ipcRenderer.on(IPC_CHANNELS.openPlan, wrapped);
+    return () => ipcRenderer.removeListener(IPC_CHANNELS.openPlan, wrapped);
   },
 };
 

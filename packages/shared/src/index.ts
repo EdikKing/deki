@@ -301,10 +301,115 @@ export type TaskStatus = z.infer<typeof taskStatusSchema>;
 export const taskKindSchema = z.enum([
   "interactive",
   "background",
+  "planning",
   "worker",
   "plan-execution",
 ]);
 export type TaskKind = z.infer<typeof taskKindSchema>;
+
+export const interactionModeSchema = z.enum(["act", "plan"]);
+export type InteractionMode = z.infer<typeof interactionModeSchema>;
+
+export const planStatusSchema = z.enum([
+  "draft",
+  "ready",
+  "approved",
+  "executing",
+  "completed",
+  "abandoned",
+]);
+export type PlanStatus = z.infer<typeof planStatusSchema>;
+
+export const planStepStatusSchema = z.enum([
+  "pending",
+  "running",
+  "completed",
+  "blocked",
+  "skipped",
+]);
+export type PlanStepStatus = z.infer<typeof planStepStatusSchema>;
+
+export const planStepSchema = z.object({
+  id: z.string().trim().min(1).max(100),
+  title: z.string().trim().min(1).max(200),
+  description: z.string().trim().min(1).max(10_000),
+  dependencies: z.array(z.string().trim().min(1).max(100)).max(30).default([]),
+  candidateFiles: z.array(z.string().trim().min(1).max(2_000)).max(100).default([]),
+  validation: z.array(z.string().trim().min(1).max(2_000)).min(1).max(30),
+  risk: z.enum(["low", "medium", "high"]),
+  parallelizable: z.boolean().default(false),
+  assignedProfile: z.string().trim().min(1).max(100).optional(),
+}).strict();
+export type PlanStep = z.infer<typeof planStepSchema>;
+
+export const planRecordSchema = z.object({
+  id: z.string().uuid(),
+  workspaceId: z.string().min(1),
+  workspacePath: z.string().min(1).optional(),
+  sessionId: z.string().min(1),
+  planningTaskId: z.string().uuid().optional(),
+  executionTaskId: z.string().uuid().optional(),
+  goal: z.string().trim().min(1).max(100_000),
+  status: planStatusSchema,
+  currentRevision: z.number().int().positive(),
+  approvedRevision: z.number().int().positive().optional(),
+  executingRevision: z.number().int().positive().optional(),
+  createdAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+}).strict();
+export type PlanRecord = z.infer<typeof planRecordSchema>;
+
+export const planRevisionRecordSchema = z.object({
+  planId: z.string().uuid(),
+  revision: z.number().int().positive(),
+  feedback: z.string().trim().max(10_000).optional(),
+  assumptions: z.array(z.string().trim().min(1).max(2_000)).max(100),
+  constraints: z.array(z.string().trim().min(1).max(2_000)).max(100),
+  steps: z.array(planStepSchema).min(1).max(30),
+  createdAt: z.string().datetime(),
+}).strict();
+export type PlanRevisionRecord = z.infer<typeof planRevisionRecordSchema>;
+
+export const planStepStateSchema = z.object({
+  planId: z.string().uuid(),
+  revision: z.number().int().positive(),
+  stepId: z.string().min(1).max(100),
+  status: planStepStatusSchema,
+  summary: z.string().max(10_000).optional(),
+  evidence: z.array(z.string().max(10_000)).max(100).default([]),
+  reason: z.string().max(10_000).optional(),
+  startedAt: z.string().datetime().optional(),
+  completedAt: z.string().datetime().optional(),
+  updatedAt: z.string().datetime(),
+}).strict();
+export type PlanStepState = z.infer<typeof planStepStateSchema>;
+
+export const planEventTypeSchema = z.enum([
+  "plan.created",
+  "plan.submitted",
+  "plan.revised",
+  "plan.approved",
+  "plan.execution_started",
+  "plan.step_started",
+  "plan.step_completed",
+  "plan.step_blocked",
+  "plan.replan_requested",
+  "plan.completed",
+  "plan.abandoned",
+]);
+export type PlanEventType = z.infer<typeof planEventTypeSchema>;
+
+export const planEventSchema = z.object({
+  eventId: z.string().uuid(),
+  planId: z.string().uuid(),
+  taskId: z.string().uuid().optional(),
+  runId: z.string().uuid().optional(),
+  timestamp: z.string().datetime(),
+  sequence: z.number().int().positive(),
+  type: planEventTypeSchema,
+  payload: z.record(z.string(), z.unknown()),
+}).strict();
+export type PlanEvent = z.infer<typeof planEventSchema>;
 
 export const taskRecordSchema = z.object({
   id: z.string().uuid(),
@@ -466,6 +571,24 @@ export const taskSummarySchema = z.object({
 }).strict();
 export type TaskSummary = z.infer<typeof taskSummarySchema>;
 
+export const planDetailSchema = z.object({
+  plan: planRecordSchema,
+  revisions: z.array(planRevisionRecordSchema),
+  stepStates: z.array(planStepStateSchema),
+  events: z.array(planEventSchema),
+  executionTask: taskRecordSchema.optional(),
+}).strict();
+export type PlanDetail = z.infer<typeof planDetailSchema>;
+
+export const planSummarySchema = z.object({
+  plan: planRecordSchema,
+  revision: planRevisionRecordSchema,
+  completedSteps: z.number().int().nonnegative(),
+  totalSteps: z.number().int().nonnegative(),
+  currentStep: planStepSchema.optional(),
+}).strict();
+export type PlanSummary = z.infer<typeof planSummarySchema>;
+
 export const bootstrapStateSchema = z.object({
   workspace: z.string().optional(),
   trusted: z.boolean(),
@@ -477,6 +600,7 @@ export const bootstrapStateSchema = z.object({
   sessionConfiguration: z.object({
     permissionPolicies: permissionPoliciesSchema,
     thinkingLevel: thinkingLevelSchema,
+    interactionMode: interactionModeSchema.default("act"),
   }).strict().optional(),
   memories: z.array(memoryRecordSchema),
   recalledMemories: z.array(memoryRecordSchema),
@@ -642,6 +766,7 @@ export const trustWorkspaceInputSchema = z.object({
 export const sendPromptInputSchema = z.object({
   prompt: z.string().trim().min(1).max(100_000),
   mode: z.enum(["foreground", "background"]).default("foreground"),
+  interactionMode: interactionModeSchema.default("act"),
 }).strict();
 
 export const rememberInputSchema = z.object({
@@ -656,8 +781,11 @@ export const selectModelInputSchema = z.object({
 export const updateSessionConfigurationInputSchema = z.object({
   permissionPolicies: permissionPoliciesSchema.optional(),
   thinkingLevel: thinkingLevelSchema.optional(),
+  interactionMode: interactionModeSchema.optional(),
 }).strict().refine(
-  (input) => input.permissionPolicies !== undefined || input.thinkingLevel !== undefined,
+  (input) => input.permissionPolicies !== undefined
+    || input.thinkingLevel !== undefined
+    || input.interactionMode !== undefined,
   { message: "至少需要提供一项会话配置" },
 );
 export type UpdateSessionConfigurationInput = z.infer<
@@ -842,8 +970,30 @@ export const taskIdInputSchema = z.object({
 
 export const promptSubmissionOptionsSchema = z.object({
   mode: z.enum(["foreground", "background"]).default("foreground"),
+  interactionMode: interactionModeSchema.default("act"),
 }).strict();
 export type PromptSubmissionOptions = z.infer<typeof promptSubmissionOptionsSchema>;
+
+export const planListInputSchema = z.object({
+  statuses: z.array(planStatusSchema).max(planStatusSchema.options.length).optional(),
+  workspaceIds: z.array(z.string().min(1)).max(100).optional(),
+  query: z.string().trim().max(500).optional(),
+  limit: z.number().int().min(1).max(500).default(100),
+}).strict();
+export type PlanListInput = z.infer<typeof planListInputSchema>;
+
+export const planIdInputSchema = z.object({
+  planId: z.string().uuid(),
+}).strict();
+
+export const approvePlanInputSchema = planIdInputSchema.extend({
+  revision: z.number().int().positive(),
+}).strict();
+
+export const revisePlanInputSchema = planIdInputSchema.extend({
+  feedback: z.string().trim().min(1).max(10_000),
+  mode: z.enum(["foreground", "background"]).default("foreground"),
+}).strict();
 
 export const taskInputResponseSchema = taskIdInputSchema.extend({
   requestId: z.string().min(1),
@@ -871,6 +1021,12 @@ export const IPC_CHANNELS = {
   promoteTask: "deki:promote-task",
   openTaskSession: "deki:open-task-session",
   respondToTaskInput: "deki:respond-to-task-input",
+  listPlans: "deki:list-plans",
+  getPlan: "deki:get-plan",
+  approvePlan: "deki:approve-plan",
+  revisePlan: "deki:revise-plan",
+  abandonPlan: "deki:abandon-plan",
+  openPlanSession: "deki:open-plan-session",
   newSession: "deki:new-session",
   listSessions: "deki:list-sessions",
   getSessionHistory: "deki:get-session-history",
@@ -927,7 +1083,9 @@ export const IPC_CHANNELS = {
   settingsChanged: "deki:settings-changed",
   agentEvent: "deki:agent-event",
   taskEvent: "deki:task-event",
+  planEvent: "deki:plan-event",
   openTask: "deki:open-task",
+  openPlan: "deki:open-plan",
 } as const;
 
 export interface DekiDesktopApi {
@@ -954,6 +1112,16 @@ export interface DekiDesktopApi {
     requestId: string,
     value: string,
   ): Promise<CommandResult>;
+  listPlans(input?: Partial<PlanListInput>): Promise<PlanSummary[]>;
+  getPlan(planId: string): Promise<PlanDetail | null>;
+  approvePlan(planId: string, revision: number): Promise<CommandResult>;
+  requestPlanRevision(
+    planId: string,
+    feedback: string,
+    options?: { mode?: "foreground" | "background" },
+  ): Promise<TaskSubmissionResult>;
+  abandonPlan(planId: string): Promise<CommandResult>;
+  openPlanSession(planId: string): Promise<CommandResult>;
   newSession(): Promise<CommandResult>;
   listSessions(query?: string): Promise<SessionSummary[]>;
   getSessionHistory(): Promise<ConversationMessage[]>;
@@ -1028,14 +1196,25 @@ export interface DekiDesktopApi {
   subscribeSettings(listener: (settings: SettingsSnapshot) => void): () => void;
   subscribeAgentEvents(listener: (event: AgentEvent) => void): () => void;
   subscribeTaskEvents(listener: (event: TaskEvent) => void): () => void;
+  subscribePlanEvents(listener: (event: PlanEvent) => void): () => void;
   subscribeOpenTask(listener: (taskId: string) => void): () => void;
+  subscribeOpenPlan(listener: (planId: string) => void): () => void;
 }
+
+export type ToolEffect =
+  | "read"
+  | "write"
+  | "network-read"
+  | "interaction"
+  | "plan-control"
+  | "unknown";
 
 export interface ToolDefinition {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
   readOnlyHint?: boolean;
+  effect?: ToolEffect;
   enabled?: boolean;
   permission?: PermissionPolicy;
   timeoutMs?: number;
@@ -1044,6 +1223,11 @@ export interface ToolDefinition {
 export interface ToolCallContext {
   callId: string;
   workspace: string;
+  sessionId?: string;
+  taskId?: string;
+  runId?: string;
+  planId?: string;
+  interactionMode?: "act" | "plan" | "plan-execution";
   signal?: AbortSignal;
 }
 

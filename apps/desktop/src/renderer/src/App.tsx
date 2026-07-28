@@ -16,12 +16,14 @@ import type {
   ConversationMessage,
   MemoryRecord,
   ModelSummary,
+  PlanDetail,
   SessionSummary,
   SettingsSnapshot,
   ThinkingLevel,
 } from "@deki-ai/shared";
 import { SettingsView } from "./SettingsView";
 import { TaskCenter } from "./TaskCenter";
+import { PlanPanel } from "./PlanPanel";
 import {
   builtinModelProviders,
 } from "./builtinModelProviders";
@@ -67,6 +69,8 @@ export function App() {
   const [taskAttentionCount, setTaskAttentionCount] = useState(0);
   const [foregroundTaskId, setForegroundTaskId] = useState<string>();
   const [backgroundTask, setBackgroundTask] = useState<{ id: string; title: string }>();
+  const [interactionMode, setInteractionMode] = useState<"act" | "plan">("act");
+  const [activePlan, setActivePlan] = useState<PlanDetail | null>(null);
   const [approval, setApproval] = useState<Extract<AgentEvent, { type: "approval.requested" }>>();
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [activeSession, setActiveSession] = useState<SessionSummary>();
@@ -86,6 +90,22 @@ export function App() {
     const visibleSessions = await window.deki.listSessions("");
     setSessions(visibleSessions);
     setActiveSession(visibleSessions.find((session) => session.current));
+  }
+
+  async function refreshPlan(planId?: string) {
+    if (planId) {
+      setActivePlan(await window.deki.getPlan(planId));
+      return;
+    }
+    if (!activeSessionId.current) {
+      setActivePlan(null);
+      return;
+    }
+    const plans = await window.deki.listPlans({ limit: 100 });
+    const current = plans.find(
+      (summary) => summary.plan.sessionId === activeSessionId.current,
+    );
+    setActivePlan(current ? await window.deki.getPlan(current.plan.id) : null);
   }
 
   useEffect(() => {
@@ -165,11 +185,24 @@ export function App() {
       setSelectedTaskId(taskId);
       setShowTaskCenter(true);
     });
+    const unsubscribePlans = window.deki.subscribePlanEvents((event) => {
+      if (event.planId === activePlan?.plan.id || event.taskId === foregroundTaskId) {
+        void refreshPlan(event.planId);
+      } else {
+        void refreshPlan();
+      }
+    });
+    const unsubscribeOpenPlan = window.deki.subscribeOpenPlan((planId) => {
+      setInspectorOpen(true);
+      void refreshPlan(planId);
+    });
     return () => {
       unsubscribeTasks();
       unsubscribeOpenTask();
+      unsubscribePlans();
+      unsubscribeOpenPlan();
     };
-  }, []);
+  }, [activePlan?.plan.id, foregroundTaskId]);
 
   useEffect(() => {
     const onResize = () => {
@@ -186,6 +219,7 @@ export function App() {
   useEffect(() => {
     if (!state) return;
     activeSessionId.current = state.sessionId;
+    setInteractionMode(state.sessionConfiguration?.interactionMode ?? "act");
     void refreshSessions().catch((reason) => setError(String(reason)));
     if (!state.sessionId) {
       setActiveSession(undefined);
@@ -208,6 +242,7 @@ export function App() {
         setApproval(pending);
       })
       .catch((reason) => setError(String(reason)));
+    void refreshPlan().catch((reason) => setError(String(reason)));
   }, [state?.trusted, state?.workspace, state?.sessionId]);
 
   useEffect(() => {
@@ -369,7 +404,7 @@ export function App() {
       ]);
       setBusy(true);
     }
-    const result = await window.deki.sendPrompt(value, { mode });
+    const result = await window.deki.sendPrompt(value, { mode, interactionMode });
     if (mode === "foreground" && (!result.ok || sessionCommand)) {
       setBusy(false);
     }
@@ -629,6 +664,12 @@ export function App() {
             await refresh();
             await refreshSessions();
           }}
+          onOpenPlan={(planId) => {
+            setShowTaskCenter(false);
+            setSelectedTaskId(undefined);
+            setInspectorOpen(true);
+            void refreshPlan(planId);
+          }}
         />
       ) : (
       <section className="app-main">
@@ -720,11 +761,21 @@ export function App() {
             </div>
             <div className="composer">
               <div className="composer-card">
+                {interactionMode === "plan" && (
+                  <div className="composer-plan-notice">
+                    <span aria-hidden="true">◇</span>
+                    {zh ? "Plan 模式只读取和分析项目，不会修改文件" : "Plan mode reads and analyzes only; it cannot modify files"}
+                  </div>
+                )}
                 <textarea
                   className="composer-input"
                   value={prompt}
                   placeholder={state.ready
-                    ? (zh
+                    ? interactionMode === "plan"
+                      ? (zh
+                          ? "描述目标，Agent 将先检查项目并生成可审阅计划…"
+                          : "Describe the goal. The agent will inspect the project and produce a reviewable plan…")
+                      : (zh
                         ? "输入消息…（Enter 发送，Shift+Enter 换行，/remember 保存记忆）"
                         : "Type a message… (Enter to send, Shift+Enter for a new line, /remember to save memory)")
                     : state.workspace
@@ -753,6 +804,32 @@ export function App() {
                         );
                       }}
                     />
+                    <div className="interaction-mode-switch" role="group" aria-label={zh ? "交互模式" : "Interaction mode"}>
+                      <button
+                        className={interactionMode === "act" ? "active" : ""}
+                        disabled={busy || !state.workspace}
+                        onClick={() => void runCommand(
+                          window.deki.updateSessionConfiguration({ interactionMode: "act" }),
+                          setError,
+                          async () => {
+                            setInteractionMode("act");
+                            await refresh();
+                          },
+                        )}
+                      >{zh ? "执行" : "Act"}</button>
+                      <button
+                        className={interactionMode === "plan" ? "active" : ""}
+                        disabled={busy || !state.workspace}
+                        onClick={() => void runCommand(
+                          window.deki.updateSessionConfiguration({ interactionMode: "plan" }),
+                          setError,
+                          async () => {
+                            setInteractionMode("plan");
+                            await refresh();
+                          },
+                        )}
+                      >{zh ? "规划" : "Plan"}</button>
+                    </div>
                     {settings && (
                       <PermissionModePicker
                         policies={state.sessionConfiguration?.permissionPolicies
@@ -818,7 +895,9 @@ export function App() {
                     <button
                       className="composer-submit composer-background"
                       aria-label={zh ? "后台运行" : "Run in background"}
-                      title={zh ? "在独立会话中后台运行" : "Run in a separate background session"}
+                      title={interactionMode === "plan"
+                        ? (zh ? "在后台生成计划" : "Generate plan in background")
+                        : (zh ? "在独立会话中后台运行" : "Run in a separate background session")}
                       disabled={!prompt.trim() || isSessionCommand || !state.ready}
                       onClick={() => void submit("background")}
                     >
@@ -855,7 +934,9 @@ export function App() {
                       <button
                         className="composer-submit primary"
                         aria-label={zh ? "发送" : "Send"}
-                        title={zh ? "发送" : "Send"}
+                        title={interactionMode === "plan"
+                          ? (zh ? "生成计划" : "Generate plan")
+                          : (zh ? "发送" : "Send")}
                         disabled={!state.ready && !isSessionCommand}
                         onClick={() => void submit("foreground")}
                       >
@@ -912,6 +993,20 @@ export function App() {
               <strong>{zh ? "运行详情" : "Run details"}</strong>
               <button className="icon-button" aria-label={zh ? "关闭运行详情" : "Close run details"} onClick={() => setInspectorOpen(false)}>×</button>
             </header>
+            {activePlan && (
+              <PlanPanel
+                detail={activePlan}
+                zh={zh}
+                onChanged={async () => {
+                  await refreshPlan(activePlan.plan.id);
+                  await refresh();
+                }}
+                onOpenTask={(taskId) => {
+                  setSelectedTaskId(taskId);
+                  setShowTaskCenter(true);
+                }}
+              />
+            )}
             {diffs.length > 0 && (
               <Panel title={zh ? "变更 Diff" : "Change diffs"} count={diffs.length}>
                 {diffs.slice(-3).reverse().map((event, index) => (

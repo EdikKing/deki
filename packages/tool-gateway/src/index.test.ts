@@ -9,6 +9,7 @@ import { ToolGateway, type ToolGatewayEvent } from "./index";
 
 class FixtureProvider implements CapabilityProvider {
   readonly id = "fixture";
+  readOnly = false;
   readonly call = vi.fn(async (
     _name: string,
     input: unknown,
@@ -27,6 +28,7 @@ class FixtureProvider implements CapabilityProvider {
         required: ["text"],
         additionalProperties: false,
       },
+      ...(this.readOnly ? { readOnlyHint: true, effect: "read" as const } : {}),
     }];
   }
 
@@ -70,6 +72,48 @@ describe("ToolGateway", () => {
         { callId: "call-2", workspace: "/tmp" },
       ),
     ).rejects.toThrow("Tool 参数无效");
+    await gateway.dispose();
+  });
+
+  it("enforces Plan mode read-only policy before provider dispatch", async () => {
+    const gateway = new ToolGateway();
+    const provider = new FixtureProvider();
+    await gateway.register(provider);
+
+    await expect(gateway.call(
+      "fixture__echo",
+      { text: "write something" },
+      {
+        callId: "plan-write",
+        workspace: "/tmp",
+        interactionMode: "plan",
+      },
+    )).rejects.toMatchObject({
+      code: "PLAN_MODE_READ_ONLY",
+      toolName: "fixture__echo",
+    });
+    expect(provider.call).not.toHaveBeenCalled();
+    await gateway.dispose();
+  });
+
+  it("allows explicitly read-only tools in Plan mode", async () => {
+    const gateway = new ToolGateway();
+    const provider = new FixtureProvider();
+    provider.readOnly = true;
+    await gateway.register(provider);
+
+    await expect(gateway.call(
+      "fixture__echo",
+      { text: "inspect" },
+      {
+        callId: "plan-read",
+        workspace: "/tmp",
+        interactionMode: "plan",
+      },
+    )).resolves.toMatchObject({
+      content: [{ type: "text", text: "{\"text\":\"inspect\"}" }],
+    });
+    expect(provider.call).toHaveBeenCalledOnce();
     await gateway.dispose();
   });
 

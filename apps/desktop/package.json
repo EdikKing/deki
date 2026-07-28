@@ -18,6 +18,7 @@
     "package": "pnpm --dir ../.. cli:build && pnpm build && electron-builder --publish never",
     "package:dir": "pnpm --dir ../.. cli:build && pnpm build && electron-builder --dir",
     "package:mac": "pnpm --dir ../.. cli:build && pnpm build && electron-builder --mac dmg zip --universal --publish never",
+    "package:mac:unsigned": "pnpm --dir ../.. cli:build && pnpm build && electron-builder --mac dmg zip --universal --publish never --config.mac.notarize=false",
     "package:win": "pnpm --dir ../.. cli:build && pnpm build && electron-builder --win nsis portable --x64 --publish never",
     "package:linux": "pnpm --dir ../.. cli:build && pnpm build && electron-builder --linux AppImage deb --x64 --publish never"
   },

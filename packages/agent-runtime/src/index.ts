@@ -30,17 +30,21 @@ import { ModelConfigStore, type DekiSettings } from "@deki-ai/settings";
 import {
   agentEventSchema,
   DEKI_VERSION,
+  permissionPoliciesSchema,
   type AgentEvent,
   type CapabilityProvider,
   type ConversationMessage,
   type MemoryRecord,
   type MemoryScope,
   type ModelSummary,
+  type PermissionPolicies,
   type SessionSummary,
   type SessionHistoryState,
+  type ThinkingLevel,
   type ToolCallContext,
   type ToolDefinition,
   type ToolResult,
+  type UpdateSessionConfigurationInput,
 } from "@deki-ai/shared";
 import { ToolGateway, type GatewayTool } from "@deki-ai/tool-gateway";
 
@@ -67,6 +71,10 @@ export interface RuntimeSnapshot {
   sessionId?: string;
   models: ModelSummary[];
   selectedModel?: ModelSummary;
+  sessionConfiguration?: {
+    permissionPolicies: PermissionPolicies;
+    thinkingLevel: ThinkingLevel;
+  };
   recalledMemories: MemoryRecord[];
   skills: string[];
   diagnostics: string[];
@@ -80,12 +88,36 @@ export interface RuntimeSnapshot {
     remainingTokens: number | null;
     percent: number | null;
   };
-  activeRunCount: number;
+}
+
+export interface AgentPromptContext {
+  sourceSessionId: string;
+  sourceSessionFile?: string;
+  sourceEntryId?: string;
+  preferFork: boolean;
+}
+
+export interface AgentPromptRunHandle {
+  taskId: string;
+  runId: string;
+  sessionId: string;
+  modelProvider?: string;
+  modelId?: string;
+  completion: Promise<void>;
+  cancel(): Promise<void>;
 }
 
 type ModelType = Model<any>;
 type AgentEventInput<T extends AgentEvent = AgentEvent> =
-  T extends AgentEvent ? Omit<T, "eventId" | "timestamp" | "sessionId"> : never;
+  T extends AgentEvent
+    ? Omit<T, "eventId" | "timestamp" | "sessionId" | "taskId" | "runId">
+    : never;
+
+interface AgentExecutionContext {
+  sessionId: string;
+  taskId: string;
+  runId: string;
+}
 
 export class AgentSessionEventSubscription {
   #unsubscribe: (() => void) | undefined;
@@ -110,6 +142,8 @@ export class DekiAgentRuntime {
   #modelRuntime: ModelRuntime | undefined;
   #models: ModelType[] = [];
   #selectedModel: ModelType | undefined;
+  readonly #sessionModels = new Map<string, ModelType>();
+  readonly #sessionPermissionPolicies = new Map<string, PermissionPolicies>();
   #runtime: AgentSessionRuntime | undefined;
   readonly #sessionEvents = new AgentSessionEventSubscription();
   #recalledMemories: MemoryRecord[] = [];
@@ -120,12 +154,13 @@ export class DekiAgentRuntime {
   #lastPrompt: string | undefined;
   #checkpointManager: GitCheckpointManager | undefined;
   #runtimeToolSignature = toolDefinitionSignature([]);
-  #activeRunCount = 0;
   #branchScopeId = "detached";
   #createRuntimeFactory: CreateAgentSessionRuntimeFactory | undefined;
   readonly #backgroundRuntimes = new Set<AgentSessionRuntime>();
   readonly #backgroundUnsubscribers = new Map<AgentSessionRuntime, () => void>();
-  readonly #toolSessionId = new AsyncLocalStorage<string>();
+  readonly #runContextsBySession = new Map<string, AgentExecutionContext>();
+  readonly #runCancellers = new Map<string, () => Promise<void>>();
+  readonly #executionContext = new AsyncLocalStorage<AgentExecutionContext>();
 
   constructor(options: DekiAgentRuntimeOptions) {
     this.#options = options;
@@ -151,11 +186,35 @@ export class DekiAgentRuntime {
         workspace: this.#options.workspace,
         logsRoot: this.#options.paths.logsRoot,
         settings: this.#options.settings,
-        sessionId: () => this.#toolSessionId.getStore() ?? this.#runtime?.session.sessionId,
-        model: () => this.#selectedModel
-          ? `${this.#selectedModel.provider}/${this.#selectedModel.id}`
-          : undefined,
-        emit: (event) => this.#forwardEvent(event),
+        sessionId: () =>
+          this.#executionContext.getStore()?.sessionId
+          ?? this.#runtime?.session.sessionId,
+        model: () => {
+          const sessionId = this.#executionContext.getStore()?.sessionId
+            ?? this.#runtime?.session.sessionId;
+          const model = sessionId
+            ? this.#sessionModels.get(sessionId) ?? this.#selectedModel
+            : this.#selectedModel;
+          return model
+            ? `${model.provider}/${model.id}`
+            : undefined;
+        },
+        resolvePolicies: () => this.#permissionPoliciesForSession(
+          this.#executionContext.getStore()?.sessionId
+            ?? this.#runtime?.session.sessionId,
+        ),
+        emit: (event) => {
+          const execution = event.sessionId
+            ? this.#runContextsBySession.get(event.sessionId)
+            : this.#executionContext.getStore();
+          this.#forwardEvent(execution
+            ? {
+                ...event,
+                taskId: execution.taskId,
+                runId: execution.runId,
+              }
+            : event);
+        },
         ...(this.#options.persistProjectGrant
           ? { persistProjectGrant: this.#options.persistProjectGrant }
           : {}),
@@ -298,6 +357,14 @@ export class DekiAgentRuntime {
       ...(this.#selectedModel
         ? { selectedModel: toModelSummary(this.#selectedModel) }
         : {}),
+      ...(this.#runtime
+        ? {
+            sessionConfiguration: {
+              permissionPolicies: this.#permissionPoliciesForSession(sessionId),
+              thinkingLevel: this.#runtime.session.thinkingLevel as ThinkingLevel,
+            },
+          }
+        : {}),
       recalledMemories: [...this.#recalledMemories],
       skills: [...this.#skills],
       diagnostics: [...this.#diagnostics],
@@ -317,7 +384,6 @@ export class DekiAgentRuntime {
             },
           }
         : {}),
-      activeRunCount: this.#activeRunCount,
     };
   }
 
@@ -327,17 +393,50 @@ export class DekiAgentRuntime {
       await this.#executeCommand(trimmed);
       return;
     }
+    const handle = await this.startPrompt({
+      taskId: crypto.randomUUID(),
+      runId: crypto.randomUUID(),
+      prompt: trimmed,
+      context: this.capturePromptContext(false),
+    });
+    await handle.completion;
+  }
 
+  capturePromptContext(preferFork: boolean): AgentPromptContext {
+    const session = this.#runtime?.session;
+    if (!session) {
+      throw new Error("Agent 尚未就绪，请先配置云模型环境变量");
+    }
+    const sourceSessionFile = session.sessionFile;
+    const sourceEntryId = session.sessionManager.getLeafId() ?? undefined;
+    return {
+      sourceSessionId: session.sessionId,
+      ...(sourceSessionFile ? { sourceSessionFile } : {}),
+      ...(sourceEntryId ? { sourceEntryId } : {}),
+      preferFork,
+    };
+  }
+
+  async startPrompt(input: {
+    taskId: string;
+    runId: string;
+    prompt: string;
+    context: AgentPromptContext;
+  }): Promise<AgentPromptRunHandle> {
+    const trimmed = input.prompt.trim();
+    if (!trimmed || trimmed.startsWith("/")) {
+      throw new Error("Task Prompt 必须是非命令文本");
+    }
     const runtime = this.#runtime;
     if (!runtime) {
       throw new Error("Agent 尚未就绪，请先配置云模型环境变量");
     }
-    if (this.#activeRunCount >= this.#options.settings.agent.maxConcurrentRuns) {
-      throw new Error(`已达到并发运行上限（${this.#options.settings.agent.maxConcurrentRuns}）`);
-    }
-    if (runtime.session.isStreaming) {
-      await this.#startConcurrentPrompt(trimmed);
-      return;
+    if (
+      input.context.preferFork
+      || runtime.session.isStreaming
+      || runtime.session.sessionId !== input.context.sourceSessionId
+    ) {
+      return this.#startConcurrentPrompt(input);
     }
     if (
       this.#options.settings.agent.autoNameSessions
@@ -347,24 +446,47 @@ export class DekiAgentRuntime {
     }
     await this.#injectRelevantMemories(trimmed);
 
-    this.#streaming = true;
-    this.#activeRunCount += 1;
+    const execution: AgentExecutionContext = {
+      sessionId: runtime.session.sessionId,
+      taskId: input.taskId,
+      runId: input.runId,
+    };
+    this.#runContextsBySession.set(execution.sessionId, execution);
     this.#lastPrompt = trimmed;
     this.#appendRunState("running");
-    this.#emit({ type: "run.started" });
-    try {
-      await runtime.session.prompt(trimmed);
-    } catch (error) {
-      this.#streaming = false;
-      this.#appendRunState("failed", formatError(error));
-      this.#emit({
-        type: "run.failed",
-        error: formatError(error),
-      });
-      throw error;
-    } finally {
-      this.#activeRunCount = Math.max(0, this.#activeRunCount - 1);
-    }
+    this.#streaming = true;
+    this.#emitForSession(runtime.session, { type: "run.started" }, execution);
+    const completion = this.#executionContext.run(execution, async () => {
+      try {
+        await runtime.session.prompt(trimmed);
+      } catch (error) {
+        this.#appendRunState("failed", formatError(error));
+        this.#emitForSession(runtime.session, {
+          type: "run.failed",
+          error: formatError(error),
+        }, execution);
+        throw error;
+      } finally {
+        this.#streaming = false;
+        this.#runContextsBySession.delete(execution.sessionId);
+        this.#runCancellers.delete(input.taskId);
+      }
+    });
+    const cancel = async () => {
+      if (runtime.session.isStreaming) await runtime.session.abort();
+    };
+    this.#runCancellers.set(input.taskId, cancel);
+    return {
+      taskId: input.taskId,
+      runId: input.runId,
+      sessionId: execution.sessionId,
+      ...(runtime.session.model?.provider
+        ? { modelProvider: runtime.session.model.provider }
+        : {}),
+      ...(runtime.session.model?.id ? { modelId: runtime.session.model.id } : {}),
+      completion,
+      cancel,
+    };
   }
 
   remember(content: string, requestedScope?: MemoryScope): MemoryRecord {
@@ -443,6 +565,7 @@ export class DekiAgentRuntime {
     this.#recalledMemories = this.#recallMemories("");
     const result = await runtime.newSession();
     if (result.cancelled) return;
+    this.#registerSessionConfiguration(runtime.session);
     this.#recalledMemories = this.#recallMemories(
       "",
       runtime.session.sessionId,
@@ -590,8 +713,20 @@ export class DekiAgentRuntime {
     if (!runtime.session.sessionManager.getEntry(entryId)) {
       throw new Error("未找到分叉位置");
     }
+    const inheritedModel = this.#selectedModel;
+    const inheritedThinkingLevel = runtime.session.thinkingLevel as ThinkingLevel;
+    const inheritedPermissionPolicies = this.#permissionPoliciesForSession(
+      runtime.session.sessionId,
+    );
     const result = await runtime.fork(entryId, { position: "at" });
     if (result.cancelled) return;
+    if (inheritedModel) await runtime.session.setModel(inheritedModel);
+    runtime.session.setThinkingLevel(inheritedThinkingLevel);
+    this.#persistSessionPermissionPolicies(
+      runtime.session,
+      inheritedPermissionPolicies,
+    );
+    this.#registerSessionConfiguration(runtime.session);
     runtime.session.setSessionName(
       `${runtime.session.sessionName ?? "会话"} · 分叉`,
     );
@@ -609,6 +744,7 @@ export class DekiAgentRuntime {
     const session = await this.#findSession(id);
     const result = await runtime.switchSession(session.path);
     if (result.cancelled) return;
+    this.#registerSessionConfiguration(runtime.session);
     this.#emit({
       type: "session.ready",
       model: this.#selectedModel ? toModelSummary(this.#selectedModel) : undefined,
@@ -694,8 +830,26 @@ export class DekiAgentRuntime {
     this.#selectedModel = model;
     if (this.#runtime) {
       await this.#runtime.session.setModel(model);
+      this.#sessionModels.set(this.#runtime.session.sessionId, model);
     } else {
       await this.#createRuntime();
+    }
+  }
+
+  async updateSessionConfiguration(
+    input: UpdateSessionConfigurationInput,
+  ): Promise<void> {
+    const session = this.#runtime?.session;
+    if (!session) throw new Error("当前会话尚未就绪");
+    if (session.isStreaming) throw new Error("Agent 正在运行，无法修改会话配置");
+    if (input.permissionPolicies) {
+      if (!this.#projectFeaturesEnabled()) {
+        throw new Error("普通会话不会访问本地项目，无需设置权限");
+      }
+      this.#persistSessionPermissionPolicies(session, input.permissionPolicies);
+    }
+    if (input.thinkingLevel) {
+      session.setThinkingLevel(input.thinkingLevel);
     }
   }
 
@@ -707,6 +861,12 @@ export class DekiAgentRuntime {
         .map((runtime) => runtime.session.abort()),
     ]);
     this.#streaming = false;
+  }
+
+  async cancelTask(taskId: string): Promise<void> {
+    const cancel = this.#runCancellers.get(taskId);
+    if (!cancel) throw new Error("未找到正在运行的任务");
+    await cancel();
   }
 
   respondToApproval(requestId: string, decision: ApprovalDecision): boolean {
@@ -727,16 +887,24 @@ export class DekiAgentRuntime {
       [...this.#backgroundRuntimes].map((runtime) => runtime.dispose()),
     );
     this.#backgroundRuntimes.clear();
+    this.#runContextsBySession.clear();
+    this.#runCancellers.clear();
+    this.#sessionModels.clear();
+    this.#sessionPermissionPolicies.clear();
     await this.#gateway.dispose();
     await this.#options.mcpManager.dispose();
   }
 
-  async #startConcurrentPrompt(prompt: string): Promise<void> {
-    const current = this.#runtime;
+  async #startConcurrentPrompt(input: {
+    taskId: string;
+    runId: string;
+    prompt: string;
+    context: AgentPromptContext;
+  }): Promise<AgentPromptRunHandle> {
     const createRuntime = this.#createRuntimeFactory;
-    const sourceFile = current?.session.sessionFile;
-    if (!current || !createRuntime || !sourceFile) {
-      throw new Error("当前会话尚未持久化，不能创建并发分支");
+    const sourceFile = input.context.sourceSessionFile;
+    if (!createRuntime || !sourceFile) {
+      throw new Error("源会话尚未持久化，不能创建并发分支");
     }
     const sessionDirectory = join(
       this.#options.paths.sessionsRoot,
@@ -748,21 +916,31 @@ export class DekiAgentRuntime {
       sessionDirectory,
       { parentSession: sourceFile },
     );
+    if (
+      input.context.sourceEntryId
+      && sessionManager.getEntry(input.context.sourceEntryId)
+    ) {
+      sessionManager.branch(input.context.sourceEntryId);
+    }
     const background = await createAgentSessionRuntime(createRuntime, {
       cwd: this.#options.workspace,
       agentDir: this.#options.paths.root,
       sessionManager,
     });
-    background.session.setSessionName(createSessionTitle(prompt));
+    background.session.setSessionName(createSessionTitle(input.prompt));
     background.session.setAutoCompactionEnabled(
       this.#options.settings.agent.compactionEnabled,
     );
     background.session.setAutoRetryEnabled(
       this.#options.settings.models.maxRetries > 0,
     );
-    background.session.setThinkingLevel(
-      this.#options.settings.models.thinkingLevel,
-    );
+    this.#registerSessionConfiguration(background.session, false);
+    const execution: AgentExecutionContext = {
+      sessionId: background.session.sessionId,
+      taskId: input.taskId,
+      runId: input.runId,
+    };
+    this.#runContextsBySession.set(execution.sessionId, execution);
     this.#backgroundRuntimes.add(background);
     const unsubscribe = background.session.subscribe((event) => {
       if (event.type === "agent_end") {
@@ -773,26 +951,31 @@ export class DekiAgentRuntime {
       }
       const translated = translatePiAgentEvent(event);
       if (translated) {
-        this.#emitForSession(background.session, translated);
+        this.#emitForSession(background.session, translated, execution);
       }
     });
     this.#backgroundUnsubscribers.set(background, unsubscribe);
-    const memories = this.#recallMemories(prompt, background.session.sessionId);
+    const memories = this.#recallMemories(input.prompt, background.session.sessionId);
     if (memories.length > 0) {
       await background.session.sendCustomMessage({
         customType: "deki.memory.recall",
         content: renderMemoryContext(memories),
         display: false,
-        details: { query: prompt, memoryIds: memories.map((memory) => memory.id) },
+        details: {
+          query: input.prompt,
+          memoryIds: memories.map((memory) => memory.id),
+        },
       }, { triggerTurn: false });
     }
     background.session.sessionManager.appendCustomEntry("deki.run-state", {
       state: "running",
       updatedAt: new Date().toISOString(),
     });
-    this.#activeRunCount += 1;
-    this.#emitForSession(background.session, { type: "run.started" });
-    void background.session.prompt(prompt)
+    this.#emitForSession(background.session, { type: "run.started" }, execution);
+    const completion = this.#executionContext.run(
+      execution,
+      async () => background.session.prompt(input.prompt),
+    )
       .catch((error: unknown) => {
         background.session.sessionManager.appendCustomEntry("deki.run-state", {
           state: "failed",
@@ -802,19 +985,40 @@ export class DekiAgentRuntime {
         this.#emitForSession(background.session, {
           type: "run.failed",
           error: formatError(error),
-        });
+        }, execution);
+        throw error;
       })
       .finally(async () => {
         background.session.sessionManager.appendCustomEntry("deki.run-state", {
           state: "idle",
           updatedAt: new Date().toISOString(),
         });
-        this.#activeRunCount = Math.max(0, this.#activeRunCount - 1);
         this.#backgroundUnsubscribers.get(background)?.();
         this.#backgroundUnsubscribers.delete(background);
         this.#backgroundRuntimes.delete(background);
+        this.#runContextsBySession.delete(execution.sessionId);
+        this.#runCancellers.delete(input.taskId);
+        this.#sessionModels.delete(background.session.sessionId);
+        this.#sessionPermissionPolicies.delete(background.session.sessionId);
         await background.dispose();
       });
+    const cancel = async () => {
+      if (background.session.isStreaming) await background.session.abort();
+    };
+    this.#runCancellers.set(input.taskId, cancel);
+    return {
+      taskId: input.taskId,
+      runId: input.runId,
+      sessionId: execution.sessionId,
+      ...(background.session.model?.provider
+        ? { modelProvider: background.session.model.provider }
+        : {}),
+      ...(background.session.model?.id
+        ? { modelId: background.session.model.id }
+        : {}),
+      completion,
+      cancel,
+    };
   }
 
   async #createRuntime(): Promise<void> {
@@ -834,6 +1038,11 @@ export class DekiAgentRuntime {
     }) => {
       const recalled = this.#recallMemories("", sessionManager.getSessionId());
       this.#recalledMemories = recalled;
+      const sessionModel = resolveSessionModel(
+        this.#models,
+        sessionManager,
+        selectedModel,
+      );
       const contextFiles = this.#projectFeaturesEnabled()
         ? await loadConfiguredContextFiles(
             cwd,
@@ -841,7 +1050,7 @@ export class DekiAgentRuntime {
             this.#options.settings.workspace.contextIgnore,
           )
         : [];
-      const modelContext = selectedModel.contextWindow ?? 128_000;
+      const modelContext = sessionModel.contextWindow ?? 128_000;
       const compactionThreshold = Math.min(
         this.#options.settings.agent.compactionThreshold,
         Math.max(1_000, modelContext - 1_000),
@@ -929,7 +1138,7 @@ export class DekiAgentRuntime {
           services,
           sessionManager,
           ...(sessionStartEvent ? { sessionStartEvent } : {}),
-          model: selectedModel,
+          model: sessionModel,
           tools: this.#projectFeaturesEnabled()
             ? tools.map((tool) => tool.modelName)
             : [],
@@ -964,9 +1173,7 @@ export class DekiAgentRuntime {
     this.#runtime.session.setAutoRetryEnabled(
       this.#options.settings.models.maxRetries > 0,
     );
-    this.#runtime.session.setThinkingLevel(
-      this.#options.settings.models.thinkingLevel,
-    );
+    this.#registerSessionConfiguration(this.#runtime.session);
     this.#runtime.setRebindSession(async (session) => {
       this.#bindSession(session);
     });
@@ -995,8 +1202,68 @@ export class DekiAgentRuntime {
     }
     this.#emit({
       type: "session.ready",
-      model: toModelSummary(selectedModel),
+      model: this.#selectedModel
+        ? toModelSummary(this.#selectedModel)
+        : undefined,
     });
+  }
+
+  #registerSessionConfiguration(
+    session: AgentSessionRuntime["session"],
+    makeCurrent = true,
+  ): void {
+    const sessionId = session.sessionId;
+    const model = session.model
+      ? this.#models.find(
+          (candidate) => candidate.provider === session.model?.provider
+            && candidate.id === session.model?.id,
+        ) ?? session.model
+      : undefined;
+    if (model) {
+      this.#sessionModels.set(sessionId, model);
+      if (makeCurrent) this.#selectedModel = model;
+    }
+
+    const entries = session.sessionManager.getBranch();
+    if (!entries.some((entry) => entry.type === "thinking_level_change")) {
+      session.setThinkingLevel(this.#options.settings.models.thinkingLevel);
+    }
+    const savedPolicies = [...entries].reverse().find(
+      (entry) => entry.type === "custom"
+        && entry.customType === "deki.permission-policies",
+    );
+    const parsedPolicies = savedPolicies?.type === "custom"
+      ? permissionPoliciesSchema.safeParse(
+          isRecord(savedPolicies.data) ? savedPolicies.data.policies : undefined,
+        )
+      : undefined;
+    this.#sessionPermissionPolicies.set(
+      sessionId,
+      parsedPolicies?.success
+        ? { ...parsedPolicies.data }
+        : { ...this.#options.settings.permissions.policies },
+    );
+  }
+
+  #permissionPoliciesForSession(sessionId: string | undefined): PermissionPolicies {
+    const policies = sessionId
+      ? this.#sessionPermissionPolicies.get(sessionId)
+      : undefined;
+    return {
+      ...(policies ?? this.#options.settings.permissions.policies),
+    };
+  }
+
+  #persistSessionPermissionPolicies(
+    session: AgentSessionRuntime["session"],
+    policies: PermissionPolicies,
+  ): void {
+    const parsed = permissionPoliciesSchema.parse(policies);
+    session.sessionManager.appendCustomEntry("deki.permission-policies", {
+      version: 1,
+      policies: parsed,
+    });
+    this.#sessionPermissionPolicies.set(session.sessionId, { ...parsed });
   }
 
   #toPiTool(tool: GatewayTool, sessionId: () => string): PiToolDefinition {
@@ -1005,8 +1272,9 @@ export class DekiAgentRuntime {
       label: tool.internalName,
       description: tool.description,
       parameters: Type.Unsafe(tool.inputSchema),
-      execute: async (toolCallId, params, signal) =>
-        this.#toolSessionId.run(sessionId(), async () => {
+      execute: async (toolCallId, params, signal) => {
+        const effectiveSessionId = sessionId();
+        const execute = async () => {
         const context: ToolCallContext = {
           callId: toolCallId,
           workspace: this.#options.workspace,
@@ -1057,7 +1325,12 @@ export class DekiAgentRuntime {
           }
           throw error;
         }
-        }),
+        };
+        const execution = this.#runContextsBySession.get(effectiveSessionId);
+        return execution
+          ? this.#executionContext.run(execution, execute)
+          : execute();
+      },
     });
   }
 
@@ -1068,14 +1341,15 @@ export class DekiAgentRuntime {
   }
 
   #handleSessionEvent(event: AgentSessionEvent): void {
+    const session = this.#runtime?.session;
     if (event.type === "agent_end") {
       this.#streaming = false;
       this.#appendRunState("idle");
       void this.#createAutomaticMemoryCandidates();
     }
     const translated = translatePiAgentEvent(event);
-    if (translated) {
-      this.#emit(translated);
+    if (translated && session) {
+      this.#emitForSession(session, translated);
     }
   }
 
@@ -1228,7 +1502,8 @@ export class DekiAgentRuntime {
   }
 
   #emit(event: AgentEventInput): void {
-    const sessionId = this.#toolSessionId.getStore()
+    const execution = this.#executionContext.getStore();
+    const sessionId = execution?.sessionId
       ?? this.#runtime?.session.sessionId;
     const complete = {
       ...event,
@@ -1236,6 +1511,9 @@ export class DekiAgentRuntime {
       timestamp: new Date().toISOString(),
       ...(sessionId
         ? { sessionId }
+        : {}),
+      ...(execution
+        ? { taskId: execution.taskId, runId: execution.runId }
         : {}),
     } as AgentEvent;
     this.#forwardEvent(complete);
@@ -1260,12 +1538,16 @@ export class DekiAgentRuntime {
   #emitForSession(
     session: AgentSessionRuntime["session"],
     event: AgentEventInput,
+    execution = this.#runContextsBySession.get(session.sessionId),
   ): void {
     const complete = {
       ...event,
       eventId: crypto.randomUUID(),
       timestamp: new Date().toISOString(),
       sessionId: session.sessionId,
+      ...(execution
+        ? { taskId: execution.taskId, runId: execution.runId }
+        : {}),
     } as AgentEvent;
     if (shouldPersistTimelineEvent(complete)) {
       session.sessionManager.appendCustomEntry("deki.timeline", complete);
@@ -1679,6 +1961,25 @@ function parseRememberCommand(parts: string[]): {
 
 function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function resolveSessionModel(
+  models: readonly ModelType[],
+  sessionManager: SessionManager,
+  fallback: ModelType,
+): ModelType {
+  const savedModel = [...sessionManager.getBranch()].reverse().find(
+    (entry) => entry.type === "model_change",
+  );
+  if (savedModel?.type !== "model_change") return fallback;
+  return models.find(
+    (model) => model.provider === savedModel.provider
+      && model.id === savedModel.modelId,
+  ) ?? fallback;
 }
 
 function createSessionTitle(prompt: string): string {

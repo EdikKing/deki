@@ -45,6 +45,7 @@ export interface DekiPaths {
   projectsRoot: string;
   sessionsRoot: string;
   memoryDatabase: string;
+  tasksDatabase: string;
   logsRoot: string;
 }
 
@@ -59,6 +60,7 @@ export function getDekiPaths(
     projectsRoot: join(root, "projects"),
     sessionsRoot: join(root, "sessions"),
     memoryDatabase: join(root, "memory", "memory.db"),
+    tasksDatabase: join(root, "tasks", "tasks.db"),
     logsRoot: join(root, "logs"),
   };
 }
@@ -69,6 +71,7 @@ export async function ensureDekiDirectories(paths: DekiPaths): Promise<void> {
     mkdir(paths.sessionsRoot, { recursive: true }),
     mkdir(paths.projectsRoot, { recursive: true }),
     mkdir(resolve(paths.memoryDatabase, ".."), { recursive: true }),
+    mkdir(resolve(paths.tasksDatabase, ".."), { recursive: true }),
     mkdir(paths.logsRoot, { recursive: true }),
   ]);
 }

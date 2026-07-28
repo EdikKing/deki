@@ -3,6 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  ensureDekiDirectories,
+  getDekiPaths,
   isWorkspaceTrusted,
   loadMcpConfig,
   readMcpLocalConfig,
@@ -23,6 +25,15 @@ afterEach(async () => {
 });
 
 describe("config", () => {
+  it("creates the independent task database directory", async () => {
+    const root = await mkdtemp(join(tmpdir(), "deki-paths-"));
+    temporaryDirectories.push(root);
+    const paths = getDekiPaths(root);
+    await ensureDekiDirectories(paths);
+    await expect(stat(join(root, "tasks"))).resolves.toBeTruthy();
+    expect(paths.tasksDatabase).toBe(join(root, "tasks", "tasks.db"));
+  });
+
   it("canonicalizes a workspace and creates a stable scope id", async () => {
     const directory = await mkdtemp(join(tmpdir(), "deki-config-"));
     temporaryDirectories.push(directory);

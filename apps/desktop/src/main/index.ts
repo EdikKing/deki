@@ -37,6 +37,11 @@ import {
 import { McpManager } from "@deki-ai/mcp-manager";
 import { MemoryEngine } from "@deki-ai/memory-engine";
 import {
+  TaskOrchestrator,
+  TaskStore,
+  type PromptExecutionInput,
+} from "@deki-ai/task-orchestrator";
+import {
   ModelConfigStore,
   SettingsStore,
   settingsPatchSchema,
@@ -76,6 +81,12 @@ import {
   sessionSummarySchema,
   skillStatusSchema,
   skillActionInputSchema,
+  taskDetailSchema,
+  taskEventSchema,
+  taskIdInputSchema,
+  taskListInputSchema,
+  taskRecordSchema,
+  taskSubmissionResultSchema,
   rememberInputSchema,
   removeModelProviderInputSchema,
   resetSettingsInputSchema,
@@ -83,11 +94,16 @@ import {
   sendPromptInputSchema,
   settingsSnapshotSchema,
   updateSettingsInputSchema,
+  updateSessionConfigurationInputSchema,
   type AgentEvent,
   type BootstrapState,
   type CommandResult,
   type McpServerEditor,
   type MemoryScope,
+  type TaskEvent,
+  type TaskListInput,
+  type TaskSubmissionResult,
+  type UpdateSessionConfigurationInput,
 } from "@deki-ai/shared";
 
 protocol.registerSchemesAsPrivileged([{
@@ -116,13 +132,13 @@ class DesktopController {
   readonly #settings: SettingsStore;
   readonly #models: ModelConfigStore;
   readonly #checkpoints: GitCheckpointManager | undefined;
+  readonly #tasks: TaskOrchestrator;
   readonly #resumeLatest: boolean;
   #runtime: DekiAgentRuntime | undefined;
   #trusted = false;
   #starting: Promise<void> | undefined;
   #diagnostics: string[] = [];
   #reloadPending = false;
-  #activeRuns = 0;
   #recentWorkspaces: string[];
 
   private constructor(
@@ -144,6 +160,49 @@ class DesktopController {
     this.#settings = settings;
     this.#models = new ModelConfigStore(paths.modelsFile);
     this.#checkpoints = workspace ? new GitCheckpointManager(workspace) : undefined;
+    this.#tasks = new TaskOrchestrator({
+      store: new TaskStore(paths.tasksDatabase),
+      workspaceId: scopeId,
+      concurrency: settings.snapshot().effective.agent.maxConcurrentRuns,
+      executor: async ({ task, run, execution, signal }) => {
+        const runtime = this.#runtime;
+        if (!runtime) throw new Error("Agent Runtime 尚未就绪");
+        const promptExecution = execution as PromptExecutionInput;
+        const handle = await runtime.startPrompt({
+          taskId: task.id,
+          runId: run.id,
+          prompt: task.goal,
+          context: {
+            sourceSessionId: promptExecution.sourceSessionId,
+            ...(promptExecution.sourceSessionFile
+              ? { sourceSessionFile: promptExecution.sourceSessionFile }
+              : {}),
+            ...(promptExecution.sourceEntryId
+              ? { sourceEntryId: promptExecution.sourceEntryId }
+              : {}),
+            preferFork: promptExecution.preferFork,
+          },
+        });
+        if (signal.aborted) await handle.cancel();
+        return handle;
+      },
+      onEvent: (event) => {
+        broadcastTaskEvent(event);
+        if (
+          this.#reloadPending
+          && (
+            event.type === "task.succeeded"
+            || event.type === "task.failed"
+            || event.type === "task.cancelled"
+            || event.type === "task.interrupted"
+          )
+        ) {
+          setImmediate(() => {
+            void this.#reloadRuntimeWhenIdle();
+          });
+        }
+      },
+    });
     this.#resumeLatest = resumeLatest;
     this.#recentWorkspaces = recentWorkspaces;
     this.#settings.subscribe((snapshot) => {
@@ -216,6 +275,9 @@ class DesktopController {
       ...(snapshot?.sessionId ? { sessionId: snapshot.sessionId } : {}),
       models: snapshot?.models ?? [],
       ...(snapshot?.selectedModel ? { selectedModel: snapshot.selectedModel } : {}),
+      ...(snapshot?.sessionConfiguration
+        ? { sessionConfiguration: snapshot.sessionConfiguration }
+        : {}),
       memories: [
         ...(this.#projectFeatures
           ? this.#memory.listProjectMemories(this.#scopeId)
@@ -241,7 +303,7 @@ class DesktopController {
       skills: snapshot?.skills ?? [],
       diagnostics: [...this.#diagnostics, ...(snapshot?.diagnostics ?? [])],
       ...(snapshot?.modelUsage ? { modelUsage: snapshot.modelUsage } : {}),
-      activeRunCount: snapshot?.activeRunCount ?? this.#activeRuns,
+      activeRunCount: this.#tasks.activeRunCount,
       recentWorkspaces: this.#recentWorkspaces,
     });
   }
@@ -261,21 +323,79 @@ class DesktopController {
     }
   }
 
-  async sendPrompt(prompt: string): Promise<CommandResult> {
-    const limit = this.#settings.snapshot().effective.agent.maxConcurrentRuns;
-    if (this.#activeRuns >= limit) {
-      return { ok: false, error: `已达到并发运行上限（${limit}）` };
+  async sendPrompt(prompt: string): Promise<TaskSubmissionResult> {
+    const trimmed = prompt.trim();
+    if (trimmed.startsWith("/")) {
+      return this.#run(async (runtime) => runtime.prompt(trimmed));
     }
-    this.#activeRuns += 1;
+    if (!this.#trusted) {
+      return { ok: false, error: "请先信任当前工作区" };
+    }
+    const runtime = this.#runtime;
+    if (!runtime) {
+      return { ok: false, error: "Agent Runtime 尚未就绪" };
+    }
     try {
-      return await this.#run(async (runtime) => runtime.prompt(prompt));
-    } finally {
-      this.#activeRuns -= 1;
+      const snapshot = runtime.snapshot();
+      const sessionId = snapshot.sessionId;
+      if (!sessionId) throw new Error("当前会话尚未就绪");
+      const hasPending = this.#tasks.listTasks({
+        statuses: ["queued", "running", "waiting_approval", "waiting_user"],
+        limit: 500,
+      }).some((task) => task.sessionId === sessionId || !task.sessionId);
+      const preferFork = snapshot.streaming || hasPending;
+      const context = runtime.capturePromptContext(preferFork);
+      const task = this.#tasks.submitPrompt({
+        title: createTaskTitle(trimmed),
+        prompt: trimmed,
+        kind: preferFork ? "background" : "interactive",
+        execution: {
+          type: "agent-prompt",
+          sourceSessionId: context.sourceSessionId,
+          ...(context.sourceSessionFile
+            ? { sourceSessionFile: context.sourceSessionFile }
+            : {}),
+          ...(context.sourceEntryId
+            ? { sourceEntryId: context.sourceEntryId }
+            : {}),
+          preferFork,
+        },
+      });
+      return { ok: true, task };
+    } catch (error) {
+      return { ok: false, error: formatError(error) };
     }
   }
 
   async abort(): Promise<CommandResult> {
-    return this.#run(async (runtime) => runtime.abort());
+    const sessionId = this.#runtime?.snapshot().sessionId;
+    const task = sessionId
+      ? this.#tasks.currentTaskForSession(sessionId)
+      : undefined;
+    return task
+      ? this.cancelTask(task.id)
+      : this.#run(async (runtime) => runtime.abort());
+  }
+
+  listTasks(input: TaskListInput) {
+    return this.#tasks.listTasks({
+      limit: input.limit,
+      ...(input.statuses ? { statuses: input.statuses } : {}),
+    });
+  }
+
+  getTask(taskId: string) {
+    return this.#tasks.getTask(taskId) ?? null;
+  }
+
+  async cancelTask(taskId: string): Promise<CommandResult> {
+    try {
+      return await this.#tasks.cancelTask(taskId)
+        ? { ok: true }
+        : { ok: false, error: "未找到可取消的任务" };
+    } catch (error) {
+      return { ok: false, error: formatError(error) };
+    }
   }
 
   async newSession(): Promise<CommandResult> {
@@ -337,6 +457,12 @@ class DesktopController {
     return this.#run(async (runtime) => runtime.selectModel(provider, id));
   }
 
+  async updateSessionConfiguration(
+    input: UpdateSessionConfigurationInput,
+  ): Promise<CommandResult> {
+    return this.#run(async (runtime) => runtime.updateSessionConfiguration(input));
+  }
+
   getSettings(): SettingsSnapshot {
     return this.#settings.snapshot();
   }
@@ -352,6 +478,7 @@ class DesktopController {
     assertSettingsScopePatch(scope, patch);
     const before = this.#settings.snapshot();
     const snapshot = await this.#settings.update(scope, patch, expectedRevision);
+    this.#tasks.setConcurrency(snapshot.effective.agent.maxConcurrentRuns);
     if (requiresRuntimeReload(before, snapshot)) {
       await this.#reloadRuntimeWhenIdle();
     }
@@ -368,6 +495,7 @@ class DesktopController {
     }
     const before = this.#settings.snapshot();
     const snapshot = await this.#settings.reset(scope, keys, expectedRevision);
+    this.#tasks.setConcurrency(snapshot.effective.agent.maxConcurrentRuns);
     if (requiresRuntimeReload(before, snapshot)) {
       await this.#reloadRuntimeWhenIdle();
     }
@@ -379,7 +507,7 @@ class DesktopController {
   }
 
   async upsertModelProvider(input: ModelProviderInput): Promise<CommandResult> {
-    if (this.#runtime?.snapshot().streaming) {
+    if (this.#runtime?.snapshot().streaming || this.#tasks.activeRunCount > 0) {
       return { ok: false, error: "模型运行期间不能修改 Provider" };
     }
     try {
@@ -969,9 +1097,10 @@ class DesktopController {
   }
 
   async getDataUsage() {
-    const [sessionsBytes, memoryBytes, logsBytes, configBytes] = await Promise.all([
+    const [sessionsBytes, memoryBytes, tasksBytes, logsBytes, configBytes] = await Promise.all([
       directorySize(this.#paths.sessionsRoot),
       directorySize(resolve(this.#paths.memoryDatabase, "..")),
+      directorySize(resolve(this.#paths.tasksDatabase, "..")),
       directorySize(this.#paths.logsRoot),
       Promise.all([
         fileSize(this.#paths.configFile),
@@ -981,9 +1110,10 @@ class DesktopController {
       ]).then((values) => values.reduce((sum, value) => sum + value, 0)),
     ]);
     return {
-      totalBytes: sessionsBytes + memoryBytes + logsBytes + configBytes,
+      totalBytes: sessionsBytes + memoryBytes + tasksBytes + logsBytes + configBytes,
       sessionsBytes,
       memoryBytes,
+      tasksBytes,
       logsBytes,
       configBytes,
     };
@@ -1073,6 +1203,7 @@ class DesktopController {
   }
 
   async dispose(): Promise<void> {
+    await this.#tasks.dispose();
     await this.#runtime?.dispose();
     this.#runtime = undefined;
     this.#memory.close();
@@ -1085,6 +1216,7 @@ class DesktopController {
       this.#reloadPending = true;
       return;
     }
+    this.#tasks.pause();
     await this.#runtime?.dispose();
     this.#runtime = undefined;
     await this.#startRuntime();
@@ -1112,6 +1244,7 @@ class DesktopController {
         persistProjectGrant: async (category, grantKey) =>
           this.#persistProjectGrant(category, grantKey),
         onEvent: (event) => {
+          this.#tasks.handleAgentEvent(event);
           broadcastEvent(event);
           if (event.type === "diagnostic") {
             void writeDiagnosticLog(
@@ -1134,6 +1267,7 @@ class DesktopController {
       try {
         await runtime.initialize();
         this.#runtime = runtime;
+        if (runtime.snapshot().ready) this.#tasks.start();
       } catch (error) {
         await runtime.dispose();
         const message = `Runtime 初始化失败: ${formatError(error)}`;
@@ -1444,11 +1578,26 @@ function registerIpcHandlers(): void {
   ipcMain.handle(IPC_CHANNELS.sendPrompt, async (event, raw) => {
     assertTrustedSender(event);
     const { prompt } = sendPromptInputSchema.parse(raw);
-    return commandResultSchema.parse(await controller?.sendPrompt(prompt));
+    return taskSubmissionResultSchema.parse(await controller?.sendPrompt(prompt));
   });
   ipcMain.handle(IPC_CHANNELS.abortRun, async (event) => {
     assertTrustedSender(event);
     return commandResultSchema.parse(await controller?.abort());
+  });
+  ipcMain.handle(IPC_CHANNELS.listTasks, (event, raw) => {
+    assertTrustedSender(event);
+    const input = taskListInputSchema.parse(raw ?? {});
+    return taskRecordSchema.array().parse(controller?.listTasks(input) ?? []);
+  });
+  ipcMain.handle(IPC_CHANNELS.getTask, (event, raw) => {
+    assertTrustedSender(event);
+    const { taskId } = taskIdInputSchema.parse(raw);
+    return taskDetailSchema.nullable().parse(controller?.getTask(taskId) ?? null);
+  });
+  ipcMain.handle(IPC_CHANNELS.cancelTask, async (event, raw) => {
+    assertTrustedSender(event);
+    const { taskId } = taskIdInputSchema.parse(raw);
+    return commandResultSchema.parse(await controller?.cancelTask(taskId));
   });
   ipcMain.handle(IPC_CHANNELS.newSession, async (event) => {
     assertTrustedSender(event);
@@ -1505,6 +1654,13 @@ function registerIpcHandlers(): void {
     assertTrustedSender(event);
     const { provider, id } = selectModelInputSchema.parse(raw);
     return commandResultSchema.parse(await controller?.selectModel(provider, id));
+  });
+  ipcMain.handle(IPC_CHANNELS.updateSessionConfiguration, async (event, raw) => {
+    assertTrustedSender(event);
+    const input = updateSessionConfigurationInputSchema.parse(raw);
+    return commandResultSchema.parse(
+      await controller?.updateSessionConfiguration(input),
+    );
   });
   ipcMain.handle(IPC_CHANNELS.getSettings, (event) => {
     assertTrustedSender(event);
@@ -1716,6 +1872,7 @@ function registerIpcHandlers(): void {
       totalBytes: 0,
       sessionsBytes: 0,
       memoryBytes: 0,
+      tasksBytes: 0,
       logsBytes: 0,
       configBytes: 0,
     });
@@ -1834,7 +1991,9 @@ function registerIpcHandlers(): void {
       ? paths.sessionsRoot
       : category === "memories"
         ? resolve(paths.memoryDatabase, "..")
-        : paths.logsRoot;
+        : category === "tasks"
+          ? resolve(paths.tasksDatabase, "..")
+          : paths.logsRoot;
     await controller?.dispose();
     controller = undefined;
     await moveToTrashOrBackup(target);
@@ -1907,6 +2066,15 @@ function broadcastEvent(raw: AgentEvent): void {
   }
 }
 
+function broadcastTaskEvent(raw: TaskEvent): void {
+  const event = taskEventSchema.parse(raw);
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.isDestroyed()) {
+      window.webContents.send(IPC_CHANNELS.taskEvent, event);
+    }
+  }
+}
+
 function broadcastSettings(raw: SettingsSnapshot): void {
   const settings = settingsSnapshotSchema.parse(raw);
   for (const window of BrowserWindow.getAllWindows()) {
@@ -1914,6 +2082,11 @@ function broadcastSettings(raw: SettingsSnapshot): void {
       window.webContents.send(IPC_CHANNELS.settingsChanged, settings);
     }
   }
+}
+
+function createTaskTitle(prompt: string): string {
+  const firstLine = prompt.split("\n", 1)[0]?.trim() ?? prompt;
+  return firstLine.length > 42 ? `${firstLine.slice(0, 42)}…` : firstLine;
 }
 
 function applyNativeSettings(snapshot: SettingsSnapshot): void {

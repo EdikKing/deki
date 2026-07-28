@@ -52,6 +52,7 @@ export interface PermissionEngineOptions {
   settings: DekiSettings;
   sessionId: () => string | undefined;
   model: () => string | undefined;
+  resolvePolicies?: () => Record<PermissionCategory, PermissionPolicy>;
   emit: (event: AgentEvent) => void;
   persistProjectGrant?: (category: PermissionCategory, grantKey?: string) => Promise<void>;
 }
@@ -78,7 +79,7 @@ export class PermissionDeniedError extends Error {
 export class PermissionEngine {
   readonly #options: PermissionEngineOptions;
   readonly #pending = new Map<string, PendingApproval>();
-  readonly #sessionGrants = new Set<string>();
+  readonly #sessionGrants = new Map<string, Set<string>>();
   readonly #authorized = new Map<string, AuthorizedOperation>();
   readonly #cleanupPromise: Promise<void>;
 
@@ -96,19 +97,20 @@ export class PermissionEngine {
 
   async authorize(request: PermissionRequest): Promise<void> {
     const grantKey = request.grantKey ?? request.category;
-    const fullAccess = Object.values(
-      this.#options.settings.permissions.policies,
-    ).every((policy) => policy === "allow");
-    const policy = this.#sessionGrants.has(grantKey)
+    const policies = this.#options.resolvePolicies?.()
+      ?? this.#options.settings.permissions.policies;
+    const grants = this.#grantsForCurrentSession();
+    const fullAccess = Object.values(policies).every((policy) => policy === "allow");
+    const policy = grants.has(grantKey)
       ? "allow"
       : fullAccess
         ? "allow"
-        : request.policy ?? this.#options.settings.permissions.policies[request.category];
+        : request.policy ?? policies[request.category];
     let decision: ApprovalDecision = policy === "allow" ? "allow_once" : "deny";
     if (policy === "ask") decision = await this.#ask(request);
-    if (decision === "allow_session") this.#sessionGrants.add(grantKey);
+    if (decision === "allow_session") grants.add(grantKey);
     if (decision === "allow_project") {
-      this.#sessionGrants.add(grantKey);
+      grants.add(grantKey);
       await this.#options.persistProjectGrant?.(request.category, request.grantKey);
     }
     if (policy === "deny" || decision === "deny") {
@@ -214,6 +216,16 @@ export class PermissionEngine {
       pending.resolve("deny");
       this.#pending.delete(requestId);
     }
+  }
+
+  #grantsForCurrentSession(): Set<string> {
+    const sessionId = this.#options.sessionId() ?? "__unbound__";
+    let grants = this.#sessionGrants.get(sessionId);
+    if (!grants) {
+      grants = new Set();
+      this.#sessionGrants.set(sessionId, grants);
+    }
+    return grants;
   }
 
   async recordDiff(callId: string, diff: string): Promise<void> {

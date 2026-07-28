@@ -5,6 +5,11 @@ import {
   memoryListInputSchema,
   rememberInputSchema,
   sendPromptInputSchema,
+  taskEventSchema,
+  taskListInputSchema,
+  taskRecordSchema,
+  taskSubmissionResultSchema,
+  updateSessionConfigurationInputSchema,
 } from "./index";
 
 describe("shared IPC schemas", () => {
@@ -31,6 +36,33 @@ describe("shared IPC schemas", () => {
 
   it("rejects empty prompts", () => {
     expect(() => sendPromptInputSchema.parse({ prompt: "   " })).toThrow();
+  });
+
+  it("validates task records, events, and submission results", () => {
+    const task = taskRecordSchema.parse({
+      id: "9d0cb2ad-fbeb-4307-b24b-dd4d6ea16eaf",
+      workspaceId: "workspace-a",
+      rootTaskId: "9d0cb2ad-fbeb-4307-b24b-dd4d6ea16eaf",
+      kind: "interactive",
+      title: "修复测试",
+      goal: "修复测试",
+      status: "queued",
+      priority: 0,
+      createdAt: "2026-07-28T00:00:00.000Z",
+      updatedAt: "2026-07-28T00:00:00.000Z",
+    });
+    expect(taskSubmissionResultSchema.parse({ ok: true, task }).task?.id)
+      .toBe(task.id);
+    expect(taskEventSchema.parse({
+      eventId: "25874e8e-00b8-4e39-9843-6ebda59f6ca7",
+      taskId: task.id,
+      timestamp: "2026-07-28T00:00:00.000Z",
+      sequence: 1,
+      type: "task.created",
+      payload: {},
+    }).sequence).toBe(1);
+    expect(taskListInputSchema.parse({})).toEqual({ limit: 100 });
+    expect(() => taskListInputSchema.parse({ limit: 501 })).toThrow();
   });
 
   it("validates task-scoped memory commands and indexed queries", () => {
@@ -65,5 +97,31 @@ describe("shared IPC schemas", () => {
     });
     expect(state.ready).toBe(false);
     expect(state.diagnostics).toEqual(["missing auth"]);
+  });
+
+  it("validates current-session configuration updates", () => {
+    expect(updateSessionConfigurationInputSchema.parse({
+      thinkingLevel: "high",
+    })).toEqual({ thinkingLevel: "high" });
+    const permissionUpdate = updateSessionConfigurationInputSchema.parse({
+      permissionPolicies: {
+        "workspace.read": "allow",
+        "workspace.write": "allow",
+        "workspace.delete": "ask",
+        "shell.safe": "allow",
+        "shell.unknown": "ask",
+        "dependencies.install": "ask",
+        "git.commit": "ask",
+        "git.push": "ask",
+        outsideWorkspace: "ask",
+        sensitiveFiles: "ask",
+        privileged: "ask",
+        network: "ask",
+        "mcp.read": "allow",
+        "mcp.write": "ask",
+      },
+    });
+    expect(permissionUpdate.permissionPolicies?.["workspace.delete"]).toBe("ask");
+    expect(() => updateSessionConfigurationInputSchema.parse({})).toThrow();
   });
 });

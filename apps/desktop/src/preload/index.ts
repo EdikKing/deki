@@ -28,9 +28,16 @@ import {
   sessionSummarySchema,
   skillStatusSchema,
   skillActionInputSchema,
+  taskDetailSchema,
+  taskEventSchema,
+  taskIdInputSchema,
+  taskListInputSchema,
+  taskRecordSchema,
+  taskSubmissionResultSchema,
   settingsPatchSchema,
   settingsScopeSchema,
   settingsSnapshotSchema,
+  updateSessionConfigurationInputSchema,
   type DekiDesktopApi,
 } from "@deki-ai/shared";
 
@@ -61,13 +68,37 @@ const api: DekiDesktopApi = {
     );
   },
   async sendPrompt(prompt) {
-    return commandResultSchema.parse(
+    return taskSubmissionResultSchema.parse(
       await ipcRenderer.invoke(IPC_CHANNELS.sendPrompt, { prompt }),
     );
   },
   async abortRun() {
     return commandResultSchema.parse(
       await ipcRenderer.invoke(IPC_CHANNELS.abortRun),
+    );
+  },
+  async listTasks(input) {
+    return taskRecordSchema.array().parse(
+      await ipcRenderer.invoke(
+        IPC_CHANNELS.listTasks,
+        taskListInputSchema.parse(input ?? {}),
+      ),
+    );
+  },
+  async getTask(taskId) {
+    return taskDetailSchema.nullable().parse(
+      await ipcRenderer.invoke(
+        IPC_CHANNELS.getTask,
+        taskIdInputSchema.parse({ taskId }),
+      ),
+    );
+  },
+  async cancelTask(taskId) {
+    return commandResultSchema.parse(
+      await ipcRenderer.invoke(
+        IPC_CHANNELS.cancelTask,
+        taskIdInputSchema.parse({ taskId }),
+      ),
     );
   },
   async newSession() {
@@ -146,6 +177,14 @@ const api: DekiDesktopApi = {
   async selectModel(provider, id) {
     return commandResultSchema.parse(
       await ipcRenderer.invoke(IPC_CHANNELS.selectModel, { provider, id }),
+    );
+  },
+  async updateSessionConfiguration(input) {
+    return commandResultSchema.parse(
+      await ipcRenderer.invoke(
+        IPC_CHANNELS.updateSessionConfiguration,
+        updateSessionConfigurationInputSchema.parse(input),
+      ),
     );
   },
   async getSettings() {
@@ -420,6 +459,13 @@ const api: DekiDesktopApi = {
     };
     ipcRenderer.on(IPC_CHANNELS.agentEvent, handler);
     return () => ipcRenderer.removeListener(IPC_CHANNELS.agentEvent, handler);
+  },
+  subscribeTaskEvents(listener) {
+    const handler = (_event: Electron.IpcRendererEvent, raw: unknown) => {
+      listener(taskEventSchema.parse(raw));
+    };
+    ipcRenderer.on(IPC_CHANNELS.taskEvent, handler);
+    return () => ipcRenderer.removeListener(IPC_CHANNELS.taskEvent, handler);
   },
 };
 

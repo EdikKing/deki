@@ -70,6 +70,49 @@ describe("PermissionEngine", () => {
     })).resolves.toBeUndefined();
   });
 
+  it("resolves policies independently for the active chat session", async () => {
+    const root = await mkdtemp(join(tmpdir(), "deki-permissions-session-"));
+    const settings = structuredClone(defaultSettings);
+    let sessionId = "chat-a";
+    const fullAccess = structuredClone(settings.permissions.policies);
+    for (const category of Object.keys(fullAccess) as Array<keyof typeof fullAccess>) {
+      fullAccess[category] = "allow";
+    }
+    const policies = new Map([
+      ["chat-a", fullAccess],
+      ["chat-b", {
+        ...settings.permissions.policies,
+        "workspace.write": "deny" as const,
+      }],
+    ]);
+    const engine = new PermissionEngine({
+      workspace: root,
+      logsRoot: join(root, "logs"),
+      settings,
+      sessionId: () => sessionId,
+      model: () => "provider/model",
+      resolvePolicies: () => policies.get(sessionId) ?? settings.permissions.policies,
+      emit: () => {},
+    });
+
+    await expect(engine.authorize({
+      callId: "chat-a-write",
+      category: "workspace.write",
+      title: "write",
+      description: "write",
+      details: {},
+    })).resolves.toBeUndefined();
+
+    sessionId = "chat-b";
+    await expect(engine.authorize({
+      callId: "chat-b-write",
+      category: "workspace.write",
+      title: "write",
+      description: "write",
+      details: {},
+    })).rejects.toThrow("权限策略拒绝");
+  });
+
   it("writes workspace files and returns a unified diff through the gateway", async () => {
     const root = await mkdtemp(join(tmpdir(), "deki-tools-"));
     const events: string[] = [];

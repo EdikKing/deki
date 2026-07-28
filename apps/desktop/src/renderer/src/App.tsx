@@ -18,6 +18,7 @@ import type {
   ModelSummary,
   SessionSummary,
   SettingsSnapshot,
+  ThinkingLevel,
 } from "@deki-ai/shared";
 import { SettingsView } from "./SettingsView";
 import {
@@ -41,7 +42,6 @@ type ToolActivity = {
   update?: unknown;
   result?: unknown;
 };
-type ThinkingLevel = SettingsSnapshot["effective"]["models"]["thinkingLevel"];
 const thinkingLevels: readonly ThinkingLevel[] = [
   "off",
   "minimal",
@@ -278,6 +278,18 @@ export function App() {
         {...(settingsSection ? { initialSection: settingsSection } : {})}
         {...(settingsSection === "permissions" ? { initialScope: "session" as const } : {})}
         hasWorkspace={Boolean(state.workspace && state.trusted)}
+        {...(state.sessionConfiguration
+          ? {
+              sessionPermissionPolicies: state.sessionConfiguration.permissionPolicies,
+              onSessionPermissionPoliciesChanged: async (permissionPolicies) => {
+                const result = await window.deki.updateSessionConfiguration({
+                  permissionPolicies,
+                });
+                if (!result.ok) throw new Error(result.error ?? "会话权限更新失败");
+                await refresh();
+              },
+            }
+          : {})}
         {...(state.sessionId ? { taskId: state.sessionId } : {})}
         locale={locale}
         onChanged={setSettings}
@@ -653,21 +665,19 @@ export function App() {
                     />
                     {settings && (
                       <PermissionModePicker
-                        policies={settings.effective.permissions.policies}
+                        policies={state.sessionConfiguration?.permissionPolicies
+                          ?? settings.effective.permissions.policies}
                         zh={zh}
-                        disabled={busy}
+                        disabled={busy || !state.ready}
                         available={Boolean(state.workspace)}
                         onSelect={async (mode) => {
-                          try {
-                            const next = await window.deki.updateSettings(
-                              "session",
-                              { permissions: { policies: policiesForPermissionMode(mode) } },
-                              settings.revision,
-                            );
-                            setSettings(next);
-                          } catch (reason) {
-                            setError(reason instanceof Error ? reason.message : String(reason));
-                          }
+                          await runCommand(
+                            window.deki.updateSessionConfiguration({
+                              permissionPolicies: policiesForPermissionMode(mode),
+                            }),
+                            setError,
+                            refresh,
+                          );
                         }}
                         onOpenSettings={() => {
                           setSettingsSection("permissions");
@@ -677,20 +687,16 @@ export function App() {
                     )}
                     {settings && (
                       <ThinkingLevelPicker
-                        value={settings.effective.models.thinkingLevel}
+                        value={state.sessionConfiguration?.thinkingLevel
+                          ?? settings.effective.models.thinkingLevel}
                         zh={zh}
-                        disabled={busy}
+                        disabled={busy || !state.ready}
                         onSelect={async (thinkingLevel) => {
-                          try {
-                            const next = await window.deki.updateSettings(
-                              "session",
-                              { models: { thinkingLevel } },
-                              settings.revision,
-                            );
-                            setSettings(next);
-                          } catch (reason) {
-                            setError(reason instanceof Error ? reason.message : String(reason));
-                          }
+                          await runCommand(
+                            window.deki.updateSessionConfiguration({ thinkingLevel }),
+                            setError,
+                            refresh,
+                          );
                         }}
                       />
                     )}

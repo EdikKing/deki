@@ -1,0 +1,11 @@
+{
+  "name": "@deki-ai/task-orchestrator",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "@deki-ai/shared": "workspace:*",
+    "zod": "4.4.3"
+  }
+}

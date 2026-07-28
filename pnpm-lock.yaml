@@ -90,6 +90,9 @@ importers:
       '@deki-ai/shared':
         specifier: workspace:*
         version: link:../../packages/shared
+      '@deki-ai/task-orchestrator':
+        specifier: workspace:*
+        version: link:../../packages/task-orchestrator
       '@deki-ai/tool-gateway':
         specifier: workspace:*
         version: link:../../packages/tool-gateway
@@ -234,6 +237,15 @@ importers:
 
   packages/shared:
     dependencies:
+      zod:
+        specifier: 4.4.3
+        version: 4.4.3
+
+  packages/task-orchestrator:
+    dependencies:
+      '@deki-ai/shared':
+        specifier: workspace:*
+        version: link:../shared
       zod:
         specifier: 4.4.3
         version: 4.4.3

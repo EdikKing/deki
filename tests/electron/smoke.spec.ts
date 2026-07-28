@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   mkdir,
   mkdtemp,
@@ -17,6 +18,7 @@ import {
   test,
   type ElectronApplication,
 } from "@playwright/test";
+import type { DekiDesktopApi } from "@deki-ai/shared";
 
 const require = createRequire(import.meta.url);
 const electronPath = require("electron") as string;
@@ -35,6 +37,17 @@ test("starts a general chat without a workspace", async ({}, testInfo) => {
 
   try {
     const window = await electronApp.firstWindow();
+    expect(await window.evaluate(
+      () => (globalThis as unknown as { deki: DekiDesktopApi }).deki
+        .listTasks({ limit: 10 }),
+    )).toEqual([]);
+    expect(await window.evaluate(
+      () => (globalThis as unknown as { deki: DekiDesktopApi }).deki
+        .getTask("9d0cb2ad-fbeb-4307-b24b-dd4d6ea16eaf"),
+    )).toBeNull();
+    expect((await window.evaluate(
+      () => (globalThis as unknown as { deki: DekiDesktopApi }).deki.getDataUsage(),
+    )).tasksBytes).toBeGreaterThanOrEqual(0);
     await expect(window.getByRole("heading", { name: /开始一个普通会话|Start a general chat/ })).toBeVisible();
     const navigation = window.getByRole("navigation", { name: "项目和会话" });
     const defaultWorkspace = navigation.getByRole("button", { name: /默认工作区|Default workspace/ }).first();
@@ -150,6 +163,10 @@ test("groups and searches models in the composer picker", async ({}) => {
   const temporaryHome = await mkdtemp(resolve(tmpdir(), "deki-electron-model-picker-"));
   await seedChineseSettings(temporaryHome);
   await seedComposerModels(temporaryHome);
+  const firstSessionId = "00000000-0000-4000-8000-000000000001";
+  const secondSessionId = "00000000-0000-4000-8000-000000000002";
+  await seedPersistedSession(temporaryHome, undefined, firstSessionId, "2026-07-27T10:00:00.000Z");
+  await seedPersistedSession(temporaryHome, undefined, secondSessionId, "2026-07-27T10:01:00.000Z");
   const electronApp = await electron.launch({
     executablePath: electronPath,
     args: createElectronArguments(temporaryHome),
@@ -158,6 +175,11 @@ test("groups and searches models in the composer picker", async ({}) => {
 
   try {
     const window = await electronApp.firstWindow();
+    expect(await window.evaluate(
+      (sessionId) => (globalThis as unknown as { deki: DekiDesktopApi }).deki.switchSession(sessionId),
+      firstSessionId,
+    ))
+      .toEqual({ ok: true });
     const trigger = window.locator(".composer-model-trigger");
     await expect(trigger.locator(".composer-model-name")).toHaveText("Alpha Chat");
     await trigger.click();
@@ -170,9 +192,112 @@ test("groups and searches models in the composer picker", async ({}) => {
     await picker.getByRole("option", { name: "Beta Code" }).click();
     await expect(trigger.locator(".composer-model-name")).toHaveText("Beta Code");
     await expect(picker).not.toBeVisible();
+
+    expect(await window.evaluate(
+      () => (globalThis as unknown as { deki: DekiDesktopApi }).deki
+        .updateSessionConfiguration({ thinkingLevel: "high" }),
+    )).toEqual({ ok: true });
+    const firstSession = await window.evaluate(
+      () => (globalThis as unknown as { deki: DekiDesktopApi }).deki.getBootstrapState(),
+    );
+    expect(firstSession.selectedModel?.name).toBe("Beta Code");
+    expect(firstSession.sessionConfiguration?.thinkingLevel).toBe("high");
+
+    expect(await window.evaluate(
+      (sessionId) => (globalThis as unknown as { deki: DekiDesktopApi }).deki.switchSession(sessionId),
+      secondSessionId,
+    ))
+      .toEqual({ ok: true });
+    const secondSession = await window.evaluate(
+      () => (globalThis as unknown as { deki: DekiDesktopApi }).deki.getBootstrapState(),
+    );
+    expect(secondSession.sessionId).not.toBe(firstSession.sessionId);
+    expect(secondSession.selectedModel?.name).toBe("Alpha Chat");
+    expect(secondSession.sessionConfiguration?.thinkingLevel).toBe("medium");
+
+    expect(await window.evaluate(
+      (sessionId) => (globalThis as unknown as { deki: DekiDesktopApi }).deki.switchSession(sessionId),
+      firstSession.sessionId!,
+    ))
+      .toEqual({ ok: true });
+    const restoredSession = await window.evaluate(
+      () => (globalThis as unknown as { deki: DekiDesktopApi }).deki.getBootstrapState(),
+    );
+    expect(restoredSession.selectedModel?.name).toBe("Beta Code");
+    expect(restoredSession.sessionConfiguration?.thinkingLevel).toBe("high");
   } finally {
     await electronApp.close();
     await rm(temporaryHome, { recursive: true, force: true });
+  }
+});
+
+// Playwright requires an object-destructured fixtures parameter.
+// eslint-disable-next-line no-empty-pattern
+test("keeps permission mode on the chat where it was selected", async ({}) => {
+  const temporaryHome = await mkdtemp(resolve(tmpdir(), "deki-electron-session-permissions-"));
+  const workspace = await mkdtemp(resolve(tmpdir(), "deki-electron-session-workspace-"));
+  await seedChineseSettings(temporaryHome);
+  await seedComposerModels(temporaryHome);
+  const firstSessionId = "00000000-0000-4000-8000-000000000011";
+  const secondSessionId = "00000000-0000-4000-8000-000000000012";
+  await seedPersistedSession(temporaryHome, workspace, firstSessionId, "2026-07-27T11:00:00.000Z");
+  await seedPersistedSession(temporaryHome, workspace, secondSessionId, "2026-07-27T11:01:00.000Z");
+  const electronApp = await electron.launch({
+    executablePath: electronPath,
+    args: createElectronArguments(temporaryHome, "--workspace", workspace),
+    env: createTestEnvironment(temporaryHome),
+  });
+
+  try {
+    const window = await electronApp.firstWindow();
+    await window.getByRole("button", { name: "信任并继续" }).click();
+    const permissionTrigger = window.getByRole("button", { name: "选择权限模式" });
+    await expect(permissionTrigger).toBeEnabled();
+    expect(await window.evaluate(
+      (sessionId) => (globalThis as unknown as { deki: DekiDesktopApi }).deki.switchSession(sessionId),
+      firstSessionId,
+    ))
+      .toEqual({ ok: true });
+    await permissionTrigger.click();
+    await window.getByRole("listbox", { name: "权限模式" })
+      .getByRole("option", { name: /完全访问权限/ })
+      .click();
+    await expect(permissionTrigger).toContainText("完全访问权限");
+
+    const firstSession = await window.evaluate(
+      () => (globalThis as unknown as { deki: DekiDesktopApi }).deki.getBootstrapState(),
+    );
+    expect(Object.values(
+      firstSession.sessionConfiguration!.permissionPolicies,
+    ).every((policy) => policy === "allow")).toBe(true);
+
+    expect(await window.evaluate(
+      (sessionId) => (globalThis as unknown as { deki: DekiDesktopApi }).deki.switchSession(sessionId),
+      secondSessionId,
+    ))
+      .toEqual({ ok: true });
+    const secondSession = await window.evaluate(
+      () => (globalThis as unknown as { deki: DekiDesktopApi }).deki.getBootstrapState(),
+    );
+    expect(secondSession.sessionId).not.toBe(firstSession.sessionId);
+    expect(secondSession.sessionConfiguration?.permissionPolicies["workspace.delete"]).toBe("ask");
+
+    expect(await window.evaluate(
+      (sessionId) => (globalThis as unknown as { deki: DekiDesktopApi }).deki.switchSession(sessionId),
+      firstSession.sessionId!,
+    ))
+      .toEqual({ ok: true });
+    const restoredSession = await window.evaluate(
+      () => (globalThis as unknown as { deki: DekiDesktopApi }).deki.getBootstrapState(),
+    );
+    expect(Object.values(
+      restoredSession.sessionConfiguration!.permissionPolicies,
+    ).every((policy) => policy === "allow")).toBe(true);
+    await expect(window.locator(".inline-error")).toHaveCount(0);
+  } finally {
+    await electronApp.close();
+    await rm(temporaryHome, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
   }
 });
 
@@ -307,7 +432,7 @@ test("automatically trusts a workspace selected from Add project", async ({}) =>
     await window.getByRole("button", { name: "添加项目" }).click();
     await expect(window.getByRole("heading", { name: "从理解项目开始" })).toBeVisible();
     await expect(window.getByRole("heading", { name: "信任这个工作区？" })).toHaveCount(0);
-    await expect(window.getByRole("button", { name: "选择权限模式" })).toBeEnabled();
+    await expect(window.getByRole("button", { name: "选择权限模式" })).toBeDisabled();
 
     const config = JSON.parse(
       await readFile(join(temporaryHome, ".deki", "config.json"), "utf8"),
@@ -409,18 +534,7 @@ test("trusts a workspace, streams fixture events, and recalls memory", async ({}
 
     const permissionTrigger = window.getByRole("button", { name: "选择权限模式" });
     await expect(permissionTrigger).toContainText("请求批准");
-    await permissionTrigger.click();
-    const permissionPicker = window.getByRole("listbox", { name: "权限模式" });
-    await expect(permissionPicker.getByRole("option")).toHaveCount(3);
-    await expect(permissionPicker.getByRole("option", { name: /^请求批准 / })).toHaveAttribute("aria-selected", "true");
-    await permissionPicker.getByRole("option", { name: /完全访问权限/ }).click();
-    await expect(permissionTrigger).toContainText("完全访问权限");
-    await permissionTrigger.click();
-    await permissionPicker.getByRole("button", { name: "逐项配置权限…" }).click();
-    await expect(window.getByRole("heading", { name: "权限" })).toBeVisible();
-    await expect(window.locator(".scope-picker select").first()).toHaveValue("session");
-    await expect(window.getByText(/完全访问权限已开启/)).toBeVisible();
-    await window.getByRole("button", { name: "返回" }).click();
+    await expect(permissionTrigger).toBeDisabled();
 
     await window.getByTestId("open-settings").click();
     await window.getByTestId("settings-section-mcp").click();
@@ -549,8 +663,8 @@ async function seedComposerModels(temporaryHome: string) {
         api: "openai-completions",
         apiKey: "alpha-test-key",
         models: [
-          { id: "alpha-chat", name: "Alpha Chat" },
-          { id: "alpha-reasoner", name: "Alpha Reasoner" },
+          { id: "alpha-chat", name: "Alpha Chat", reasoning: true },
+          { id: "alpha-reasoner", name: "Alpha Reasoner", reasoning: true },
         ],
       },
       beta: {
@@ -559,9 +673,93 @@ async function seedComposerModels(temporaryHome: string) {
         api: "openai-completions",
         apiKey: "beta-test-key",
         models: [
-          { id: "beta-code", name: "Beta Code" },
+          { id: "beta-code", name: "Beta Code", reasoning: true },
         ],
       },
     },
   }));
+}
+
+async function seedPersistedSession(
+  temporaryHome: string,
+  workspace: string | undefined,
+  sessionId: string,
+  timestamp: string,
+) {
+  const normalizedWorkspace = workspace ? await realpath(workspace) : undefined;
+  const cwd = normalizedWorkspace ?? join(temporaryHome, ".deki", "general");
+  const scopeId = normalizedWorkspace
+    ? createHash("sha256").update(normalizedWorkspace).digest("hex").slice(0, 24)
+    : "general";
+  const sessionDirectory = join(temporaryHome, ".deki", "sessions", scopeId);
+  await mkdir(sessionDirectory, { recursive: true });
+  const entries = [
+    {
+      type: "session",
+      version: 3,
+      id: sessionId,
+      timestamp,
+      cwd,
+    },
+    {
+      type: "model_change",
+      id: `${sessionId}-model`,
+      parentId: null,
+      timestamp,
+      provider: "alpha",
+      modelId: "alpha-chat",
+    },
+    {
+      type: "thinking_level_change",
+      id: `${sessionId}-thinking`,
+      parentId: `${sessionId}-model`,
+      timestamp,
+      thinkingLevel: "medium",
+    },
+    {
+      type: "message",
+      id: `${sessionId}-user`,
+      parentId: `${sessionId}-thinking`,
+      timestamp,
+      message: {
+        role: "user",
+        content: [{ type: "text", text: `seed ${sessionId}` }],
+        timestamp: new Date(timestamp).getTime(),
+      },
+    },
+    {
+      type: "message",
+      id: `${sessionId}-assistant`,
+      parentId: `${sessionId}-user`,
+      timestamp,
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "ready" }],
+        api: "openai-completions",
+        provider: "alpha",
+        model: "alpha-chat",
+        usage: {
+          input: 1,
+          output: 1,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 2,
+          cost: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            total: 0,
+          },
+        },
+        stopReason: "stop",
+        timestamp: new Date(timestamp).getTime(),
+      },
+    },
+  ];
+  const fileTimestamp = timestamp.replace(/[:.]/g, "-");
+  await writeFile(
+    join(sessionDirectory, `${fileTimestamp}_${sessionId}.jsonl`),
+    `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
+  );
 }

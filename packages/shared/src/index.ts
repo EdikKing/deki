@@ -9,6 +9,20 @@ export const permissionCategorySchema = z.enum([
   "mcp.read", "mcp.write",
 ]);
 export type PermissionCategory = z.infer<typeof permissionCategorySchema>;
+export const permissionPoliciesSchema = z.record(
+  permissionCategorySchema,
+  permissionPolicySchema,
+);
+export type PermissionPolicies = z.infer<typeof permissionPoliciesSchema>;
+export const thinkingLevelSchema = z.enum([
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+]);
+export type ThinkingLevel = z.infer<typeof thinkingLevelSchema>;
 
 const generalSchema = z.object({
   locale: z.enum(["system", "zh-CN", "en-US"]),
@@ -31,7 +45,7 @@ const appearanceSchema = z.object({
 const modelDefaultsSchema = z.object({
   generalModel: z.string(),
   projectModel: z.string(),
-  thinkingLevel: z.enum(["off", "minimal", "low", "medium", "high", "xhigh"]),
+  thinkingLevel: thinkingLevelSchema,
   maxOutputTokens: z.number().int(),
   timeoutMs: z.number().int(),
   maxRetries: z.number().int(),
@@ -52,7 +66,7 @@ const workspaceSettingsSchema = z.object({
   loadProjectMemory: z.boolean(),
 }).strict();
 const permissionsSettingsSchema = z.object({
-  policies: z.record(permissionCategorySchema, permissionPolicySchema),
+  policies: permissionPoliciesSchema,
   approvalTimeoutMs: z.number().int(),
   auditRetentionDays: z.number().int(),
   showDiffAfterWrite: z.boolean(),
@@ -271,6 +285,146 @@ export const serverStatusSchema = z.object({
 
 export type ServerStatus = z.infer<typeof serverStatusSchema>;
 
+export const taskStatusSchema = z.enum([
+  "queued",
+  "running",
+  "waiting_approval",
+  "waiting_user",
+  "paused",
+  "succeeded",
+  "failed",
+  "cancelled",
+  "interrupted",
+]);
+export type TaskStatus = z.infer<typeof taskStatusSchema>;
+
+export const taskKindSchema = z.enum([
+  "interactive",
+  "background",
+  "worker",
+  "plan-execution",
+]);
+export type TaskKind = z.infer<typeof taskKindSchema>;
+
+export const taskRecordSchema = z.object({
+  id: z.string().uuid(),
+  workspaceId: z.string().min(1),
+  rootTaskId: z.string().uuid(),
+  parentTaskId: z.string().uuid().optional(),
+  kind: taskKindSchema,
+  title: z.string().min(1).max(200),
+  goal: z.string().min(1).max(100_000),
+  status: taskStatusSchema,
+  priority: z.number().int(),
+  sessionId: z.string().optional(),
+  planId: z.string().uuid().optional(),
+  currentRunId: z.string().uuid().optional(),
+  assignedProfile: z.string().min(1).max(100).optional(),
+  createdAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+  completedAt: z.string().datetime().optional(),
+}).strict();
+export type TaskRecord = z.infer<typeof taskRecordSchema>;
+
+export const runStatusSchema = z.enum([
+  "queued",
+  "starting",
+  "running",
+  "waiting_approval",
+  "waiting_user",
+  "succeeded",
+  "failed",
+  "cancelled",
+  "interrupted",
+]);
+export type RunStatus = z.infer<typeof runStatusSchema>;
+
+export const runRecordSchema = z.object({
+  id: z.string().uuid(),
+  taskId: z.string().uuid(),
+  attempt: z.number().int().positive(),
+  status: runStatusSchema,
+  sessionId: z.string().optional(),
+  runnerId: z.string().min(1),
+  modelProvider: z.string().optional(),
+  modelId: z.string().optional(),
+  startedAt: z.string().datetime().optional(),
+  finishedAt: z.string().datetime().optional(),
+  error: z.string().optional(),
+  resultSummary: z.string().optional(),
+  inputTokens: z.number().int().nonnegative(),
+  outputTokens: z.number().int().nonnegative(),
+  toolCallCount: z.number().int().nonnegative(),
+}).strict();
+export type RunRecord = z.infer<typeof runRecordSchema>;
+
+export const artifactKindSchema = z.enum([
+  "report",
+  "evidence",
+  "patch",
+  "commit",
+  "test-result",
+  "diff",
+  "log",
+]);
+export type ArtifactKind = z.infer<typeof artifactKindSchema>;
+
+export const artifactRecordSchema = z.object({
+  id: z.string().uuid(),
+  taskId: z.string().uuid(),
+  runId: z.string().uuid(),
+  kind: artifactKindSchema,
+  title: z.string().min(1).max(200),
+  uri: z.string().optional(),
+  content: z.string().optional(),
+  metadata: z.record(z.string(), z.unknown()),
+  createdAt: z.string().datetime(),
+}).strict();
+export type ArtifactRecord = z.infer<typeof artifactRecordSchema>;
+
+export const taskEventTypeSchema = z.enum([
+  "task.created",
+  "task.queued",
+  "task.started",
+  "task.progress",
+  "task.waiting_approval",
+  "task.waiting_user",
+  "task.paused",
+  "task.resumed",
+  "task.succeeded",
+  "task.failed",
+  "task.cancelled",
+  "task.interrupted",
+  "run.created",
+  "run.started",
+  "run.completed",
+  "run.failed",
+  "run.cancelled",
+  "run.interrupted",
+  "artifact.created",
+]);
+export type TaskEventType = z.infer<typeof taskEventTypeSchema>;
+
+export const taskEventSchema = z.object({
+  eventId: z.string().uuid(),
+  taskId: z.string().uuid(),
+  runId: z.string().uuid().optional(),
+  sessionId: z.string().optional(),
+  timestamp: z.string().datetime(),
+  sequence: z.number().int().positive(),
+  type: taskEventTypeSchema,
+  payload: z.record(z.string(), z.unknown()),
+}).strict();
+export type TaskEvent = z.infer<typeof taskEventSchema>;
+
+export const taskDetailSchema = z.object({
+  task: taskRecordSchema,
+  runs: z.array(runRecordSchema),
+  artifacts: z.array(artifactRecordSchema),
+  events: z.array(taskEventSchema),
+}).strict();
+export type TaskDetail = z.infer<typeof taskDetailSchema>;
+
 export const bootstrapStateSchema = z.object({
   workspace: z.string().optional(),
   trusted: z.boolean(),
@@ -279,6 +433,10 @@ export const bootstrapStateSchema = z.object({
   sessionId: z.string().optional(),
   models: z.array(modelSummarySchema),
   selectedModel: modelSummarySchema.optional(),
+  sessionConfiguration: z.object({
+    permissionPolicies: permissionPoliciesSchema,
+    thinkingLevel: thinkingLevelSchema,
+  }).strict().optional(),
   memories: z.array(memoryRecordSchema),
   recalledMemories: z.array(memoryRecordSchema),
   mcpServers: z.array(serverStatusSchema),
@@ -304,6 +462,8 @@ const eventBase = {
   eventId: z.string(),
   timestamp: z.string(),
   sessionId: z.string().optional(),
+  taskId: z.string().uuid().optional(),
+  runId: z.string().uuid().optional(),
 } as const;
 
 export const agentEventSchema = z.discriminatedUnion("type", [
@@ -437,6 +597,16 @@ export const selectModelInputSchema = z.object({
   provider: z.string().min(1),
   id: z.string().min(1),
 });
+export const updateSessionConfigurationInputSchema = z.object({
+  permissionPolicies: permissionPoliciesSchema.optional(),
+  thinkingLevel: thinkingLevelSchema.optional(),
+}).strict().refine(
+  (input) => input.permissionPolicies !== undefined || input.thinkingLevel !== undefined,
+  { message: "至少需要提供一项会话配置" },
+);
+export type UpdateSessionConfigurationInput = z.infer<
+  typeof updateSessionConfigurationInputSchema
+>;
 export const sessionIdInputSchema = z.object({
   id: z.string().trim().min(1).max(200),
 }).strict();
@@ -556,6 +726,7 @@ export const dataUsageSchema = z.object({
   totalBytes: z.number().nonnegative(),
   sessionsBytes: z.number().nonnegative(),
   memoryBytes: z.number().nonnegative(),
+  tasksBytes: z.number().nonnegative(),
   logsBytes: z.number().nonnegative(),
   configBytes: z.number().nonnegative(),
 }).strict();
@@ -586,7 +757,7 @@ export const gitCheckpointIdInputSchema = z.object({
   id: z.string().trim().min(1).max(160),
 }).strict();
 export const clearDataInputSchema = z.object({
-  category: z.enum(["sessions", "memories", "logs"]),
+  category: z.enum(["sessions", "memories", "tasks", "logs"]),
 }).strict();
 
 export const commandResultSchema = z.object({
@@ -596,6 +767,21 @@ export const commandResultSchema = z.object({
 
 export type CommandResult = z.infer<typeof commandResultSchema>;
 
+export const taskSubmissionResultSchema = commandResultSchema.extend({
+  task: taskRecordSchema.optional(),
+}).strict();
+export type TaskSubmissionResult = z.infer<typeof taskSubmissionResultSchema>;
+
+export const taskListInputSchema = z.object({
+  statuses: z.array(taskStatusSchema).max(taskStatusSchema.options.length).optional(),
+  limit: z.number().int().min(1).max(500).default(100),
+}).strict();
+export type TaskListInput = z.infer<typeof taskListInputSchema>;
+
+export const taskIdInputSchema = z.object({
+  taskId: z.string().uuid(),
+}).strict();
+
 export const IPC_CHANNELS = {
   getBootstrapState: "deki:get-bootstrap-state",
   chooseWorkspace: "deki:choose-workspace",
@@ -604,6 +790,9 @@ export const IPC_CHANNELS = {
   trustWorkspace: "deki:trust-workspace",
   sendPrompt: "deki:send-prompt",
   abortRun: "deki:abort-run",
+  listTasks: "deki:list-tasks",
+  getTask: "deki:get-task",
+  cancelTask: "deki:cancel-task",
   newSession: "deki:new-session",
   listSessions: "deki:list-sessions",
   getSessionHistory: "deki:get-session-history",
@@ -615,6 +804,7 @@ export const IPC_CHANNELS = {
   remember: "deki:remember",
   listMemories: "deki:list-memories",
   selectModel: "deki:select-model",
+  updateSessionConfiguration: "deki:update-session-configuration",
   getSettings: "deki:get-settings",
   updateSettings: "deki:update-settings",
   resetSettings: "deki:reset-settings",
@@ -658,6 +848,7 @@ export const IPC_CHANNELS = {
   clearData: "deki:clear-data",
   settingsChanged: "deki:settings-changed",
   agentEvent: "deki:agent-event",
+  taskEvent: "deki:task-event",
 } as const;
 
 export interface DekiDesktopApi {
@@ -666,8 +857,11 @@ export interface DekiDesktopApi {
   openWorkspace(workspace: string): Promise<CommandResult>;
   openGeneralChat(): Promise<CommandResult>;
   trustWorkspace(): Promise<CommandResult>;
-  sendPrompt(prompt: string): Promise<CommandResult>;
+  sendPrompt(prompt: string): Promise<TaskSubmissionResult>;
   abortRun(): Promise<CommandResult>;
+  listTasks(input?: Partial<TaskListInput>): Promise<TaskRecord[]>;
+  getTask(taskId: string): Promise<TaskDetail | null>;
+  cancelTask(taskId: string): Promise<CommandResult>;
   newSession(): Promise<CommandResult>;
   listSessions(query?: string): Promise<SessionSummary[]>;
   getSessionHistory(): Promise<ConversationMessage[]>;
@@ -679,6 +873,9 @@ export interface DekiDesktopApi {
   remember(content: string, scope?: MemoryScope): Promise<CommandResult>;
   listMemories(scope?: MemoryScope, query?: string): Promise<MemoryRecord[]>;
   selectModel(provider: string, id: string): Promise<CommandResult>;
+  updateSessionConfiguration(
+    input: UpdateSessionConfigurationInput,
+  ): Promise<CommandResult>;
   getSettings(): Promise<SettingsSnapshot>;
   updateSettings(
     scope: SettingsScope,
@@ -734,9 +931,10 @@ export interface DekiDesktopApi {
   factoryReset(): Promise<CommandResult>;
   exportData(): Promise<CommandResult>;
   importData(): Promise<CommandResult>;
-  clearData(category: "sessions" | "memories" | "logs"): Promise<CommandResult>;
+  clearData(category: "sessions" | "memories" | "tasks" | "logs"): Promise<CommandResult>;
   subscribeSettings(listener: (settings: SettingsSnapshot) => void): () => void;
   subscribeAgentEvents(listener: (event: AgentEvent) => void): () => void;
+  subscribeTaskEvents(listener: (event: TaskEvent) => void): () => void;
 }
 
 export interface ToolDefinition {

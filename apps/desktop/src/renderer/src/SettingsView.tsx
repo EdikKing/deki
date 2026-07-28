@@ -19,6 +19,7 @@ import type {
   MemoryRecord,
   MemoryScope,
   PermissionCategory,
+  PermissionPolicies,
   PermissionPolicy,
   RedactedModelProvider,
   SettingsPatch,
@@ -105,6 +106,8 @@ export function SettingsView(props: {
   locale: Locale;
   initialSection?: SectionId;
   initialScope?: SettingsScope;
+  sessionPermissionPolicies?: PermissionPolicies;
+  onSessionPermissionPoliciesChanged?: (policies: PermissionPolicies) => Promise<void>;
   onChanged: (snapshot: SettingsSnapshot) => void;
   onClose: () => void;
   onRefreshState: () => Promise<void>;
@@ -115,6 +118,9 @@ export function SettingsView(props: {
   const [query, setQuery] = useState("");
   const [error, setError] = useState<string>();
   const [saving, setSaving] = useState(false);
+  const [sessionPermissionPolicies, setSessionPermissionPolicies] = useState(
+    props.sessionPermissionPolicies,
+  );
   const [providers, setProviders] = useState<RedactedModelProvider[]>([]);
   const [editingProvider, setEditingProvider] = useState<ModelProviderInput>();
   const zh = props.locale === "zh-CN";
@@ -124,6 +130,10 @@ export function SettingsView(props: {
       setError(String(reason));
     });
   }, []);
+
+  useEffect(() => {
+    setSessionPermissionPolicies(props.sessionPermissionPolicies);
+  }, [props.sessionPermissionPolicies]);
 
   useEffect(() => {
     if (!props.hasWorkspace && scope !== "global" && scope !== "session") setScope("global");
@@ -153,6 +163,17 @@ export function SettingsView(props: {
     setSaving(true);
     setError(undefined);
     try {
+      const policies = patch.permissions?.policies;
+      if (
+        scope === "session"
+        && section === "permissions"
+        && policies
+        && props.onSessionPermissionPoliciesChanged
+      ) {
+        await props.onSessionPermissionPoliciesChanged(policies);
+        setSessionPermissionPolicies(policies);
+        return;
+      }
       const next = await window.deki.updateSettings(scope, patch, props.snapshot.revision);
       props.onChanged(next);
     } catch (reason) {
@@ -175,8 +196,24 @@ export function SettingsView(props: {
     }
   }
 
-  const value = props.snapshot.effective;
-  const source = (path: string) => props.snapshot.sources[path] ?? "default";
+  const value = scope === "session"
+    && section === "permissions"
+    && sessionPermissionPolicies
+    ? {
+        ...props.snapshot.effective,
+        permissions: {
+          ...props.snapshot.effective.permissions,
+          policies: sessionPermissionPolicies,
+        },
+      }
+    : props.snapshot.effective;
+  const source = (path: string) => (
+    scope === "session"
+    && path.startsWith("permissions.policies.")
+    && sessionPermissionPolicies
+      ? "session"
+      : props.snapshot.sources[path] ?? "default"
+  );
   const resettableKeys = listLeafPaths(value[section as keyof DekiSettings], section);
 
   return (
@@ -1172,16 +1209,16 @@ function PrivacySettings({ source, zh, value, update }: SettingsComponentProps) 
     void window.deki.listAuditRecords().then(setAudits);
   }, []);
   return <>
-    <Setting title={zh ? "本地数据占用" : "Local data usage"} description={usage ? `${formatBytes(usage.totalBytes)} · sessions ${formatBytes(usage.sessionsBytes)} · memory ${formatBytes(usage.memoryBytes)} · logs ${formatBytes(usage.logsBytes)}` : (zh ? "正在统计…" : "Calculating…")} source="local"><button className="ghost" onClick={() => void window.deki.getDataUsage().then(setUsage)}>{zh ? "刷新" : "Refresh"}</button></Setting>
+    <Setting title={zh ? "本地数据占用" : "Local data usage"} description={usage ? `${formatBytes(usage.totalBytes)} · sessions ${formatBytes(usage.sessionsBytes)} · memory ${formatBytes(usage.memoryBytes)} · tasks ${formatBytes(usage.tasksBytes)} · logs ${formatBytes(usage.logsBytes)}` : (zh ? "正在统计…" : "Calculating…")} source="local"><button className="ghost" onClick={() => void window.deki.getDataUsage().then(setUsage)}>{zh ? "刷新" : "Refresh"}</button></Setting>
     <Toggle title={zh ? "遥测" : "Telemetry"} description={zh ? "固定关闭，不会发送使用数据。" : "Always off; no usage data is sent."} path="privacy.telemetry" checked={false} disabled source={source} onChange={() => Promise.resolve()} />
     <Range title={zh ? "普通日志保留天数" : "General log retention days"} path="privacy.logRetentionDays" value={value.privacy.logRetentionDays} min={1} max={365} source={source} onChange={(logRetentionDays) => update({ privacy: { logRetentionDays } })} />
     <Setting title={zh ? "数据目录" : "Data directory"} description="~/.deki/" source="local"><button className="ghost" onClick={() => void window.deki.openDataDirectory()}>{zh ? "在文件管理器中打开" : "Open in file manager"}</button></Setting>
     <Setting title={zh ? "脱敏诊断导出" : "Redacted diagnostics export"} description={zh ? "不包含 API Key、项目源码或完整审计 Diff。" : "Excludes API keys, project source, and full audit diffs."} source="local"><button className="ghost" onClick={() => void window.deki.exportDiagnostics()}>{zh ? "导出诊断包" : "Export diagnostics"}</button></Setting>
     <Setting title={zh ? "数据导出 / 导入" : "Data export / import"} description={zh ? "导出设置、脱敏 Provider 元数据和当前作用域记忆；不包含 API Key、源码、审计 Diff 或机器路径。导入前会预览数量。" : "Exports settings, redacted provider metadata, and current-scope memories. API keys, source, audit diffs, and machine paths are excluded. Import shows a preview."} source="local"><div className="button-group"><button className="ghost" onClick={() => void window.deki.exportData()}>{zh ? "导出" : "Export"}</button><button className="ghost" onClick={() => void window.deki.importData()}>{zh ? "导入" : "Import"}</button></div></Setting>
-    <Setting title={zh ? "分类清理" : "Category cleanup"} description={zh ? "先关闭相关资源，再移到系统废纸篓；失败时保留时间戳备份。" : "Closes related resources before moving data to trash; falls back to a timestamped backup."} source="local"><div className="button-group">{(["sessions", "memories", "logs"] as const).map((category) => <button className="danger-outline" key={category} onClick={() => {
-      const label = category === "sessions" ? (zh ? "会话" : "sessions") : category === "memories" ? (zh ? "记忆" : "memories") : (zh ? "日志" : "logs");
+    <Setting title={zh ? "分类清理" : "Category cleanup"} description={zh ? "先关闭相关资源，再移到系统废纸篓；失败时保留时间戳备份。" : "Closes related resources before moving data to trash; falls back to a timestamped backup."} source="local"><div className="button-group">{(["sessions", "memories", "tasks", "logs"] as const).map((category) => <button className="danger-outline" key={category} onClick={() => {
+      const label = category === "sessions" ? (zh ? "会话" : "sessions") : category === "memories" ? (zh ? "记忆" : "memories") : category === "tasks" ? (zh ? "任务" : "tasks") : (zh ? "日志" : "logs");
       if (window.confirm(zh ? `将全部${label}移到废纸篓？` : `Move all ${label} to the trash?`)) void window.deki.clearData(category);
-    }}>{category === "sessions" ? (zh ? "清理会话" : "Sessions") : category === "memories" ? (zh ? "清理记忆" : "Memories") : (zh ? "清理日志" : "Logs")}</button>)}</div></Setting>
+    }}>{category === "sessions" ? (zh ? "清理会话" : "Sessions") : category === "memories" ? (zh ? "清理记忆" : "Memories") : category === "tasks" ? (zh ? "清理任务" : "Tasks") : (zh ? "清理日志" : "Logs")}</button>)}</div></Setting>
     <Setting title={zh ? "恢复出厂设置" : "Factory reset"} description={zh ? "关闭 Runtime、MCP 和数据库后，将 ~/.deki 移入系统废纸篓；失败时保留时间戳备份。" : "Closes runtime, MCP, and databases, then moves ~/.deki to trash; falls back to a timestamped backup."} source="local"><button className="danger" onClick={() => {
       if (window.confirm(zh ? "将全部 Deki 本地数据移到废纸篓并恢复出厂设置？" : "Move all local Deki data to the trash and reset the app?")) void window.deki.factoryReset();
     }}>{zh ? "可恢复地重置" : "Recoverable reset"}</button></Setting>

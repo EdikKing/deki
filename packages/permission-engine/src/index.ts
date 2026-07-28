@@ -54,6 +54,11 @@ export interface PermissionEngineOptions {
   model: () => string | undefined;
   resolvePolicies?: () => Record<PermissionCategory, PermissionPolicy>;
   emit: (event: AgentEvent) => void;
+  taskId?: () => string | undefined;
+  acquireResumeLease?: (
+    taskId: string,
+    requestId: string,
+  ) => Promise<{ commit(): void; release(): void } | null>;
   persistProjectGrant?: (category: PermissionCategory, grantKey?: string) => Promise<void>;
 }
 
@@ -61,6 +66,8 @@ interface PendingApproval {
   request: PermissionRequest;
   resolve: (decision: ApprovalDecision) => void;
   timeout: ReturnType<typeof setTimeout>;
+  taskId?: string;
+  resolving: boolean;
 }
 
 interface AuthorizedOperation {
@@ -196,17 +203,37 @@ export class PermissionEngine {
     return { source, destination };
   }
 
-  respond(requestId: string, decision: ApprovalDecision): boolean {
+  async respond(requestId: string, decision: ApprovalDecision): Promise<boolean> {
+    return this.#resolvePending(requestId, decision);
+  }
+
+  async #resolvePending(
+    requestId: string,
+    decision: ApprovalDecision,
+  ): Promise<boolean> {
     const pending = this.#pending.get(requestId);
-    if (!pending) return false;
+    if (!pending || pending.resolving) return false;
+    pending.resolving = true;
+    const lease = pending.taskId && this.#options.acquireResumeLease
+      ? await this.#options.acquireResumeLease(pending.taskId, requestId)
+      : undefined;
+    if (pending.taskId && this.#options.acquireResumeLease && !lease) {
+      if (this.#pending.get(requestId) === pending) pending.resolving = false;
+      return false;
+    }
+    if (this.#pending.get(requestId) !== pending) {
+      lease?.release();
+      return false;
+    }
     clearTimeout(pending.timeout);
     this.#pending.delete(requestId);
-    pending.resolve(decision);
+    lease?.commit();
     this.#emit({
       type: "approval.resolved",
       requestId,
       decision,
     });
+    pending.resolve(decision);
     return true;
   }
 
@@ -257,17 +284,18 @@ export class PermissionEngine {
     const expiresAt = new Date(
       Date.now() + this.#options.settings.permissions.approvalTimeoutMs,
     ).toISOString();
+    const taskId = this.#options.taskId?.();
     const decision = new Promise<ApprovalDecision>((resolveDecision) => {
       const timeout = setTimeout(() => {
-        this.#pending.delete(requestId);
-        resolveDecision("deny");
-        this.#emit({
-          type: "approval.resolved",
-          requestId,
-          decision: "deny",
-        });
+        void this.#resolvePending(requestId, "deny");
       }, this.#options.settings.permissions.approvalTimeoutMs);
-      this.#pending.set(requestId, { request, resolve: resolveDecision, timeout });
+      this.#pending.set(requestId, {
+        request,
+        resolve: resolveDecision,
+        timeout,
+        ...(taskId ? { taskId } : {}),
+        resolving: false,
+      });
     });
     this.#emit({
       type: "approval.requested",
@@ -386,6 +414,27 @@ export class WorkspaceToolsProvider implements CapabilityProvider {
         required: ["path", "pattern"],
         additionalProperties: false,
       }),
+      tool("git_inspect", "Inspect Git status, diff, log, or an existing object without a shell.", {
+        type: "object",
+        properties: {
+          action: { enum: ["status", "diff", "log", "show"] },
+          revision: {
+            type: "string",
+            minLength: 1,
+            maxLength: 200,
+            pattern: "^(?!-)[A-Za-z0-9._/@{}^~:+-]+$",
+          },
+          paths: {
+            type: "array",
+            items: { type: "string", minLength: 1, maxLength: 2_000 },
+            maxItems: 100,
+          },
+          limit: { type: "integer", minimum: 1, maximum: 200 },
+          staged: { type: "boolean" },
+        },
+        required: ["action"],
+        additionalProperties: false,
+      }),
       tool("edit", "Replace an exact text fragment in a workspace file.", {
         type: "object",
         properties: {
@@ -436,6 +485,7 @@ export class WorkspaceToolsProvider implements CapabilityProvider {
       else if (name === "ls") result = await this.#ls(params, context);
       else if (name === "find") result = await this.#find(params, context);
       else if (name === "grep") result = await this.#grep(params, context);
+      else if (name === "git_inspect") result = await this.#gitInspect(params, context);
       else if (name === "edit") result = await this.#edit(params, context);
       else if (name === "write") result = await this.#write(params, context);
       else if (name === "delete") result = await this.#delete(params, context);
@@ -589,6 +639,36 @@ export class WorkspaceToolsProvider implements CapabilityProvider {
       if (diff) await this.#permissions.recordDiff(context.callId, diff);
       throw error;
     }
+  }
+
+  async #gitInspect(
+    params: Record<string, unknown>,
+    context: ToolCallContext,
+  ): Promise<ToolResult> {
+    const action = stringParam(params, "action");
+    if (!["status", "diff", "log", "show"].includes(action)) {
+      throw new Error("不支持的 Git 检查操作");
+    }
+    const paths = stringArrayParam(params, "paths");
+    const revision = optionalStringParam(params, "revision");
+    const limit = numberParam(params, "limit", 20);
+    const staged = params.staged === true;
+    if (revision && !/^(?!-)[A-Za-z0-9._/@{}^~:+-]+$/.test(revision)) {
+      throw new Error("revision 包含不允许的字符");
+    }
+    const workspace = await realpath(this.#permissions.workspace);
+    for (const path of paths) {
+      const resolved = await normalizeWorkspacePath(workspace, path);
+      if (!isWithin(workspace, resolved)) throw new Error(`Git path 超出工作区: ${path}`);
+    }
+    const args = gitInspectArgs(action, {
+      ...(revision ? { revision } : {}),
+      paths,
+      limit,
+      staged,
+    });
+    const output = await runProcess("git", args, workspace, context.signal, this.#outputLimitBytes);
+    return textResult(output, this.#outputLimitBytes);
   }
 
   async #delete(params: Record<string, unknown>, context: ToolCallContext): Promise<ToolResult> {
@@ -809,12 +889,73 @@ function tool(
   description: string,
   inputSchema: Record<string, unknown>,
 ): ToolDefinition {
-  const effect = ["read", "ls", "find", "grep"].includes(name)
+  const effect = ["read", "ls", "find", "grep", "git_inspect"].includes(name)
     ? "read" as const
     : ["edit", "write", "delete", "move"].includes(name)
       ? "write" as const
       : "unknown" as const;
   return { name, description, inputSchema, effect };
+}
+
+function optionalStringParam(
+  params: Record<string, unknown>,
+  name: string,
+): string | undefined {
+  const value = params[name];
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") throw new Error(`${name} 必须是字符串`);
+  return value;
+}
+
+function stringArrayParam(params: Record<string, unknown>, name: string): string[] {
+  const value = params[name];
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+    throw new Error(`${name} 必须是字符串数组`);
+  }
+  return value as string[];
+}
+
+function gitInspectArgs(
+  action: string,
+  options: {
+    revision?: string;
+    paths: string[];
+    limit: number;
+    staged: boolean;
+  },
+): string[] {
+  const pathArgs = options.paths.length > 0 ? ["--", ...options.paths] : [];
+  if (action === "status") return ["status", "--short", "--branch", ...pathArgs];
+  if (action === "diff") {
+    return [
+      "diff",
+      "--no-ext-diff",
+      "--no-textconv",
+      ...(options.staged ? ["--staged"] : []),
+      ...(options.revision ? [options.revision] : []),
+      ...pathArgs,
+    ];
+  }
+  if (action === "log") {
+    return [
+      "log",
+      "--no-ext-diff",
+      `--max-count=${options.limit}`,
+      "--format=%h %s",
+      ...(options.revision ? [options.revision] : []),
+      ...pathArgs,
+    ];
+  }
+  if (!options.revision) throw new Error("git show 需要 revision");
+  return [
+    "show",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--format=fuller",
+    options.revision,
+    ...pathArgs,
+  ];
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -946,8 +1087,18 @@ async function runShell(
   const shell = process.platform === "win32"
     ? { command: process.env.ComSpec ?? "cmd.exe", args: ["/d", "/s", "/c", command] }
     : { command: process.env.SHELL ?? "/bin/sh", args: ["-lc", command] };
+  return runProcess(shell.command, shell.args, cwd, signal, limit);
+}
+
+async function runProcess(
+  command: string,
+  args: string[],
+  cwd: string,
+  signal: AbortSignal | undefined,
+  limit: number,
+): Promise<string> {
   return new Promise<string>((resolveOutput, reject) => {
-    const child = spawn(shell.command, shell.args, {
+    const child = spawn(command, args, {
       cwd,
       env: process.env,
       stdio: ["ignore", "pipe", "pipe"],

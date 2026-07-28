@@ -1,5 +1,10 @@
 import { useMemo, useState } from "react";
-import type { PlanDetail, PlanStepState } from "@deki-ai/shared";
+import type {
+  PlanDetail,
+  PlanRevisionRecord,
+  PlanStep,
+  PlanStepState,
+} from "@deki-ai/shared";
 
 interface PlanPanelProps {
   detail: PlanDetail;
@@ -26,16 +31,7 @@ export function PlanPanel(props: PlanPanelProps) {
       (candidate) => candidate.revision === revision.revision - 1,
     );
     if (!previous) return undefined;
-    const before = new Map(previous.steps.map((step) => [step.id, step]));
-    const after = new Map(revision.steps.map((step) => [step.id, step]));
-    return {
-      added: revision.steps.filter((step) => !before.has(step.id)),
-      changed: revision.steps.filter((step) => {
-        const old = before.get(step.id);
-        return old && JSON.stringify(old) !== JSON.stringify(step);
-      }),
-      removed: previous.steps.filter((step) => !after.has(step.id)),
-    };
+    return diffPlanRevisions(previous, revision);
   }, [detail.revisions, revision]);
 
   async function run(operation: Promise<{ ok: boolean; error?: string | undefined }>) {
@@ -65,6 +61,18 @@ export function PlanPanel(props: PlanPanelProps) {
     }
   }
 
+  function requestReplan() {
+    const reason = window.prompt(
+      zh ? "说明执行偏离或假设失效的原因" : "Describe why execution needs replanning",
+      detail.plan.replanReason ?? "",
+    );
+    if (!reason?.trim()) return;
+    const affected = [...states.values()]
+      .filter((state) => state.status === "running" || state.status === "blocked")
+      .map((state) => state.stepId);
+    void run(window.deki.requestPlanReplan(detail.plan.id, reason.trim(), affected));
+  }
+
   return (
     <section className="plan-panel" data-testid="plan-panel">
       <header className="plan-panel-heading">
@@ -82,6 +90,18 @@ export function PlanPanel(props: PlanPanelProps) {
       </header>
 
       <p className="plan-goal">{detail.plan.goal}</p>
+      {detail.plan.replanReason && (
+        <div className="plan-replan-reason">
+          <strong>{zh ? "重新规划原因" : "Replan reason"}</strong>
+          <p>{detail.plan.replanReason}</p>
+          {detail.plan.affectedStepIds.length > 0 && (
+            <small>
+              {zh ? "受影响步骤" : "Affected steps"}: {detail.plan.affectedStepIds.join(", ")}
+            </small>
+          )}
+          {detail.plan.replanEvidence.map((item) => <p key={item}>• {item}</p>)}
+        </div>
+      )}
 
       {revision && (
         <>
@@ -122,9 +142,23 @@ export function PlanPanel(props: PlanPanelProps) {
             </button>
           </>
         )}
+        {detail.plan.status === "draft" && (
+          <button className="primary" disabled={busy} onClick={requestRevision}>
+            {zh ? "生成修订" : "Generate revision"}
+          </button>
+        )}
         {detail.plan.executionTaskId && (
           <button onClick={() => props.onOpenTask(detail.plan.executionTaskId!)}>
             {zh ? "打开任务" : "Open task"}
+          </button>
+        )}
+        {(detail.plan.status === "executing"
+          || (detail.plan.status === "approved"
+            && detail.executionTask
+            && ["paused", "interrupted", "failed"].includes(detail.executionTask.status))
+          || [...states.values()].some((state) => state.status === "blocked")) && (
+          <button disabled={busy} onClick={requestReplan}>
+            {zh ? "重新规划" : "Replan"}
           </button>
         )}
         <button
@@ -145,13 +179,20 @@ export function PlanPanel(props: PlanPanelProps) {
           </button>
         )}
         {detail.executionTask
-          && detail.plan.status === "executing"
           && ["paused", "interrupted"].includes(detail.executionTask.status) && (
           <button
             disabled={busy}
             onClick={() => void run(window.deki.resumeTask(detail.executionTask!.id))}
           >
             {zh ? "恢复执行" : "Resume"}
+          </button>
+        )}
+        {detail.executionTask?.status === "failed" && (
+          <button
+            disabled={busy}
+            onClick={() => void run(window.deki.retryTask(detail.executionTask!.id))}
+          >
+            {zh ? "重试执行" : "Retry"}
           </button>
         )}
         {detail.plan.status !== "completed" && detail.plan.status !== "abandoned" && (
@@ -171,15 +212,30 @@ export function PlanPanel(props: PlanPanelProps) {
         <details className="plan-revisions">
           <summary>{zh ? "版本历史" : "Revision history"} · {detail.revisions.length}</summary>
           {revisionDelta && (
-            <p>
-              +{revisionDelta.added.length} · ~{revisionDelta.changed.length}
-              {" "}· -{revisionDelta.removed.length}
-              {[...revisionDelta.added, ...revisionDelta.changed, ...revisionDelta.removed]
-                .map((step) => step.title).length > 0
-                ? ` · ${[...revisionDelta.added, ...revisionDelta.changed, ...revisionDelta.removed]
-                    .map((step) => step.title).join("、")}`
-                : ""}
-            </p>
+            <div className="plan-revision-diff">
+              <p>
+                +{revisionDelta.added.length} · ~{revisionDelta.changed.length}
+                {" "}· -{revisionDelta.removed.length}
+                {revisionDelta.reordered.length > 0
+                  ? ` · ${zh ? "重排" : "reordered"} ${revisionDelta.reordered.length}`
+                  : ""}
+              </p>
+              {revisionDelta.assumptions.added.map((item) => (
+                <small key={`aa-${item}`}>+ {zh ? "假设" : "assumption"}: {item}</small>
+              ))}
+              {revisionDelta.assumptions.removed.map((item) => (
+                <small key={`ar-${item}`}>− {zh ? "假设" : "assumption"}: {item}</small>
+              ))}
+              {revisionDelta.constraints.added.map((item) => (
+                <small key={`ca-${item}`}>+ {zh ? "约束" : "constraint"}: {item}</small>
+              ))}
+              {revisionDelta.constraints.removed.map((item) => (
+                <small key={`cr-${item}`}>− {zh ? "约束" : "constraint"}: {item}</small>
+              ))}
+              {revisionDelta.changed.map(({ step, fields }) => (
+                <small key={step.id}>~ {step.title}: {fields.join(", ")}</small>
+              ))}
+            </div>
           )}
           {[...detail.revisions].reverse().map((item) => (
             <div key={item.revision}>
@@ -193,6 +249,54 @@ export function PlanPanel(props: PlanPanelProps) {
       {error && <p className="error">{error}</p>}
     </section>
   );
+}
+
+export function diffPlanRevisions(
+  beforeRevision: PlanRevisionRecord,
+  afterRevision: PlanRevisionRecord,
+) {
+  const before = new Map(beforeRevision.steps.map((step) => [step.id, step]));
+  const after = new Map(afterRevision.steps.map((step) => [step.id, step]));
+  const beforeOrder = new Map(beforeRevision.steps.map((step, index) => [step.id, index]));
+  const changed = afterRevision.steps.flatMap((step) => {
+    const old = before.get(step.id);
+    if (!old) return [];
+    const fields = changedStepFields(old, step);
+    return fields.length > 0 ? [{ step, fields }] : [];
+  });
+  return {
+    added: afterRevision.steps.filter((step) => !before.has(step.id)),
+    removed: beforeRevision.steps.filter((step) => !after.has(step.id)),
+    changed,
+    reordered: afterRevision.steps.filter((step, index) =>
+      beforeOrder.has(step.id) && beforeOrder.get(step.id) !== index),
+    assumptions: setDiff(beforeRevision.assumptions, afterRevision.assumptions),
+    constraints: setDiff(beforeRevision.constraints, afterRevision.constraints),
+  };
+}
+
+function changedStepFields(before: PlanStep, after: PlanStep): string[] {
+  const fields: Array<keyof PlanStep> = [
+    "title",
+    "description",
+    "dependencies",
+    "candidateFiles",
+    "validation",
+    "risk",
+    "parallelizable",
+    "assignedProfile",
+  ];
+  return fields.filter((field) =>
+    JSON.stringify(before[field]) !== JSON.stringify(after[field]));
+}
+
+function setDiff(before: string[], after: string[]) {
+  const beforeSet = new Set(before);
+  const afterSet = new Set(after);
+  return {
+    added: after.filter((item) => !beforeSet.has(item)),
+    removed: before.filter((item) => !afterSet.has(item)),
+  };
 }
 
 function PlanStepRow(props: {

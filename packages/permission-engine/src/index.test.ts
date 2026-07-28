@@ -1,6 +1,8 @@
 import { access, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import { defaultSettings } from "@deki-ai/settings";
 import {
@@ -13,6 +15,77 @@ import {
 } from "./index";
 
 describe("PermissionEngine", () => {
+  it("provides structured Git inspection without accepting option injection", async () => {
+    const root = await mkdtemp(join(tmpdir(), "deki-git-inspect-"));
+    await promisify(execFile)("git", ["init"], { cwd: root });
+    await writeFile(join(root, "untracked.txt"), "test", "utf8");
+    const engine = new PermissionEngine({
+      workspace: root,
+      logsRoot: join(root, "logs"),
+      settings: defaultSettings,
+      sessionId: () => "session",
+      model: () => "provider/model",
+      emit: () => {},
+    });
+    const provider = new WorkspaceToolsProvider(engine);
+    const status = await provider.callTool(
+      "git_inspect",
+      { action: "status" },
+      { callId: "git-status", workspace: root, interactionMode: "plan" },
+    );
+    expect(status.content[0]).toMatchObject({
+      type: "text",
+      text: expect.stringContaining("untracked.txt"),
+    });
+    await expect(provider.callTool(
+      "git_inspect",
+      { action: "show", revision: "--output=owned" },
+      { callId: "git-injection", workspace: root, interactionMode: "plan" },
+    )).rejects.toThrow("revision 包含不允许的字符");
+  });
+
+  it("acquires and commits a task resume lease before resolving approval", async () => {
+    const root = await mkdtemp(join(tmpdir(), "deki-permissions-resume-"));
+    const settings = structuredClone(defaultSettings);
+    settings.permissions.policies["workspace.write"] = "ask";
+    let requestId = "";
+    let acquired = "";
+    let committed = false;
+    const engine = new PermissionEngine({
+      workspace: root,
+      logsRoot: join(root, "logs"),
+      settings,
+      sessionId: () => "session",
+      model: () => "provider/model",
+      taskId: () => "task-1",
+      acquireResumeLease: async (taskId, pendingRequestId) => {
+        acquired = `${taskId}:${pendingRequestId}`;
+        return {
+          commit: () => {
+            committed = true;
+          },
+          release: () => {},
+        };
+      },
+      emit: (event) => {
+        if (event.type === "approval.requested") requestId = event.requestId;
+      },
+    });
+    const authorization = engine.authorize({
+      callId: "write-approval",
+      category: "workspace.write",
+      title: "write",
+      description: "write",
+      details: {},
+    });
+    await Promise.resolve();
+    expect(requestId).not.toBe("");
+    expect(await engine.respond(requestId, "allow_once")).toBe(true);
+    await authorization;
+    expect(acquired).toBe(`task-1:${requestId}`);
+    expect(committed).toBe(true);
+  });
+
   it("classifies privileged, git, install and safe shell commands", () => {
     expect(classifyShell("sudo rm -rf build")).toBe("privileged");
     expect(classifyShell("git push origin main")).toBe("git.push");

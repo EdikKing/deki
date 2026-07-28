@@ -98,13 +98,15 @@ export function TaskCenter(props: TaskCenterProps) {
         title: props.zh ? "需要处理" : "Needs attention",
         rows: tasks.filter((item) =>
           item.task.status === "waiting_approval"
-          || item.task.status === "waiting_user"),
+          || item.task.status === "waiting_user"
+          || (item.task.status === "queued" && !item.runnable)),
       },
       {
         key: "queued",
         title: props.zh ? "排队与暂停" : "Queued & paused",
         rows: tasks.filter((item) =>
-          item.task.status === "queued" || item.task.status === "paused"),
+          (item.task.status === "queued" || item.task.status === "paused")
+          && item.runnable),
       },
       {
         key: "completed",
@@ -186,6 +188,9 @@ export function TaskCenter(props: TaskCenterProps) {
                       {(summary.resultSummary || summary.error) && (
                         <span>{summary.error ?? summary.resultSummary}</span>
                       )}
+                      {summary.attentionReason && (
+                        <span>{attentionReasonLabel(summary.attentionReason, props.zh)}</span>
+                      )}
                     </span>
                     <time>{relativeTime(task.updatedAt, props.zh)}</time>
                   </button>
@@ -219,6 +224,8 @@ export function TaskCenter(props: TaskCenterProps) {
                 </div>
                 <TaskActions
                   detail={detail}
+                  attentionReason={tasks.find((item) => item.task.id === detail.task.id)
+                    ?.attentionReason}
                   zh={props.zh}
                   onOpenPlan={props.onOpenPlan}
                   onCommand={command}
@@ -364,14 +371,33 @@ export function TaskCenter(props: TaskCenterProps) {
   );
 }
 
+function attentionReasonLabel(
+  reason: NonNullable<TaskSummary["attentionReason"]>,
+  zh: boolean,
+): string {
+  const copy = {
+    workspace_missing: { zh: "项目路径不存在，可取消任务或恢复项目路径", en: "Project path is missing" },
+    workspace_untrusted: { zh: "项目需要重新信任", en: "Project must be trusted again" },
+    runtime_unavailable: { zh: "项目运行环境暂不可用", en: "Project runtime is unavailable" },
+  };
+  return zh ? copy[reason].zh : copy[reason].en;
+}
+
 function TaskActions(props: {
   detail: TaskDetail;
+  attentionReason?: TaskSummary["attentionReason"];
   zh: boolean;
   onCommand(operation: Promise<{ ok: boolean; error?: string | undefined }>): Promise<void>;
   onOpen(): Promise<void>;
   onOpenPlan(planId: string): void;
 }) {
   const { task } = props.detail;
+  const reopenWorkspace = async () => {
+    if (!task.workspacePath) return { ok: false, error: "任务没有可用的项目路径" };
+    const opened = await window.deki.openWorkspace(task.workspacePath);
+    if (!opened.ok || props.attentionReason !== "workspace_untrusted") return opened;
+    return window.deki.trustWorkspace();
+  };
   return (
     <div className="task-detail-actions">
       {task.sessionId && (
@@ -382,6 +408,15 @@ function TaskActions(props: {
       {task.planId && (
         <button onClick={() => props.onOpenPlan(task.planId!)}>
           {props.zh ? "打开计划" : "Open plan"}
+        </button>
+      )}
+      {props.attentionReason
+        && props.attentionReason !== "workspace_missing"
+        && task.workspacePath && (
+        <button onClick={() => void props.onCommand(reopenWorkspace())}>
+          {props.attentionReason === "workspace_untrusted"
+            ? props.zh ? "打开并信任项目" : "Open & trust project"
+            : props.zh ? "打开项目" : "Open project"}
         </button>
       )}
       {task.status === "queued" && (

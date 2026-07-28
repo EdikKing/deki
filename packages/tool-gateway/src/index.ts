@@ -44,6 +44,10 @@ export class ToolGateway {
   readonly #calls: CallLimiter;
 
   constructor(options: ToolGatewayOptions = {}) {
+    this.#ajv.addFormat(
+      "uuid",
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+    );
     this.#outputLimitBytes = positiveInteger(
       options.outputLimitBytes ?? DEFAULT_OUTPUT_LIMIT_BYTES,
       "outputLimitBytes",
@@ -267,10 +271,13 @@ export class PlanModePolicyError extends Error {
 
 function assertToolAllowed(
   tool: GatewayTool,
-  input: unknown,
+  _input: unknown,
   context: ToolCallContext,
 ): void {
   if (context.interactionMode !== "plan") return;
+  if (tool.providerToolName === "bash") {
+    throw new PlanModePolicyError(tool.modelName);
+  }
   if (tool.effect === "write") {
     throw new PlanModePolicyError(tool.modelName);
   }
@@ -281,17 +288,7 @@ function assertToolAllowed(
     || tool.readOnlyHint === true) {
     return;
   }
-  if (tool.providerToolName === "bash" && isReadOnlyShellInput(input)) return;
   throw new PlanModePolicyError(tool.modelName);
-}
-
-function isReadOnlyShellInput(input: unknown): boolean {
-  if (!input || typeof input !== "object" || Array.isArray(input)) return false;
-  const command = (input as Record<string, unknown>).command;
-  if (typeof command !== "string") return false;
-  const value = command.trim().toLocaleLowerCase();
-  if (/[|;&><`$]/.test(value)) return false;
-  return /^(?:pwd|ls|find|rg|grep|git\s+(?:status|diff|log|show))\b/.test(value);
 }
 
 function isSafeSegment(value: string): boolean {

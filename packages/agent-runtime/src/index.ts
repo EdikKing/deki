@@ -63,6 +63,10 @@ export interface DekiAgentRuntimeOptions {
     grantKey?: string,
   ) => Promise<void>;
   onEvent: (event: AgentEvent) => void;
+  acquireResumeLease?: (
+    taskId: string,
+    requestId: string,
+  ) => Promise<{ commit(): void; release(): void } | null>;
   planTools?: {
     submit(input: {
       goal: string;
@@ -261,6 +265,10 @@ export class DekiAgentRuntime {
               }
             : event);
         },
+        taskId: () => this.#executionContext.getStore()?.taskId,
+        ...(this.#options.acquireResumeLease
+          ? { acquireResumeLease: this.#options.acquireResumeLease }
+          : {}),
         ...(this.#options.persistProjectGrant
           ? { persistProjectGrant: this.#options.persistProjectGrant }
           : {}),
@@ -958,14 +966,26 @@ export class DekiAgentRuntime {
     await cancel();
   }
 
-  respondToApproval(requestId: string, decision: ApprovalDecision): boolean {
-    return this.#permissions?.respond(requestId, decision) ?? false;
+  async respondToApproval(
+    requestId: string,
+    decision: ApprovalDecision,
+  ): Promise<boolean> {
+    return await this.#permissions?.respond(requestId, decision) ?? false;
   }
 
-  respondToTaskInput(requestId: string, value: string): boolean {
+  async respondToTaskInput(requestId: string, value: string): Promise<boolean> {
     const pending = this.#userInputRequests.get(requestId);
     if (!pending) return false;
+    const lease = this.#options.acquireResumeLease
+      ? await this.#options.acquireResumeLease(pending.execution.taskId, requestId)
+      : undefined;
+    if (this.#options.acquireResumeLease && !lease) return false;
+    if (this.#userInputRequests.get(requestId) !== pending) {
+      lease?.release();
+      return false;
+    }
     this.#userInputRequests.delete(requestId);
+    lease?.commit();
     this.#executionContext.run(pending.execution, () => {
       this.#emit({
         type: "user_input.resolved",
@@ -1014,6 +1034,11 @@ export class DekiAgentRuntime {
     if (!createRuntime || !sourceFile) {
       throw new Error("源会话尚未持久化，不能创建并发分支");
     }
+    try {
+      await access(sourceFile);
+    } catch {
+      throw new Error("任务恢复失败：最新会话文件已不存在");
+    }
     const sessionDirectory = join(
       this.#options.paths.sessionsRoot,
       this.#options.scopeId,
@@ -1024,10 +1049,10 @@ export class DekiAgentRuntime {
       sessionDirectory,
       { parentSession: sourceFile },
     );
-    if (
-      input.context.sourceEntryId
-      && sessionManager.getEntry(input.context.sourceEntryId)
-    ) {
+    if (input.context.sourceEntryId) {
+      if (!sessionManager.getEntry(input.context.sourceEntryId)) {
+        throw new Error("任务恢复失败：最新会话位置已不存在");
+      }
       sessionManager.branch(input.context.sourceEntryId);
     }
     const background = await createAgentSessionRuntime(createRuntime, {

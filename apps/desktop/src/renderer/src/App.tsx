@@ -171,10 +171,11 @@ export function App() {
   useEffect(() => {
     const refreshAttention = async () => {
       const rows = await window.deki.listTasks({
-        statuses: ["waiting_approval", "waiting_user"],
+        statuses: ["waiting_approval", "waiting_user", "queued"],
         limit: 500,
       });
-      setTaskAttentionCount(rows.length);
+      setTaskAttentionCount(rows.filter((item) =>
+        item.task.status !== "queued" || !item.runnable).length);
     };
     void refreshAttention();
     const unsubscribeTasks = window.deki.subscribeTaskEvents(() => {

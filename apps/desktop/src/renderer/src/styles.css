@@ -3589,6 +3589,22 @@ html[data-theme="light"] .settings-error {
   line-height: 1.45;
 }
 
+.plan-replan-reason {
+  display: grid;
+  gap: 4px;
+  margin: 8px 0;
+  padding: 8px 9px;
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, var(--border));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--danger) 6%, transparent);
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.plan-replan-reason p {
+  margin: 0;
+}
+
 .plan-context,
 .plan-revisions {
   margin: 8px 0;
@@ -3688,6 +3704,20 @@ html[data-theme="light"] .settings-error {
 
 .plan-revisions p {
   grid-column: 1 / -1;
+}
+
+.plan-revision-diff {
+  display: grid;
+  gap: 3px;
+  margin: 6px 0;
+  padding: 7px 8px;
+  border-radius: 8px;
+  background: var(--bg-input);
+}
+
+.plan-revision-diff small {
+  color: var(--text-muted);
+  line-height: 1.4;
 }
 
 @media (max-width: 520px) {

@@ -117,6 +117,31 @@ describe("ToolGateway", () => {
     await gateway.dispose();
   });
 
+  it.each([
+    "find . -delete",
+    "rg token . | tee leaked.txt",
+    "git --no-pager diff",
+    "git status",
+    "python -c 'open(\"owned\", \"w\").write(\"x\")'",
+    "npm install left-pad",
+  ])("rejects all free-form shell in Plan mode before dispatch: %s", async (command) => {
+    const gateway = new ToolGateway();
+    const provider = new ShellProvider();
+    await gateway.register(provider);
+
+    await expect(gateway.call(
+      "workspace__bash",
+      { command },
+      {
+        callId: "plan-shell",
+        workspace: "/tmp",
+        interactionMode: "plan",
+      },
+    )).rejects.toMatchObject({ code: "PLAN_MODE_READ_ONLY" });
+    expect(provider.call).not.toHaveBeenCalled();
+    await gateway.dispose();
+  });
+
   it("redacts secrets from results, structured details, events and errors", async () => {
     const secret = "sk-abcdefghijklmnop";
     const provider = new ResultProvider({
@@ -260,6 +285,44 @@ class ResultProvider implements CapabilityProvider {
   async callTool(): Promise<ToolResult> {
     if (this.error) throw this.error;
     return this.result;
+  }
+
+  async healthCheck() {
+    return { state: "ready" as const };
+  }
+
+  async dispose() {}
+}
+
+class ShellProvider implements CapabilityProvider {
+  readonly id = "workspace";
+  readonly call = vi.fn(async (
+    _name: string,
+    _input: unknown,
+    _context: ToolCallContext,
+  ): Promise<ToolResult> => ({
+    content: [{ type: "text", text: "unexpected" }],
+  }));
+
+  async listTools(): Promise<ToolDefinition[]> {
+    return [{
+      name: "bash",
+      description: "shell",
+      inputSchema: {
+        type: "object",
+        properties: { command: { type: "string" } },
+        required: ["command"],
+      },
+      effect: "unknown",
+    }];
+  }
+
+  async callTool(
+    name: string,
+    input: unknown,
+    context: ToolCallContext,
+  ): Promise<ToolResult> {
+    return this.call(name, input, context);
   }
 
   async healthCheck() {

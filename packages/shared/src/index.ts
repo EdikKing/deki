@@ -354,6 +354,9 @@ export const planRecordSchema = z.object({
   currentRevision: z.number().int().positive(),
   approvedRevision: z.number().int().positive().optional(),
   executingRevision: z.number().int().positive().optional(),
+  replanReason: z.string().max(10_000).optional(),
+  affectedStepIds: z.array(z.string().min(1).max(100)).max(30).default([]),
+  replanEvidence: z.array(z.string().max(10_000)).max(100).default([]),
   createdAt: z.string().datetime(),
   updatedAt: z.string().datetime(),
 }).strict();
@@ -390,6 +393,8 @@ export const planEventTypeSchema = z.enum([
   "plan.revised",
   "plan.approved",
   "plan.execution_started",
+  "plan.execution_paused",
+  "plan.execution_failed",
   "plan.step_started",
   "plan.step_completed",
   "plan.step_blocked",
@@ -568,6 +573,12 @@ export const taskSummarySchema = z.object({
   pendingRequestCount: z.number().int().nonnegative(),
   resultSummary: z.string().optional(),
   error: z.string().optional(),
+  runnable: z.boolean().default(true),
+  attentionReason: z.enum([
+    "workspace_missing",
+    "workspace_untrusted",
+    "runtime_unavailable",
+  ]).optional(),
 }).strict();
 export type TaskSummary = z.infer<typeof taskSummarySchema>;
 
@@ -995,6 +1006,11 @@ export const revisePlanInputSchema = planIdInputSchema.extend({
   mode: z.enum(["foreground", "background"]).default("foreground"),
 }).strict();
 
+export const replanInputSchema = planIdInputSchema.extend({
+  reason: z.string().trim().min(1).max(10_000),
+  affectedStepIds: z.array(z.string().trim().min(1).max(100)).max(30).default([]),
+}).strict();
+
 export const taskInputResponseSchema = taskIdInputSchema.extend({
   requestId: z.string().min(1),
   value: z.string().trim().min(1).max(100_000),
@@ -1025,6 +1041,7 @@ export const IPC_CHANNELS = {
   getPlan: "deki:get-plan",
   approvePlan: "deki:approve-plan",
   revisePlan: "deki:revise-plan",
+  replan: "deki:request-plan-replan",
   abandonPlan: "deki:abandon-plan",
   openPlanSession: "deki:open-plan-session",
   newSession: "deki:new-session",
@@ -1119,6 +1136,11 @@ export interface DekiDesktopApi {
     planId: string,
     feedback: string,
     options?: { mode?: "foreground" | "background" },
+  ): Promise<TaskSubmissionResult>;
+  requestPlanReplan(
+    planId: string,
+    reason: string,
+    affectedStepIds?: string[],
   ): Promise<TaskSubmissionResult>;
   abandonPlan(planId: string): Promise<CommandResult>;
   openPlanSession(planId: string): Promise<CommandResult>;

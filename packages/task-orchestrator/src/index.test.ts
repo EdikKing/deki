@@ -1,6 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   TaskOrchestrator,
@@ -17,6 +18,93 @@ afterEach(async () => {
 });
 
 describe("TaskStore", () => {
+  it("migrates a v3 database to v4 idempotently", async () => {
+    const databasePath = await createDatabasePath();
+    const legacy = new DatabaseSync(databasePath);
+    legacy.exec(`
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, workspace_path TEXT,
+        root_task_id TEXT NOT NULL, parent_task_id TEXT, kind TEXT NOT NULL,
+        title TEXT NOT NULL, goal TEXT NOT NULL, status TEXT NOT NULL,
+        priority INTEGER NOT NULL, session_id TEXT, plan_id TEXT,
+        current_run_id TEXT, assigned_profile TEXT, execution_json TEXT NOT NULL,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT
+      );
+      CREATE TABLE plans (
+        id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, workspace_path TEXT,
+        session_id TEXT NOT NULL, planning_task_id TEXT, execution_task_id TEXT,
+        goal TEXT NOT NULL, status TEXT NOT NULL, current_revision INTEGER NOT NULL,
+        approved_revision INTEGER, executing_revision INTEGER,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      INSERT INTO tasks VALUES (
+        'task-1', 'workspace-a', NULL, 'task-1', NULL, 'background',
+        'legacy', 'legacy', 'queued', 0, NULL, NULL, NULL, NULL,
+        '{"type":"agent-prompt","sourceSessionId":"s","preferFork":true}',
+        '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z', NULL
+      );
+      PRAGMA user_version = 3;
+    `);
+    legacy.close();
+
+    const migrated = new TaskStore(databasePath);
+    expect(migrated.getDeliveryMode("task-1")).toBe("background");
+    migrated.close();
+    const reopened = new TaskStore(databasePath);
+    reopened.close();
+
+    const verified = new DatabaseSync(databasePath);
+    expect((verified.prepare("PRAGMA user_version").get() as { user_version: number }).user_version)
+      .toBe(4);
+    const taskColumns = verified.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
+    const planColumns = verified.prepare("PRAGMA table_info(plans)").all() as Array<{ name: string }>;
+    expect(taskColumns.map((column) => column.name)).toContain("delivery_mode");
+    expect(planColumns.map((column) => column.name)).toContain("replan_reason");
+    verified.close();
+  });
+
+  it("migrates a v1 task database through every schema version", async () => {
+    const databasePath = await createDatabasePath();
+    const legacy = new DatabaseSync(databasePath);
+    legacy.exec(`
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL,
+        root_task_id TEXT NOT NULL, parent_task_id TEXT, kind TEXT NOT NULL,
+        title TEXT NOT NULL, goal TEXT NOT NULL, status TEXT NOT NULL,
+        priority INTEGER NOT NULL, session_id TEXT, plan_id TEXT,
+        current_run_id TEXT, assigned_profile TEXT, execution_json TEXT NOT NULL,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT
+      );
+      CREATE TABLE runs (id TEXT PRIMARY KEY, task_id TEXT);
+      INSERT INTO tasks VALUES (
+        '00000000-0000-4000-8000-000000000011', 'workspace-a',
+        '00000000-0000-4000-8000-000000000011', NULL, 'interactive',
+        'legacy v1', 'legacy v1', 'queued', 0, NULL, NULL, NULL, NULL,
+        '{"type":"agent-prompt","sourceSessionId":"s","preferFork":false}',
+        '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z', NULL
+      );
+      PRAGMA user_version = 1;
+    `);
+    legacy.close();
+
+    const migrated = new TaskStore(databasePath);
+    expect(migrated.getTask("00000000-0000-4000-8000-000000000011")).toMatchObject({
+      title: "legacy v1",
+      status: "queued",
+    });
+    expect(migrated.getDeliveryMode("00000000-0000-4000-8000-000000000011"))
+      .toBe("foreground");
+    migrated.close();
+
+    const verified = new DatabaseSync(databasePath);
+    expect((verified.prepare("PRAGMA user_version").get() as { user_version: number }).user_version)
+      .toBe(4);
+    expect(verified.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'plans'",
+    ).get()).toBeTruthy();
+    verified.close();
+  });
+
   it("persists tasks, runs, artifacts, and monotonic events", async () => {
     const store = await createStore();
     const task = store.createTask({
@@ -142,7 +230,7 @@ describe("TaskStore", () => {
       },
     });
     const run = store.createRun(executionTask.id);
-    store.markPlanExecuting(plan.id, executionTask.id, run.id);
+    store.bindRun(executionTask.id, run.id, { sessionId: "session-execution" });
     expect(() => store.updatePlanStep(plan.id, {
       revision: 2,
       stepId: "implement",
@@ -166,7 +254,7 @@ describe("TaskStore", () => {
         runId: run.id,
       });
     }
-    store.completePlan(plan.id, executionTask.id, run.id);
+    store.finishRun(executionTask.id, run.id, "succeeded");
     expect(store.getPlan(plan.id)?.plan.status).toBe("completed");
     store.close();
   });
@@ -189,6 +277,46 @@ describe("TaskStore", () => {
       ],
     })).toThrow(/相对路径|存在环/);
     expect(store.listPlans()).toHaveLength(0);
+    store.close();
+  });
+
+  it("returns an incomplete Plan execution to approved when its Task fails", async () => {
+    const store = await createStore();
+    const planning = store.createTask({
+      workspaceId: "workspace-a",
+      kind: "planning",
+      title: "plan",
+      goal: "plan",
+      execution: { ...promptExecution(), interactionMode: "plan" },
+    });
+    const plan = store.createPlan({
+      workspaceId: "workspace-a",
+      sessionId: "session-plan",
+      planningTaskId: planning.id,
+      goal: "plan",
+      assumptions: [],
+      constraints: [],
+      steps: planSteps(),
+    });
+    store.cancelInactiveTask(planning.id);
+    const execution = store.approvePlan(plan.id, 1, {
+      title: "execute",
+      execution: {
+        ...promptExecution(true),
+        interactionMode: "plan-execution",
+        planId: plan.id,
+        planRevision: 1,
+      },
+    });
+    const run = store.createRun(execution.id);
+    store.bindRun(execution.id, run.id, { sessionId: "session-execution" });
+
+    expect(() => store.finishRun(execution.id, run.id, "succeeded"))
+      .toThrow("计划仍有未完成步骤");
+    expect(store.getPlan(plan.id)?.plan.status).toBe("executing");
+    store.finishRun(execution.id, run.id, "failed", "Agent 提前结束");
+    expect(store.getTask(execution.id)?.status).toBe("failed");
+    expect(store.getPlan(plan.id)?.plan.status).toBe("approved");
     store.close();
   });
 
@@ -302,6 +430,37 @@ describe("TaskStore", () => {
 });
 
 describe("TaskOrchestrator", () => {
+  it("keeps unavailable workspace tasks queued and exposes an attention reason", async () => {
+    const store = await createStore();
+    const executor = vi.fn(async () => deferredHandle("unused"));
+    const orchestrator = new TaskOrchestrator({
+      store,
+      concurrency: 1,
+      executor,
+      workspaceAvailability: () => ({
+        runnable: false,
+        attentionReason: "workspace_missing",
+      }),
+    });
+    const task = orchestrator.submitPrompt({
+      workspaceId: "workspace-missing",
+      workspacePath: "/missing/project",
+      title: "missing",
+      prompt: "missing",
+      kind: "background",
+      execution: promptExecution(true),
+    });
+    orchestrator.start();
+    await settle();
+    expect(executor).not.toHaveBeenCalled();
+    expect(orchestrator.listTaskSummaries()[0]).toMatchObject({
+      task: { id: task.id, status: "queued" },
+      runnable: false,
+      attentionReason: "workspace_missing",
+    });
+    await orchestrator.dispose();
+  });
+
   it("queues over the concurrency limit and starts in FIFO order", async () => {
     const store = await createStore();
     const handles: Array<ReturnType<typeof deferredHandle>> = [];
@@ -627,6 +786,142 @@ describe("TaskOrchestrator", () => {
     await settle();
     expect(orchestrator.getTask(task.id)?.runs).toHaveLength(2);
     expect(orchestrator.getTask(task.id)?.task.status).toBe("succeeded");
+    await orchestrator.dispose();
+  });
+
+  it("reacquires a global slot before resolving a waiting request", async () => {
+    const store = await createStore();
+    const handles: Array<ReturnType<typeof deferredHandle>> = [];
+    const orchestrator = new TaskOrchestrator({
+      store,
+      workspaceId: "workspace-a",
+      concurrency: 1,
+      executor: async ({ task }) => {
+        const handle = deferredHandle(`session-${task.title}`);
+        handles.push(handle);
+        return handle;
+      },
+    });
+    orchestrator.start();
+    const waiting = orchestrator.submitPrompt({
+      title: "waiting",
+      prompt: "waiting",
+      kind: "interactive",
+      execution: promptExecution(),
+    });
+    orchestrator.submitPrompt({
+      title: "other",
+      prompt: "other",
+      kind: "background",
+      execution: promptExecution(true),
+    });
+    await settle();
+    const runId = orchestrator.getTask(waiting.id)!.task.currentRunId!;
+    orchestrator.handleAgentEvent({
+      eventId: crypto.randomUUID(),
+      timestamp: new Date().toISOString(),
+      sessionId: "session-waiting",
+      taskId: waiting.id,
+      runId,
+      type: "approval.requested",
+      requestId: "approval-resume",
+      category: "workspace.write",
+      title: "写入",
+      description: "写入",
+      details: {},
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+    await settle();
+    expect(handles).toHaveLength(2);
+
+    const leasePromise = orchestrator.acquireResumeLease(waiting.id, "approval-resume");
+    await expect(orchestrator.acquireResumeLease(waiting.id, "approval-resume"))
+      .resolves.toBeNull();
+    handles[1]!.resolve();
+    const lease = await leasePromise;
+    expect(lease).not.toBeNull();
+    expect(orchestrator.activeRunCount).toBe(1);
+    lease!.commit();
+    orchestrator.handleAgentEvent({
+      eventId: crypto.randomUUID(),
+      timestamp: new Date().toISOString(),
+      sessionId: "session-waiting",
+      taskId: waiting.id,
+      runId,
+      type: "approval.resolved",
+      requestId: "approval-resume",
+      decision: "allow_once",
+    });
+    expect(orchestrator.getTask(waiting.id)?.task.status).toBe("running");
+    handles[0]!.resolve();
+    await settle();
+    await orchestrator.dispose();
+  });
+
+  it("keeps Plan execution consistent on failure and atomically prepares replan", async () => {
+    const store = await createStore();
+    const planning = store.createTask({
+      workspaceId: "workspace-a",
+      kind: "planning",
+      title: "plan",
+      goal: "plan",
+      execution: { ...promptExecution(), interactionMode: "plan" },
+    });
+    const plan = store.createPlan({
+      workspaceId: "workspace-a",
+      sessionId: "session-plan",
+      planningTaskId: planning.id,
+      goal: "plan",
+      assumptions: [],
+      constraints: [],
+      steps: planSteps(),
+    });
+    store.cancelInactiveTask(planning.id);
+    const execution = store.approvePlan(plan.id, 1, {
+      title: "execute",
+      execution: {
+        ...promptExecution(true),
+        interactionMode: "plan-execution",
+        planId: plan.id,
+        planRevision: 1,
+      },
+    });
+    const handle = deferredHandle("session-execution");
+    const orchestrator = new TaskOrchestrator({
+      store,
+      concurrency: 1,
+      executor: async () => handle,
+    });
+    orchestrator.start();
+    await settle();
+    expect(store.getPlan(plan.id)?.plan.status).toBe("executing");
+    const runId = store.getTask(execution.id)!.currentRunId!;
+    store.updatePlanStep(plan.id, {
+      revision: 1,
+      stepId: "inspect",
+      status: "running",
+      taskId: execution.id,
+      runId,
+    });
+
+    await orchestrator.requestReplan(execution.id, {
+      planId: plan.id,
+      reason: "假设失效",
+      affectedStepIds: ["inspect"],
+      evidence: ["API 已变化"],
+    });
+    handle.reject(abortError());
+    await settle();
+    const detail = store.getPlan(plan.id)!;
+    expect(detail.plan).toMatchObject({
+      status: "draft",
+      replanReason: "假设失效",
+      affectedStepIds: ["inspect"],
+      replanEvidence: ["API 已变化"],
+    });
+    expect(detail.stepStates.find((state) => state.stepId === "inspect"))
+      .toMatchObject({ status: "blocked", reason: "假设失效" });
+    expect(store.getTask(execution.id)?.status).toBe("paused");
     await orchestrator.dispose();
   });
 });

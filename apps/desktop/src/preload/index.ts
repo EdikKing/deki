@@ -42,6 +42,7 @@ import {
   planListInputSchema,
   planSummarySchema,
   revisePlanInputSchema,
+  replanInputSchema,
   taskInputResponseSchema,
   settingsPatchSchema,
   settingsScopeSchema,
@@ -195,6 +196,18 @@ const api: DekiDesktopApi = {
           planId,
           feedback,
           mode: options?.mode ?? "foreground",
+        }),
+      ),
+    );
+  },
+  async requestPlanReplan(planId, reason, affectedStepIds) {
+    return taskSubmissionResultSchema.parse(
+      await ipcRenderer.invoke(
+        IPC_CHANNELS.replan,
+        replanInputSchema.parse({
+          planId,
+          reason,
+          affectedStepIds: affectedStepIds ?? [],
         }),
       ),
     );

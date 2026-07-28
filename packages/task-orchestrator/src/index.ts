@@ -50,6 +50,7 @@ export const promptExecutionInputSchema = z.object({
   interactionMode: z.enum(["act", "plan", "plan-execution"]).optional(),
   planId: z.string().uuid().optional(),
   planRevision: z.number().int().positive().optional(),
+  deliveryMode: z.enum(["foreground", "background"]).optional(),
 }).strict();
 export type PromptExecutionInput = z.infer<typeof promptExecutionInputSchema>;
 export type TaskExecutionInput = PromptExecutionInput;
@@ -86,6 +87,7 @@ interface TaskRow {
   current_run_id: string | null;
   assigned_profile: string | null;
   execution_json: string;
+  delivery_mode: string;
   created_at: string;
   updated_at: string;
   completed_at: string | null;
@@ -158,6 +160,9 @@ interface PlanRow {
   current_revision: number;
   approved_revision: number | null;
   executing_revision: number | null;
+  replan_reason: string | null;
+  affected_step_ids_json: string;
+  replan_evidence_json: string;
   created_at: string;
   updated_at: string;
 }
@@ -230,7 +235,7 @@ const planTransitions: Record<PlanStatus, ReadonlySet<PlanStatus>> = {
   draft: new Set(["ready", "abandoned"]),
   ready: new Set(["draft", "approved", "abandoned"]),
   approved: new Set(["executing", "draft", "abandoned"]),
-  executing: new Set(["draft", "completed", "abandoned"]),
+  executing: new Set(["approved", "draft", "completed", "abandoned"]),
   completed: new Set(),
   abandoned: new Set(),
 };
@@ -295,8 +300,8 @@ export class TaskStore {
         INSERT INTO tasks (
           id, workspace_id, workspace_path, root_task_id, parent_task_id, kind,
           title, goal, status, priority, session_id, plan_id, current_run_id,
-          assigned_profile, execution_json, created_at, updated_at, completed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?, ?, NULL)
+          assigned_profile, execution_json, delivery_mode, created_at, updated_at, completed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?, ?, ?, NULL)
       `).run(
         task.id,
         task.workspaceId,
@@ -311,6 +316,7 @@ export class TaskStore {
         task.planId ?? null,
         task.assignedProfile ?? null,
         JSON.stringify(execution),
+        execution.deliveryMode ?? "foreground",
         task.createdAt,
         task.updatedAt,
       );
@@ -415,18 +421,36 @@ export class TaskStore {
 
   getExecution(id: string): TaskExecutionInput {
     const row = this.#database.prepare(
-      "SELECT execution_json FROM tasks WHERE id = ?",
-    ).get(id) as { execution_json: string } | undefined;
+      "SELECT execution_json, delivery_mode FROM tasks WHERE id = ?",
+    ).get(id) as { execution_json: string; delivery_mode: string } | undefined;
     if (!row) throw new Error("未找到任务");
-    return promptExecutionInputSchema.parse(JSON.parse(row.execution_json));
+    return promptExecutionInputSchema.parse({
+      ...JSON.parse(row.execution_json) as Record<string, unknown>,
+      deliveryMode: row.delivery_mode === "background" ? "background" : "foreground",
+    });
+  }
+
+  getDeliveryMode(id: string): "foreground" | "background" {
+    const row = this.#database.prepare(
+      "SELECT delivery_mode FROM tasks WHERE id = ?",
+    ).get(id) as { delivery_mode: string } | undefined;
+    return row?.delivery_mode === "background" ? "background" : "foreground";
   }
 
   updateExecution(taskId: string, execution: TaskExecutionInput): void {
     this.#requireTask(taskId);
+    const current = this.getExecution(taskId);
+    const next = promptExecutionInputSchema.parse({
+      ...execution,
+      deliveryMode: current.deliveryMode,
+    });
     this.#database.prepare(
-      "UPDATE tasks SET execution_json = ?, updated_at = ? WHERE id = ?",
+      `UPDATE tasks
+       SET execution_json = ?, delivery_mode = ?, updated_at = ?
+       WHERE id = ?`,
     ).run(
-      JSON.stringify(promptExecutionInputSchema.parse(execution)),
+      JSON.stringify(next),
+      next.deliveryMode ?? current.deliveryMode ?? "foreground",
       new Date().toISOString(),
       taskId,
     );
@@ -544,7 +568,8 @@ export class TaskStore {
       this.#database.prepare(`
         UPDATE plans
         SET status = 'ready', current_revision = ?, planning_task_id = ?,
-            updated_at = ?
+            replan_reason = NULL, affected_step_ids_json = '[]',
+            replan_evidence_json = '[]', updated_at = ?
         WHERE id = ?
       `).run(revisionNumber, input.planningTaskId ?? null, now, planId);
       planEvents.push(this.#appendPlanEvent(
@@ -557,21 +582,36 @@ export class TaskStore {
     return this.#requirePlan(planId);
   }
 
-  requestPlanRevision(planId: string, feedback: string): PlanRecord {
+  requestPlanRevision(
+    planId: string,
+    feedback: string,
+    affectedStepIds: string[] = [],
+  ): PlanRecord {
     const plan = this.#requirePlan(planId);
-    if (!["ready", "approved", "executing"].includes(plan.status)) {
+    if (!["draft", "ready", "approved"].includes(plan.status)) {
       throw new Error(`计划当前状态为 ${plan.status}，不能请求修订`);
     }
-    this.#assertPlanTransition(plan.status, "draft");
+    if (plan.status !== "draft") this.#assertPlanTransition(plan.status, "draft");
+    const revision = this.#requirePlanRevision(planId, plan.currentRevision);
+    const knownIds = new Set(revision.steps.map((step) => step.id));
+    if (affectedStepIds.some((id) => !knownIds.has(id))) {
+      throw new Error("受影响步骤包含未知 Step ID");
+    }
+    const nextAffected = affectedStepIds.length > 0
+      ? affectedStepIds
+      : plan.affectedStepIds;
     const now = new Date().toISOString();
     this.#transaction((_events, planEvents) => {
       this.#database.prepare(
-        "UPDATE plans SET status = 'draft', updated_at = ? WHERE id = ?",
-      ).run(now, planId);
+        `UPDATE plans
+         SET status = 'draft', replan_reason = COALESCE(replan_reason, ?),
+             affected_step_ids_json = ?, updated_at = ?
+         WHERE id = ?`,
+      ).run(feedback, JSON.stringify(nextAffected), now, planId);
       planEvents.push(this.#appendPlanEvent(
         planId,
         "plan.replan_requested",
-        { feedback },
+        { feedback, affectedStepIds: nextAffected },
         plan.executionTaskId,
       ));
     });
@@ -695,7 +735,9 @@ export class TaskStore {
       }
       this.#database.prepare(`
         UPDATE plans
-        SET status = 'approved', approved_revision = ?, execution_task_id = ?, updated_at = ?
+        SET status = 'approved', approved_revision = ?, execution_task_id = ?,
+            replan_reason = NULL, affected_step_ids_json = '[]',
+            replan_evidence_json = '[]', updated_at = ?
         WHERE id = ?
       `).run(revisionNumber, task.id, now, planId);
       planEvents.push(this.#appendPlanEvent(
@@ -706,26 +748,6 @@ export class TaskStore {
       ));
     });
     return task!;
-  }
-
-  markPlanExecuting(planId: string, taskId: string, runId: string): void {
-    const plan = this.#requirePlan(planId);
-    if (plan.status === "executing") return;
-    if (plan.status !== "approved") throw new Error("计划尚未批准");
-    const now = new Date().toISOString();
-    this.#transaction((_events, planEvents) => {
-      this.#database.prepare(`
-        UPDATE plans SET status = 'executing', executing_revision = approved_revision,
-          updated_at = ? WHERE id = ?
-      `).run(now, planId);
-      planEvents.push(this.#appendPlanEvent(
-        planId,
-        "plan.execution_started",
-        { revision: plan.approvedRevision },
-        taskId,
-        runId,
-      ));
-    });
   }
 
   updatePlanStep(planId: string, input: {
@@ -808,22 +830,6 @@ export class TaskStore {
     return next;
   }
 
-  completePlan(planId: string, taskId?: string, runId?: string): void {
-    const plan = this.#requirePlan(planId);
-    if (plan.status !== "executing" || !plan.executingRevision) return;
-    const states = this.#listPlanStepStates(planId, plan.executingRevision);
-    if (states.some((state) => state.status !== "completed" && state.status !== "skipped")) {
-      throw new Error("计划仍有未完成步骤");
-    }
-    const now = new Date().toISOString();
-    this.#transaction((_events, planEvents) => {
-      this.#database.prepare(
-        "UPDATE plans SET status = 'completed', updated_at = ? WHERE id = ?",
-      ).run(now, planId);
-      planEvents.push(this.#appendPlanEvent(planId, "plan.completed", {}, taskId, runId));
-    });
-  }
-
   abandonPlan(planId: string): PlanRecord {
     const plan = this.#requirePlan(planId);
     if (plan.status === "completed" || plan.status === "abandoned") {
@@ -890,10 +896,11 @@ export class TaskStore {
     runId: string,
     input: { sessionId: string; modelProvider?: string; modelId?: string },
   ): RunRecord {
+    const task = this.#requireTask(taskId);
     const run = this.#requireRun(runId);
     this.#assertRunTransition(run.status, "running");
     const now = new Date().toISOString();
-    this.#transaction((events) => {
+    this.#transaction((events, planEvents) => {
       this.#database.prepare(`
         UPDATE runs
         SET status = 'running', session_id = ?, model_provider = ?,
@@ -911,6 +918,22 @@ export class TaskStore {
         "UPDATE tasks SET session_id = ?, updated_at = ? WHERE id = ?",
       ).run(input.sessionId, now, taskId);
       events.push(this.#appendEvent(taskId, "run.started", {}, runId, input.sessionId));
+      if (task.kind === "plan-execution" && task.planId) {
+        const plan = this.#requirePlan(task.planId);
+        if (plan.status !== "approved") throw new Error("计划尚未批准");
+        this.#database.prepare(`
+          UPDATE plans
+          SET status = 'executing', executing_revision = approved_revision, updated_at = ?
+          WHERE id = ?
+        `).run(now, plan.id);
+        planEvents.push(this.#appendPlanEvent(
+          plan.id,
+          "plan.execution_started",
+          { revision: plan.approvedRevision },
+          taskId,
+          runId,
+        ));
+      }
     });
     return this.#requireRun(runId);
   }
@@ -962,6 +985,17 @@ export class TaskStore {
     if (isTerminalTaskStatus(task.status) || isTerminalRunStatus(run.status)) return;
     this.#assertTaskTransition(task.status, status);
     this.#assertRunTransition(run.status, status);
+    const plan = task.kind === "plan-execution" && task.planId
+      ? this.#requirePlan(task.planId)
+      : undefined;
+    if (plan && status === "succeeded") {
+      const revision = plan.executingRevision ?? plan.approvedRevision;
+      if (!revision) throw new Error("计划没有可完成的执行版本");
+      const states = this.#listPlanStepStates(plan.id, revision);
+      if (states.some((state) => state.status !== "completed" && state.status !== "skipped")) {
+        throw new Error("计划仍有未完成步骤");
+      }
+    }
     const now = new Date().toISOString();
     const runEvent: TaskEventType = status === "succeeded"
       ? "run.completed"
@@ -970,7 +1004,7 @@ export class TaskStore {
         : status === "cancelled"
           ? "run.cancelled"
           : "run.interrupted";
-    this.#transaction((events) => {
+    this.#transaction((events, planEvents) => {
       this.#database.prepare(`
         UPDATE runs
         SET status = ?, finished_at = ?, error = ?, result_summary = ?
@@ -994,6 +1028,30 @@ export class TaskStore {
         runId,
         task.sessionId,
       ));
+      if (plan && !(plan.status === "abandoned" && status === "cancelled")) {
+        const planStatus: PlanStatus = status === "succeeded"
+          ? "completed"
+          : status === "cancelled"
+            ? "abandoned"
+            : "approved";
+        this.#database.prepare(`
+          UPDATE plans
+          SET status = ?, executing_revision = NULL, updated_at = ?
+          WHERE id = ?
+        `).run(planStatus, now, plan.id);
+        const planEventType: PlanEventType = status === "succeeded"
+          ? "plan.completed"
+          : status === "cancelled"
+            ? "plan.abandoned"
+            : "plan.execution_failed";
+        planEvents.push(this.#appendPlanEvent(
+          plan.id,
+          planEventType,
+          { taskStatus: status, ...(error ? { error } : {}) },
+          taskId,
+          runId,
+        ));
+      }
     });
   }
 
@@ -1021,14 +1079,14 @@ export class TaskStore {
     });
   }
 
-  finishPausedRun(taskId: string, runId: string): void {
+  finishPausedRun(taskId: string, runId: string, replan = false): void {
     const task = this.#requireTask(taskId);
     const run = this.#requireRun(runId);
     if (task.status === "paused") return;
     this.#assertTaskTransition(task.status, "paused");
     this.#assertRunTransition(run.status, "interrupted");
     const now = new Date().toISOString();
-    this.#transaction((events) => {
+    this.#transaction((events, planEvents) => {
       this.#database.prepare(`
         UPDATE runs SET status = 'interrupted', finished_at = ?, error = ?
         WHERE id = ? AND task_id = ?
@@ -1052,6 +1110,23 @@ export class TaskStore {
         runId,
         task.sessionId,
       ));
+      if (task.kind === "plan-execution" && task.planId) {
+        const plan = this.#requirePlan(task.planId);
+        if (plan.status === "abandoned") return;
+        const planStatus: PlanStatus = replan ? "draft" : "approved";
+        this.#database.prepare(`
+          UPDATE plans
+          SET status = ?, executing_revision = NULL, updated_at = ?
+          WHERE id = ?
+        `).run(planStatus, now, plan.id);
+        planEvents.push(this.#appendPlanEvent(
+          plan.id,
+          "plan.execution_paused",
+          { replan },
+          taskId,
+          runId,
+        ));
+      }
     });
   }
 
@@ -1078,7 +1153,9 @@ export class TaskStore {
     const now = new Date().toISOString();
     this.#transaction((events) => {
       this.#database.prepare(
-        "UPDATE tasks SET kind = 'background', updated_at = ? WHERE id = ?",
+        `UPDATE tasks
+         SET kind = 'background', delivery_mode = 'background', updated_at = ?
+         WHERE id = ?`,
       ).run(now, taskId);
       events.push(this.#appendEvent(
         taskId,
@@ -1097,7 +1174,121 @@ export class TaskStore {
       throw new Error(`任务 ${taskId} 当前状态不能直接取消`);
     }
     this.#assertTaskTransition(task.status, "cancelled");
+    if (task.kind === "plan-execution" && task.planId) {
+      const plan = this.#requirePlan(task.planId);
+      const now = new Date().toISOString();
+      this.#transaction((events, planEvents) => {
+        this.#database.prepare(`
+          UPDATE tasks SET status = 'cancelled', updated_at = ?, completed_at = ?
+          WHERE id = ?
+        `).run(now, now, task.id);
+        this.#cancelPendingRequests(task.id, now);
+        events.push(this.#appendEvent(
+          task.id,
+          "task.cancelled",
+          {},
+          task.currentRunId,
+          task.sessionId,
+        ));
+        this.#database.prepare(`
+          UPDATE plans
+          SET status = 'abandoned', executing_revision = NULL, updated_at = ?
+          WHERE id = ?
+        `).run(now, plan.id);
+        planEvents.push(this.#appendPlanEvent(
+          plan.id,
+          "plan.abandoned",
+          {},
+          task.id,
+          task.currentRunId,
+        ));
+      });
+      return;
+    }
     this.#transitionTaskOnly(task, "cancelled", "task.cancelled", true);
+  }
+
+  prepareReplan(taskId: string, runId: string, input: {
+    planId: string;
+    reason: string;
+    affectedStepIds: string[];
+    evidence?: string[];
+  }): void {
+    const task = this.#requireTask(taskId);
+    const plan = this.#requirePlan(input.planId);
+    if (
+      task.kind !== "plan-execution"
+      || task.planId !== plan.id
+      || task.currentRunId !== runId
+      || plan.status !== "executing"
+      || !plan.executingRevision
+    ) {
+      throw new Error("只能为当前执行中的计划请求重新规划");
+    }
+    const executingRevision = plan.executingRevision;
+    const revision = this.#requirePlanRevision(plan.id, executingRevision);
+    const states = this.#listPlanStepStates(plan.id, executingRevision);
+    const knownIds = new Set(revision.steps.map((step) => step.id));
+    if (input.affectedStepIds.some((id) => !knownIds.has(id))) {
+      throw new Error("受影响步骤包含未知 Step ID");
+    }
+    const activeSteps = states.filter(
+      (state) => state.status === "running" || state.status === "blocked",
+    );
+    if (activeSteps.length === 0) throw new Error("当前没有正在执行或阻塞的步骤");
+    const affected = input.affectedStepIds.length > 0
+      ? new Set(input.affectedStepIds)
+      : new Set(activeSteps.map((state) => state.stepId));
+    if (!activeSteps.some((state) => affected.has(state.stepId))) {
+      throw new Error("受影响步骤必须包含当前执行或阻塞的步骤");
+    }
+    const now = new Date().toISOString();
+    this.#transaction((_events, planEvents) => {
+      for (const state of activeSteps.filter((candidate) => affected.has(candidate.stepId))) {
+        this.#database.prepare(`
+          UPDATE plan_step_states
+          SET status = 'blocked', reason = ?, evidence_json = ?, updated_at = ?
+          WHERE plan_id = ? AND revision = ? AND step_id = ?
+        `).run(
+          input.reason,
+          JSON.stringify(input.evidence ?? state.evidence),
+          now,
+          plan.id,
+          executingRevision,
+          state.stepId,
+        );
+        planEvents.push(this.#appendPlanEvent(
+          plan.id,
+          "plan.step_blocked",
+          { revision: executingRevision, stepId: state.stepId, reason: input.reason },
+          taskId,
+          runId,
+        ));
+      }
+      this.#database.prepare(`
+        UPDATE plans
+        SET replan_reason = ?, affected_step_ids_json = ?,
+            replan_evidence_json = ?, updated_at = ?
+        WHERE id = ?
+      `).run(
+        input.reason,
+        JSON.stringify([...affected]),
+        JSON.stringify(input.evidence ?? []),
+        now,
+        plan.id,
+      );
+      planEvents.push(this.#appendPlanEvent(
+        plan.id,
+        "plan.replan_requested",
+        {
+          reason: input.reason,
+          affectedStepIds: [...affected],
+          evidence: input.evidence ?? [],
+        },
+        taskId,
+        runId,
+      ));
+    });
   }
 
   createRequest(input: {
@@ -1255,7 +1446,7 @@ export class TaskStore {
       const task = rowToTask(row);
       const runId = task.currentRunId;
       const now = new Date().toISOString();
-      this.#transaction((events) => {
+      this.#transaction((events, planEvents) => {
         if (runId) {
           this.#database.prepare(`
             UPDATE runs
@@ -1286,6 +1477,23 @@ export class TaskStore {
           runId,
           task.sessionId,
         ));
+        if (task.kind === "plan-execution" && task.planId) {
+          const plan = this.#getPlanRecord(task.planId);
+          if (plan?.status === "executing") {
+            this.#database.prepare(`
+              UPDATE plans
+              SET status = 'approved', executing_revision = NULL, updated_at = ?
+              WHERE id = ?
+            `).run(now, plan.id);
+            planEvents.push(this.#appendPlanEvent(
+              plan.id,
+              "plan.execution_failed",
+              { taskStatus: "interrupted", error: "应用在任务运行期间退出" },
+              task.id,
+              runId,
+            ));
+          }
+        }
       });
     }
     return tasks.length;
@@ -1504,8 +1712,8 @@ export class TaskStore {
       INSERT INTO tasks (
         id, workspace_id, workspace_path, root_task_id, parent_task_id, kind,
         title, goal, status, priority, session_id, plan_id, current_run_id,
-        assigned_profile, execution_json, created_at, updated_at, completed_at
-      ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, 'queued', ?, NULL, ?, NULL, NULL, ?, ?, ?, NULL)
+        assigned_profile, execution_json, delivery_mode, created_at, updated_at, completed_at
+      ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, 'queued', ?, NULL, ?, NULL, NULL, ?, ?, ?, ?, NULL)
     `).run(
       task.id,
       task.workspaceId,
@@ -1517,6 +1725,7 @@ export class TaskStore {
       task.priority,
       task.planId ?? null,
       JSON.stringify(promptExecutionInputSchema.parse(input.execution)),
+      promptExecutionInputSchema.parse(input.execution).deliveryMode ?? "foreground",
       task.createdAt,
       task.updatedAt,
     );
@@ -1652,6 +1861,7 @@ export class TaskStore {
           current_run_id TEXT,
           assigned_profile TEXT,
           execution_json TEXT NOT NULL,
+          delivery_mode TEXT NOT NULL DEFAULT 'foreground',
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL,
           completed_at TEXT
@@ -1733,6 +1943,9 @@ export class TaskStore {
           current_revision INTEGER NOT NULL,
           approved_revision INTEGER,
           executing_revision INTEGER,
+          replan_reason TEXT,
+          affected_step_ids_json TEXT NOT NULL DEFAULT '[]',
+          replan_evidence_json TEXT NOT NULL DEFAULT '[]',
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL
         );
@@ -1778,7 +1991,7 @@ export class TaskStore {
         );
         CREATE INDEX plan_events_plan_sequence_idx
           ON plan_events(plan_id, sequence);
-        PRAGMA user_version = 3;
+        PRAGMA user_version = 4;
         COMMIT;
       `);
       return;
@@ -1872,6 +2085,24 @@ export class TaskStore {
         COMMIT;
       `);
     }
+    if (version <= 3) {
+      this.#database.exec(`
+        BEGIN;
+        ALTER TABLE tasks ADD COLUMN delivery_mode TEXT NOT NULL DEFAULT 'foreground';
+        ALTER TABLE plans ADD COLUMN replan_reason TEXT;
+        ALTER TABLE plans ADD COLUMN affected_step_ids_json TEXT NOT NULL DEFAULT '[]';
+        ALTER TABLE plans ADD COLUMN replan_evidence_json TEXT NOT NULL DEFAULT '[]';
+        UPDATE tasks
+        SET delivery_mode = CASE
+          WHEN kind IN ('background', 'plan-execution') THEN 'background'
+          WHEN kind = 'planning' AND execution_json LIKE '%"preferFork":true%'
+            THEN 'background'
+          ELSE 'foreground'
+        END;
+        PRAGMA user_version = 4;
+        COMMIT;
+      `);
+    }
   }
 }
 
@@ -1883,6 +2114,7 @@ interface ActiveExecution {
   cancelRequested: boolean;
   interruptRequested: boolean;
   pauseRequested: boolean;
+  replanRequested: boolean;
   slotHeld: boolean;
   summary: string;
   completion: Promise<void>;
@@ -1890,7 +2122,18 @@ interface ActiveExecution {
 
 interface ResumeWaiter {
   taskId: string;
-  resolve: () => void;
+  requestId: string;
+  resolve: (lease: ResumeLease | null) => void;
+}
+
+export interface ResumeLease {
+  commit(): void;
+  release(): void;
+}
+
+export interface WorkspaceAvailability {
+  runnable: boolean;
+  attentionReason?: "workspace_missing" | "workspace_untrusted" | "runtime_unavailable";
 }
 
 export class TaskOrchestrator {
@@ -1898,6 +2141,7 @@ export class TaskOrchestrator {
   readonly #executor: TaskExecutor;
   readonly #defaultWorkspaceId: string | undefined;
   readonly #isWorkspaceAvailable: (task: TaskRecord) => boolean;
+  readonly #workspaceAvailability: (task: TaskRecord) => WorkspaceAvailability;
   readonly #onEvent: ((event: TaskEvent) => void) | undefined;
   readonly #active = new Map<string, ActiveExecution>();
   readonly #resumeWaiters: ResumeWaiter[] = [];
@@ -1913,6 +2157,7 @@ export class TaskOrchestrator {
     concurrency: number;
     executor: TaskExecutor;
     isWorkspaceAvailable?: (task: TaskRecord) => boolean;
+    workspaceAvailability?: (task: TaskRecord) => WorkspaceAvailability;
     onEvent?: (event: TaskEvent) => void;
     recoverOnStart?: boolean;
   }) {
@@ -1920,7 +2165,15 @@ export class TaskOrchestrator {
     this.#defaultWorkspaceId = options.workspaceId;
     this.#concurrency = normalizeConcurrency(options.concurrency);
     this.#executor = options.executor;
-    this.#isWorkspaceAvailable = options.isWorkspaceAvailable ?? (() => true);
+    this.#workspaceAvailability = options.workspaceAvailability
+      ?? ((task) => {
+        const runnable = options.isWorkspaceAvailable?.(task) ?? true;
+        return {
+          runnable,
+          ...(runnable ? {} : { attentionReason: "runtime_unavailable" as const }),
+        };
+      });
+    this.#isWorkspaceAvailable = (task) => this.#workspaceAvailability(task).runnable;
     this.#onEvent = options.onEvent;
     this.#unsubscribe = this.#store.subscribe((event) => this.#onEvent?.(event));
     if (options.recoverOnStart !== false) this.#store.recoverInterrupted();
@@ -1975,7 +2228,11 @@ export class TaskOrchestrator {
     query?: string;
     limit?: number;
   } = {}): TaskSummary[] {
-    return this.#store.listTaskSummaries(options);
+    return this.#store.listTaskSummaries(options).map((summary) =>
+      taskSummarySchema.parse({
+        ...summary,
+        ...this.#workspaceAvailability(summary.task),
+      }));
   }
 
   listTasks(options: {
@@ -2051,6 +2308,25 @@ export class TaskOrchestrator {
     return true;
   }
 
+  requestReplan(taskId: string, input: {
+    planId: string;
+    reason: string;
+    affectedStepIds: string[];
+    evidence?: string[];
+  }): boolean {
+    const active = this.#active.get(taskId);
+    if (!active) return false;
+    this.#store.prepareReplan(taskId, active.runId, input);
+    this.#store.requestPause(taskId);
+    active.replanRequested = true;
+    active.pauseRequested = true;
+    setImmediate(() => {
+      active.controller.abort();
+      void active.handle?.cancel().catch(() => undefined);
+    });
+    return true;
+  }
+
   resumeTask(taskId: string): boolean {
     const task = this.#store.getTask(taskId);
     if (!task || (task.status !== "paused" && task.status !== "interrupted")) return false;
@@ -2075,19 +2351,30 @@ export class TaskOrchestrator {
     return true;
   }
 
-  async acquireResumeSlot(taskId: string): Promise<boolean> {
+  async acquireResumeLease(
+    taskId: string,
+    requestId: string,
+  ): Promise<ResumeLease | null> {
     const active = this.#active.get(taskId);
-    if (!active) return false;
-    if (active.slotHeld) return true;
-    if (this.#resumeWaiters.some((waiter) => waiter.taskId === taskId)) return false;
+    const request = this.#store.getTaskDetail(taskId)?.requests.find(
+      (candidate) => candidate.id === requestId && candidate.status === "pending",
+    );
+    const task = this.#store.getTask(taskId);
+    if (
+      !active
+      || !request
+      || !task
+      || (task.status !== "waiting_approval" && task.status !== "waiting_user")
+    ) return null;
+    if (active.slotHeld) return this.#createResumeLease(active, false);
+    if (this.#resumeWaiters.some((waiter) => waiter.requestId === requestId)) return null;
     if (this.#heldSlots() < this.#concurrency) {
       active.slotHeld = true;
-      return true;
+      return this.#createResumeLease(active, true);
     }
-    await new Promise<void>((resolve) => {
-      this.#resumeWaiters.push({ taskId, resolve });
+    return new Promise<ResumeLease | null>((resolve) => {
+      this.#resumeWaiters.push({ taskId, requestId, resolve });
     });
-    return this.#active.has(taskId);
   }
 
   handleAgentEvent(event: AgentEvent): void {
@@ -2100,6 +2387,13 @@ export class TaskOrchestrator {
 
     if (event.type === "message.delta") {
       active.summary = `${active.summary}${event.delta}`.slice(-20_000);
+      return;
+    }
+    if (
+      (event.type === "message.completed" || event.type === "tool.completed")
+      && active.handle?.captureContext
+    ) {
+      this.#store.updateExecution(taskId, active.handle.captureContext());
       return;
     }
     if (event.type === "diff.available") {
@@ -2178,7 +2472,7 @@ export class TaskOrchestrator {
       await active.completion.catch(() => undefined);
     });
     await Promise.allSettled(completions);
-    for (const waiter of this.#resumeWaiters.splice(0)) waiter.resolve();
+    for (const waiter of this.#resumeWaiters.splice(0)) waiter.resolve(null);
     this.#unsubscribe?.();
     this.#unsubscribe = undefined;
     if (options.closeStore !== false) this.#store.close();
@@ -2194,6 +2488,20 @@ export class TaskOrchestrator {
     this.#drain();
   }
 
+  #createResumeLease(active: ActiveExecution, ownsSlot: boolean): ResumeLease {
+    let settled = false;
+    return {
+      commit: () => {
+        settled = true;
+      },
+      release: () => {
+        if (settled || !ownsSlot) return;
+        settled = true;
+        if (this.#active.get(active.taskId) === active) this.#releaseSlot(active);
+      },
+    };
+  }
+
   #heldSlots(): number {
     return [...this.#active.values()].filter((active) => active.slotHeld).length;
   }
@@ -2203,8 +2511,15 @@ export class TaskOrchestrator {
     while (this.#heldSlots() < this.#concurrency && this.#resumeWaiters.length) {
       const waiter = this.#resumeWaiters.shift()!;
       const active = this.#active.get(waiter.taskId);
-      if (active) active.slotHeld = true;
-      waiter.resolve();
+      const request = this.#store.getTaskDetail(waiter.taskId)?.requests.find(
+        (candidate) => candidate.id === waiter.requestId && candidate.status === "pending",
+      );
+      if (!active || !request) {
+        waiter.resolve(null);
+        continue;
+      }
+      active.slotHeld = true;
+      waiter.resolve(this.#createResumeLease(active, true));
     }
     let available = this.#concurrency - this.#heldSlots();
     if (available <= 0) return;
@@ -2221,6 +2536,7 @@ export class TaskOrchestrator {
         cancelRequested: false,
         interruptRequested: false,
         pauseRequested: false,
+        replanRequested: false,
         slotHeld: true,
         summary: "",
         completion: Promise.resolve(),
@@ -2237,9 +2553,6 @@ export class TaskOrchestrator {
     run: RunRecord,
   ): Promise<void> {
     try {
-      if (task.kind === "plan-execution" && task.planId) {
-        this.#store.markPlanExecuting(task.planId, task.id, run.id);
-      }
       const handle = await this.#executor({
         task,
         run,
@@ -2256,15 +2569,12 @@ export class TaskOrchestrator {
         await handle.cancel().catch(() => undefined);
       }
       await handle.completion;
-      if (active.pauseRequested) {
+      if (active.pauseRequested && !active.cancelRequested && !active.interruptRequested) {
         if (handle.captureContext) this.#store.updateExecution(task.id, handle.captureContext());
-        this.#store.finishPausedRun(task.id, run.id);
+        this.#store.finishPausedRun(task.id, run.id, active.replanRequested);
       } else {
         if (task.kind === "planning" && !this.#store.getPlanForPlanningTask(task.id)) {
           throw new Error("Planning Task 未提交结构化计划");
-        }
-        if (task.kind === "plan-execution" && task.planId) {
-          this.#store.completePlan(task.planId, task.id, run.id);
         }
         this.#store.finishRun(
           task.id,
@@ -2279,11 +2589,11 @@ export class TaskOrchestrator {
         );
       }
     } catch (error) {
-      if (active.pauseRequested) {
+      if (active.pauseRequested && !active.cancelRequested && !active.interruptRequested) {
         if (active.handle?.captureContext) {
           this.#store.updateExecution(task.id, active.handle.captureContext());
         }
-        this.#store.finishPausedRun(task.id, run.id);
+        this.#store.finishPausedRun(task.id, run.id, active.replanRequested);
       } else {
         if (
           active.handle?.captureContext
@@ -2297,7 +2607,7 @@ export class TaskOrchestrator {
           run.id,
           active.interruptRequested
             ? "interrupted"
-            : active.cancelRequested || isAbortError(error)
+            : active.cancelRequested
               ? "cancelled"
               : "failed",
           active.cancelRequested || active.interruptRequested
@@ -2308,8 +2618,14 @@ export class TaskOrchestrator {
       }
     } finally {
       this.#active.delete(task.id);
-      const index = this.#resumeWaiters.findIndex((waiter) => waiter.taskId === task.id);
-      if (index >= 0) this.#resumeWaiters.splice(index, 1)[0]?.resolve();
+      for (const waiter of this.#resumeWaiters.filter((item) => item.taskId === task.id)) {
+        waiter.resolve(null);
+      }
+      this.#resumeWaiters.splice(
+        0,
+        this.#resumeWaiters.length,
+        ...this.#resumeWaiters.filter((waiter) => waiter.taskId !== task.id),
+      );
       this.#drain();
     }
   }
@@ -2413,6 +2729,9 @@ function rowToPlan(row: PlanRow): PlanRecord {
     currentRevision: row.current_revision,
     ...(row.approved_revision ? { approvedRevision: row.approved_revision } : {}),
     ...(row.executing_revision ? { executingRevision: row.executing_revision } : {}),
+    ...(row.replan_reason ? { replanReason: row.replan_reason } : {}),
+    affectedStepIds: JSON.parse(row.affected_step_ids_json),
+    replanEvidence: JSON.parse(row.replan_evidence_json),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   });
@@ -2521,11 +2840,6 @@ function normalizeConcurrency(value: number): number {
 function summarize(value: string): string | undefined {
   const trimmed = value.trim();
   return trimmed ? trimmed.slice(-4_000) : undefined;
-}
-
-function isAbortError(error: unknown): boolean {
-  return error instanceof Error
-    && (error.name === "AbortError" || /abort|cancel/i.test(error.message));
 }
 
 function formatError(error: unknown): string {

@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { appendFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { delimiter, isAbsolute, join, normalize, resolve, sep } from "node:path";
 import { homedir } from "node:os";
@@ -76,6 +77,7 @@ import {
   planListInputSchema,
   planSummarySchema,
   revisePlanInputSchema,
+  replanInputSchema,
   modelProviderInputSchema,
   modelProviderCatalogResultSchema,
   redactedModelProviderSchema,
@@ -249,7 +251,13 @@ class DesktopController {
   }
 
   get availableForTasks(): boolean {
-    return this.#trusted && Boolean(this.#runtime?.snapshot().ready);
+    return this.#trusted
+      && !this.#reloadPending
+      && Boolean(this.#runtime?.snapshot().ready);
+  }
+
+  get trusted(): boolean {
+    return this.#trusted;
   }
 
   getState(): BootstrapState {
@@ -365,6 +373,7 @@ class DesktopController {
             : {}),
           preferFork,
           interactionMode,
+          deliveryMode: mode,
         },
       });
       return { ok: true, task };
@@ -432,6 +441,7 @@ class DesktopController {
           interactionMode: "plan-execution",
           planId,
           planRevision: revision,
+          deliveryMode: "background",
         },
       });
       this.#tasks.start();
@@ -445,6 +455,7 @@ class DesktopController {
     planId: string,
     feedback: string,
     mode: "foreground" | "background" = "foreground",
+    affectedStepIds: string[] = [],
   ): TaskSubmissionResult {
     if (!this.#trusted || !this.#runtime) {
       return { ok: false, error: "项目未受信任或 Runtime 尚未就绪" };
@@ -454,7 +465,7 @@ class DesktopController {
       if (!detail || detail.plan.workspaceId !== this.#scopeId) {
         return { ok: false, error: "未找到当前项目的计划" };
       }
-      taskStore!.requestPlanRevision(planId, feedback);
+      taskStore!.requestPlanRevision(planId, feedback, affectedStepIds);
       const context = this.#runtime.capturePromptContext(mode === "background");
       const task = this.#tasks.submitPrompt({
         workspaceId: this.#scopeId,
@@ -474,12 +485,41 @@ class DesktopController {
           interactionMode: "plan",
           planId,
           planRevision: detail.plan.currentRevision,
+          deliveryMode: mode,
         },
       });
       return { ok: true, task };
     } catch (error) {
       return { ok: false, error: formatError(error) };
     }
+  }
+
+  async requestPlanReplan(
+    planId: string,
+    reason: string,
+    affectedStepIds: string[] = [],
+  ): Promise<TaskSubmissionResult> {
+    const detail = taskStore?.getPlan(planId);
+    if (!detail || detail.plan.workspaceId !== this.#scopeId) {
+      return { ok: false, error: "未找到当前项目的计划" };
+    }
+    if (
+      detail.plan.status === "executing"
+      && detail.plan.executionTaskId
+    ) {
+      try {
+        return await this.#tasks.requestReplan(detail.plan.executionTaskId, {
+          planId,
+          reason,
+          affectedStepIds,
+        })
+          ? { ok: true }
+          : { ok: false, error: "计划执行任务当前不能重新规划" };
+      } catch (error) {
+        return { ok: false, error: formatError(error) };
+      }
+    }
+    return this.requestPlanRevision(planId, reason, "foreground", affectedStepIds);
   }
 
   async abandonPlan(planId: string): Promise<CommandResult> {
@@ -491,7 +531,9 @@ class DesktopController {
       if (detail.plan.executionTaskId) {
         await this.#tasks.cancelTask(detail.plan.executionTaskId);
       }
-      taskStore!.abandonPlan(planId);
+      if (taskStore?.getPlan(planId)?.plan.status !== "abandoned") {
+        taskStore!.abandonPlan(planId);
+      }
       return { ok: true };
     } catch (error) {
       return { ok: false, error: formatError(error) };
@@ -715,17 +757,17 @@ class DesktopController {
     }
   }
 
-  respondToApproval(
+  async respondToApproval(
     requestId: string,
     decision: "allow_once" | "allow_session" | "allow_project" | "deny",
-  ): CommandResult {
-    return this.#runtime?.respondToApproval(requestId, decision)
+  ): Promise<CommandResult> {
+    return await this.#runtime?.respondToApproval(requestId, decision)
       ? { ok: true }
       : { ok: false, error: "审批请求已失效或不存在" };
   }
 
-  respondToTaskInput(requestId: string, value: string): CommandResult {
-    return this.#runtime?.respondToTaskInput(requestId, value)
+  async respondToTaskInput(requestId: string, value: string): Promise<CommandResult> {
+    return await this.#runtime?.respondToTaskInput(requestId, value)
       ? { ok: true }
       : { ok: false, error: "用户输入请求已失效或不存在" };
   }
@@ -1386,9 +1428,15 @@ class DesktopController {
       this.#reloadPending = true;
       return;
     }
-    await this.#runtime?.dispose();
-    this.#runtime = undefined;
-    await this.#startRuntime();
+    this.#reloadPending = true;
+    try {
+      await this.#runtime?.dispose();
+      this.#runtime = undefined;
+      await this.#startRuntime();
+    } finally {
+      this.#reloadPending = false;
+      this.#tasks.start();
+    }
   }
 
   async #startRuntime(): Promise<void> {
@@ -1412,6 +1460,8 @@ class DesktopController {
           : {},
         persistProjectGrant: async (category, grantKey) =>
           this.#persistProjectGrant(category, grantKey),
+        acquireResumeLease: (taskId, requestId) =>
+          this.#tasks.acquireResumeLease(taskId, requestId),
         planTools: {
           submit: async (input, context) => {
             if (
@@ -1482,11 +1532,13 @@ class DesktopController {
             ) {
               throw new Error("plan.request_replan 只能由当前计划执行任务调用");
             }
-            taskStore!.requestPlanRevision(input.planId, input.reason);
-            setImmediate(() => {
-              void this.#tasks.pauseTask(context.taskId!);
+            const paused = this.#tasks.requestReplan(context.taskId, {
+              planId: input.planId,
+              reason: input.reason,
+              affectedStepIds: input.affectedStepIds,
+              ...(input.evidence ? { evidence: input.evidence } : {}),
             });
-            return { paused: true, reason: input.reason };
+            return { paused, reason: input.reason };
           },
         },
         onEvent: (event) => {
@@ -1503,7 +1555,6 @@ class DesktopController {
             this.#reloadPending
             && (event.type === "run.completed" || event.type === "run.failed")
           ) {
-            this.#reloadPending = false;
             setImmediate(() => {
               void this.#reloadRuntimeWhenIdle();
             });
@@ -1712,8 +1763,17 @@ async function initializeDesktopState(
     store: taskStore,
     concurrency: 1,
     recoverOnStart: false,
-    isWorkspaceAvailable: (task) =>
-      workspaceControllers.get(task.workspaceId)?.availableForTasks ?? false,
+    workspaceAvailability: (task) => {
+      if (task.workspacePath && !existsSync(task.workspacePath)) {
+        return { runnable: false, attentionReason: "workspace_missing" };
+      }
+      const host = workspaceControllers.get(task.workspaceId);
+      if (!host) return { runnable: false, attentionReason: "runtime_unavailable" };
+      if (!host.trusted) return { runnable: false, attentionReason: "workspace_untrusted" };
+      return host.availableForTasks
+        ? { runnable: true }
+        : { runnable: false, attentionReason: "runtime_unavailable" };
+    },
     executor: async (input) => {
       const host = workspaceControllers.get(input.task.workspaceId);
       if (!host) throw new Error("任务所属工作区尚未加载");
@@ -1976,10 +2036,10 @@ function registerIpcHandlers(): void {
     const input = taskInputResponseSchema.parse(raw);
     const task = taskOrchestrator?.getTask(input.taskId)?.task;
     const host = task ? workspaceControllers.get(task.workspaceId) : undefined;
-    if (!task || !host || !await taskOrchestrator?.acquireResumeSlot(task.id)) {
+    if (!task || !host) {
       return commandResultSchema.parse({ ok: false, error: "任务输入请求已失效" });
     }
-    return commandResultSchema.parse(host.respondToTaskInput(
+    return commandResultSchema.parse(await host.respondToTaskInput(
       input.requestId,
       input.value,
     ));
@@ -2016,6 +2076,16 @@ function registerIpcHandlers(): void {
     const host = plan ? workspaceControllers.get(plan.workspaceId) : undefined;
     return taskSubmissionResultSchema.parse(
       host?.requestPlanRevision(planId, feedback, mode)
+      ?? { ok: false, error: "计划所属项目尚未加载" },
+    );
+  });
+  ipcMain.handle(IPC_CHANNELS.replan, async (event, raw) => {
+    assertTrustedSender(event);
+    const { planId, reason, affectedStepIds } = replanInputSchema.parse(raw);
+    const plan = taskStore?.getPlan(planId)?.plan;
+    const host = plan ? workspaceControllers.get(plan.workspaceId) : undefined;
+    return taskSubmissionResultSchema.parse(
+      await host?.requestPlanReplan(planId, reason, affectedStepIds)
       ?? { ok: false, error: "计划所属项目尚未加载" },
     );
   });
@@ -2160,10 +2230,7 @@ function registerIpcHandlers(): void {
     const host = task
       ? workspaceControllers.get(task.workspaceId)
       : controller;
-    if (task && !await taskOrchestrator?.acquireResumeSlot(task.id)) {
-      return commandResultSchema.parse({ ok: false, error: "审批请求已失效" });
-    }
-    return commandResultSchema.parse(host?.respondToApproval(
+    return commandResultSchema.parse(await host?.respondToApproval(
       input.requestId,
       input.decision,
     ) ?? { ok: false, error: "Runtime 尚未就绪" });
@@ -2612,6 +2679,15 @@ function maybeNotifyPlanEvent(event: PlanEvent): void {
   ) return;
   const plan = taskStore?.getPlan(event.planId)?.plan;
   if (!plan) return;
+  const deliveryMode = event.taskId
+    ? taskStore?.getDeliveryMode(event.taskId)
+    : plan.executionTaskId
+      ? taskStore?.getDeliveryMode(plan.executionTaskId)
+      : "foreground";
+  if (
+    (event.type === "plan.submitted" || event.type === "plan.completed")
+    && deliveryMode !== "background"
+  ) return;
   const body = event.type === "plan.submitted"
     ? "计划已生成，等待审阅"
     : event.type === "plan.completed"
@@ -2636,12 +2712,20 @@ function maybeNotifyTaskEvent(event: TaskEvent): void {
   const detail = taskOrchestrator?.getTask(event.taskId);
   if (!detail || !Notification.isSupported()) return;
   const task = detail.task;
+  const deliveryMode = taskStore?.getDeliveryMode(task.id) ?? "foreground";
+  const activeState = controller?.getState();
+  const isActiveSession = controller?.scopeId === task.workspaceId
+    && activeState?.sessionId === task.sessionId;
   const attention = event.type === "task.waiting_approval"
     || event.type === "task.waiting_user";
   const backgroundSuccess = event.type === "task.succeeded"
-    && task.kind === "background";
+    && deliveryMode === "background"
+    && task.kind !== "planning"
+    && task.kind !== "plan-execution";
   const abnormal = event.type === "task.failed" || event.type === "task.interrupted";
-  if (!attention && !backgroundSuccess && !abnormal) return;
+  const backgroundAttention = attention
+    && (deliveryMode === "background" || !isActiveSession);
+  if (!backgroundAttention && !backgroundSuccess && !abnormal) return;
   const body = attention
     ? "任务需要你的处理"
     : event.type === "task.succeeded"

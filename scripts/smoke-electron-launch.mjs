@@ -57,7 +57,7 @@ try {
         stdio: "ignore",
       });
     } else {
-      child.kill("SIGTERM");
+      await terminateChild(child);
     }
   }
   await rm(temporaryHome, {
@@ -65,6 +65,29 @@ try {
     force: true,
     maxRetries: 20,
     retryDelay: 250,
+  });
+}
+
+async function terminateChild(childProcess) {
+  childProcess.kill("SIGTERM");
+  if (await waitForExit(childProcess, 2_000)) return;
+  childProcess.kill("SIGKILL");
+  await waitForExit(childProcess, 2_000);
+}
+
+function waitForExit(childProcess, timeoutMs) {
+  if (childProcess.exitCode !== null || childProcess.signalCode !== null) {
+    return Promise.resolve(true);
+  }
+  return new Promise((resolveExit) => {
+    const timeout = setTimeout(() => finish(false), timeoutMs);
+    const onExit = () => finish(true);
+    childProcess.once("exit", onExit);
+    function finish(exited) {
+      clearTimeout(timeout);
+      childProcess.off("exit", onExit);
+      resolveExit(exited);
+    }
   });
 }
 

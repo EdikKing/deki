@@ -6,6 +6,7 @@ const releaseDirectory = resolve(process.argv[3] ?? "release");
 const requirements = {
   macos: {
     extensions: [".dmg", ".zip"],
+    architectures: ["x64", "arm64"],
     metadata: "latest-mac.yml",
   },
   windows: {
@@ -32,6 +33,11 @@ for (const extension of requirement.extensions) {
   const minimum = extension === ".exe" ? requirement.minimumExecutables ?? 1 : 1;
   if (count < minimum) {
     throw new Error(`Expected at least ${minimum} ${extension} artifact(s), found ${count}.`);
+  }
+  for (const architecture of requirement.architectures ?? []) {
+    if (!files.some((file) => file.endsWith(`-${architecture}${extension}`))) {
+      throw new Error(`Missing ${architecture} ${extension} artifact.`);
+    }
   }
 }
 if (!files.includes(requirement.metadata)) {

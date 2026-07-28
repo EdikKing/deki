@@ -226,6 +226,11 @@ jobs:
             notes+=(--notes "⚠️ This release contains unsigned desktop installers. macOS and Windows may display security warnings during installation.")
           fi
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            while IFS= read -r asset; do
+              [[ -z "$asset" ]] || gh release delete-asset \
+                "$GITHUB_REF_NAME" "$asset" --yes
+            done < <(gh release view "$GITHUB_REF_NAME" --json assets \
+              --jq '.assets[].name | select(contains("-mac-universal."))')
             gh release upload "$GITHUB_REF_NAME" release-assets/* --clobber
           else
             flags=()

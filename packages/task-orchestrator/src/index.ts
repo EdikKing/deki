@@ -833,21 +833,25 @@ export class TaskStore {
   createIntegration(input: {
     rootTaskId: string;
     taskId: string;
+    integrationTaskId?: string;
     baselineCommit: string;
     predictedOverlaps?: string[];
     workerTaskIds: string[];
+    validationTargets?: import("@deki-ai/shared").ValidationTarget[];
   }): IntegrationRecord {
     const now = new Date().toISOString();
     const record = integrationRecordSchema.parse({
       id: randomUUID(),
       rootTaskId: input.rootTaskId,
       taskId: input.taskId,
+      ...(input.integrationTaskId ? { integrationTaskId: input.integrationTaskId } : {}),
       baselineCommit: input.baselineCommit,
       status: "preparing",
       predictedOverlaps: input.predictedOverlaps ?? [],
       actualOverlaps: [],
       conflictFiles: [],
       workerTaskIds: input.workerTaskIds,
+      validationTargets: input.validationTargets ?? [],
       validationArtifactIds: [],
       cleanupStatus: "pending",
       createdAt: now,
@@ -912,6 +916,10 @@ export class TaskStore {
       const eventType = updated.status !== current.status
         ? updated.status === "testing"
           ? "integration.testing"
+          : updated.status === "paused"
+            ? "integration.paused"
+            : updated.status === "retrying"
+              ? "integration.retrying"
           : updated.status === "conflicted"
             ? "integration.conflict_detected"
             : updated.status === "failed"
@@ -945,9 +953,10 @@ export class TaskStore {
 
   getIntegrationForTask(taskId: string): IntegrationRecord | undefined {
     const row = this.#database.prepare(`
-      SELECT record_json FROM integrations WHERE task_id = ?
-      ORDER BY created_at DESC LIMIT 1
-    `).get(taskId) as { record_json: string } | undefined;
+      SELECT record_json FROM integrations
+      WHERE task_id = ? OR json_extract(record_json, '$.integrationTaskId') = ?
+      ORDER BY CASE WHEN task_id = ? THEN 0 ELSE 1 END, created_at DESC LIMIT 1
+    `).get(taskId, taskId, taskId) as { record_json: string } | undefined;
     return row ? integrationRecordSchema.parse(JSON.parse(row.record_json)) : undefined;
   }
 
@@ -3998,6 +4007,62 @@ export class TaskOrchestrator {
     result: WorkerResult,
   ): WorkerResult {
     return this.#store.saveWorkerResult(taskId, runId, result);
+  }
+
+  createIntegrationCoordinator(input: {
+    parentTaskId: string;
+    sourceSessionId: string;
+    objective: string;
+  }): { task: TaskRecord; run: RunRecord } {
+    const parent = this.#store.getTask(input.parentTaskId);
+    if (!parent || parent.kind === "worker" || parent.kind === "integration") {
+      throw new Error("Integration Task 只能由 Orchestrator 为主任务创建");
+    }
+    if (!parent.workspacePath) throw new Error("Integration Task 缺少项目工作区");
+    const task = this.#store.createTask({
+      workspaceId: parent.workspaceId,
+      workspacePath: parent.workspacePath,
+      kind: "integration",
+      title: `Integration：${input.objective.slice(0, 120)}`,
+      goal: input.objective,
+      parentTaskId: parent.id,
+      assignedProfile: "integration-runner",
+      systemCreated: true,
+      priority: parent.priority,
+      execution: {
+        type: "agent-prompt",
+        sourceSessionId: input.sourceSessionId,
+        preferFork: false,
+        deliveryMode: "background",
+      },
+    });
+    const run = this.#store.createRun(task.id, "worktree-integration");
+    const boundRun = this.#store.bindRun(task.id, run.id, {
+      sessionId: input.sourceSessionId,
+    });
+    return { task: this.#store.getTask(task.id)!, run: boundRun };
+  }
+
+  finishIntegrationCoordinator(
+    taskId: string,
+    runId: string,
+    status: "succeeded" | "failed" | "cancelled",
+    error?: string,
+  ): void {
+    this.#store.finishRun(taskId, runId, status, error);
+  }
+
+  failActiveTask(taskId: string, error: string): void {
+    const active = this.#active.get(taskId);
+    if (!active) throw new Error("任务当前没有活动 Run");
+    this.#store.finishRun(taskId, active.runId, "failed", error);
+    active.controller.abort();
+    void active.handle?.cancel().catch(() => undefined);
+  }
+
+  pauseIntegrationCoordinator(taskId: string, runId: string): void {
+    this.#store.requestPause(taskId);
+    this.#store.finishPausedRun(taskId, runId);
   }
 
   awaitIntegrationDecision(input: {

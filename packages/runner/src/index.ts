@@ -183,14 +183,20 @@ export class WorktreeRunner {
   readonly #workspace: string;
   readonly #worktreesRoot: string;
   readonly #timeoutMs: number;
+  readonly #beforePatchApply: (() => void | Promise<void>) | undefined;
 
   constructor(
     workspace: string,
-    options: { worktreesRoot: string; timeoutMs?: number },
+    options: {
+      worktreesRoot: string;
+      timeoutMs?: number;
+      beforePatchApply?: () => void | Promise<void>;
+    },
   ) {
     this.#workspace = resolve(workspace);
     this.#worktreesRoot = resolve(options.worktreesRoot);
     this.#timeoutMs = options.timeoutMs ?? defaultTimeoutMs;
+    this.#beforePatchApply = options.beforePatchApply;
   }
 
   async inspectRepository(): Promise<RepositoryDescriptor> {
@@ -795,6 +801,7 @@ export class WorktreeRunner {
         this.#timeoutMs,
       );
       try {
+        await this.#beforePatchApply?.();
         await git(repository.repositoryRoot, ["apply", "--binary", patchFile], this.#timeoutMs);
       } catch (error) {
         for (const path of changes.flatMap((change) => change.paths)) {

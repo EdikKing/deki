@@ -1826,6 +1826,8 @@ class DesktopController {
     let baseline;
     let integrationResource: WorktreeResource;
     let allocatedIntegration: WorktreeResource | undefined;
+    let integrationCoordinator:
+      ReturnType<TaskOrchestrator["createIntegrationCoordinator"]> | undefined;
     try {
       baseline = await runner.createBaseline(
         `Deki write batch ${context.taskId}`,
@@ -1867,6 +1869,11 @@ class DesktopController {
         },
       });
       taskStore!.updateRunnerResource(integrationResource.id, "active");
+      integrationCoordinator = this.#tasks.createIntegrationCoordinator({
+        parentTaskId: context.taskId,
+        sourceSessionId: context.sessionId,
+        objective: `集成 ${requests.length} 个隔离 Implementer 的提交`,
+      });
     } catch (error) {
       if (allocatedIntegration) {
         try {
@@ -1886,9 +1893,11 @@ class DesktopController {
     const integration = taskStore!.createIntegration({
       rootTaskId: taskStore!.getTask(context.taskId)!.rootTaskId,
       taskId: context.taskId,
+      integrationTaskId: integrationCoordinator.task.id,
       baselineCommit: baseline.commit,
       predictedOverlaps: [...new Set(predictedOverlaps)],
       workerTaskIds: [],
+      validationTargets: requests.flatMap((request) => request.validationTargets),
     });
     const settings = this.#settings.snapshot().effective.agent;
     const hasHighRiskStep = requests.some((request) => {
@@ -2082,10 +2091,22 @@ class DesktopController {
                 metadata: { ref: headRef, commit: head.commit },
               });
               conflictArtifactIds.push(headArtifactId);
+              const pausedReason = `重大集成冲突需要重新派发或修订计划：${inspection.files
+                .map((file) => `${file.path} (${file.reasons.join("；")})`)
+                .join(", ")}`;
+              taskStore!.updateIntegration(integration.id, {
+                status: "paused",
+                integrationCommit: head.commit,
+                commitArtifactId: headArtifactId,
+                pausedReason,
+              });
+              this.#tasks.pauseIntegrationCoordinator(
+                integrationCoordinator.task.id,
+                integrationCoordinator.run.id,
+              );
+              await this.#tasks.pauseTask(context.taskId);
               throw new Error(
-                `重大集成冲突已暂停：${inspection.files
-                  .map((file) => `${file.path} (${file.reasons.join("；")})`)
-                  .join(", ")}`,
+                pausedReason,
               );
             }
             const guard = await runner.captureIntegratorGuard(
@@ -2163,6 +2184,103 @@ class DesktopController {
       const cleanOverlapFiles = [...actualOverlaps].filter(
         (path) => !resolvedConflictPaths.has(path),
       );
+      const unsafeCleanOverlapFiles = cleanOverlapFiles.filter((path) =>
+        hasHighRiskStep
+        || normalized.some(({ request }) => request.writeSet.some((entry) =>
+          entry.exclusive
+          && (
+            entry.path === path
+            || (entry.kind === "directory" && path.startsWith(`${entry.path}/`))
+          ))));
+      if (unsafeCleanOverlapFiles.length > 0) {
+        const head = await runner.integrationPatch(integrationResource, baseline.commit);
+        const headArtifactId = randomUUID();
+        const headRef = await runner.createArtifactRef(headArtifactId, head.commit);
+        taskStore!.createArtifact({
+          id: headArtifactId,
+          taskId: context.taskId,
+          runId: context.runId,
+          kind: "commit",
+          title: `Paused Integration ${head.commit.slice(0, 12)}`,
+          content: head.commit,
+          metadata: {
+            ref: headRef,
+            commit: head.commit,
+            exclusiveOverlap: unsafeCleanOverlapFiles,
+          },
+        });
+        const patchArtifactId = randomUUID();
+        const patchFile = await artifactStore.write(
+          this.#scopeId,
+          taskStore!.getTask(context.taskId)!.rootTaskId,
+          patchArtifactId,
+          "patch",
+          head.patch,
+        );
+        taskStore!.createArtifact({
+          id: patchArtifactId,
+          taskId: context.taskId,
+          runId: context.runId,
+          kind: "patch",
+          title: "Paused Integration Patch",
+          uri: patchFile.uri,
+          metadata: {
+            sha256: patchFile.sha256,
+            size: patchFile.size,
+            baselineCommit: baseline.commit,
+            integrationCommit: head.commit,
+            changedFiles: head.changedFiles,
+          },
+        });
+        const evidenceId = randomUUID();
+        const evidence = JSON.stringify({
+          type: hasHighRiskStep ? "high-risk-overlap" : "exclusive-overlap",
+          files: unsafeCleanOverlapFiles,
+        }, null, 2);
+        const evidenceFile = await artifactStore.write(
+          this.#scopeId,
+          taskStore!.getTask(context.taskId)!.rootTaskId,
+          evidenceId,
+          "json",
+          evidence,
+        );
+        taskStore!.createArtifact({
+          id: evidenceId,
+          taskId: context.taskId,
+          runId: context.runId,
+          kind: "evidence",
+          title: "Restricted Integration Overlap",
+          uri: evidenceFile.uri,
+          metadata: {
+            sha256: evidenceFile.sha256,
+            size: evidenceFile.size,
+            files: unsafeCleanOverlapFiles,
+            highRisk: hasHighRiskStep,
+          },
+        });
+        conflictArtifactIds.push(evidenceId, headArtifactId, patchArtifactId);
+        const pausedReason = hasHighRiskStep
+          ? `高风险步骤存在真实文件重叠：${unsafeCleanOverlapFiles.join(", ")}`
+          : `exclusive 写入范围存在真实文件重叠：${unsafeCleanOverlapFiles.join(", ")}`;
+        taskStore!.updateIntegration(integration.id, {
+          status: "paused",
+          integrationCommit: head.commit,
+          commitArtifactId: headArtifactId,
+          patchArtifactId,
+          actualOverlaps: [...actualOverlaps],
+          conflictFiles: unsafeCleanOverlapFiles,
+          workerTaskIds,
+          integratorTaskIds,
+          conflictArtifactIds,
+          pausedReason,
+        });
+        this.#tasks.pauseIntegrationCoordinator(
+          integrationCoordinator.task.id,
+          integrationCoordinator.run.id,
+        );
+        await this.#tasks.pauseTask(context.taskId);
+        throw new Error(pausedReason);
+      }
       if (cleanOverlapFiles.length > 0) {
         const guard = await runner.captureIntegratorGuard(
           integrationResource,
@@ -2226,46 +2344,6 @@ class DesktopController {
         conflictArtifactIds,
         resolutionSummaries,
       });
-      const validationResults = await runner.validateIntegration(
-        integrationResource,
-        validationTargets,
-      );
-      const validationArtifactIds: string[] = [];
-      for (const validation of validationResults) {
-        const id = randomUUID();
-        const file = await artifactStore.write(
-          this.#scopeId,
-          taskStore!.getTask(context.taskId)!.rootTaskId,
-          id,
-          "log",
-          validation.output,
-        );
-        taskStore!.createArtifact({
-          id,
-          taskId: context.taskId,
-          runId: context.runId,
-          kind: "test-result",
-          title: `Integration ${validation.target.cwd ?? "."}: ${validation.target.script}`,
-          uri: file.uri,
-          metadata: {
-            sha256: file.sha256,
-            size: file.size,
-            target: validation.target,
-            exitCode: validation.exitCode,
-            durationMs: validation.durationMs,
-            timedOut: validation.timedOut,
-          },
-        });
-        validationArtifactIds.push(id);
-      }
-      if (validationResults.some((result) => result.exitCode !== 0)) {
-        taskStore!.updateIntegration(integration.id, {
-          status: "failed",
-          validationArtifactIds,
-          workerTaskIds,
-        });
-        throw new Error("集成验证失败，结果未应用到用户工作区");
-      }
       const finalized = await runner.integrationPatch(
         integrationResource,
         baseline.commit,
@@ -2328,10 +2406,71 @@ class DesktopController {
         content: finalized.commit,
         metadata: { ref: integrationRef, commit: finalized.commit },
       });
+      taskStore!.updateIntegration(integration.id, {
+        integrationCommit: finalized.commit,
+        commitArtifactId: integrationCommitArtifactId,
+        patchArtifactId: patchId,
+        diffArtifactId: diffId,
+      });
+      const validationResults = await runner.validateIntegration(
+        integrationResource,
+        validationTargets,
+      );
+      const validationArtifactIds: string[] = [];
+      for (const validation of validationResults) {
+        const id = randomUUID();
+        const file = await artifactStore.write(
+          this.#scopeId,
+          taskStore!.getTask(context.taskId)!.rootTaskId,
+          id,
+          "log",
+          validation.output,
+        );
+        taskStore!.createArtifact({
+          id,
+          taskId: context.taskId,
+          runId: context.runId,
+          kind: "test-result",
+          title: `Integration ${validation.target.cwd ?? "."}: ${validation.target.script}`,
+          uri: file.uri,
+          metadata: {
+            sha256: file.sha256,
+            size: file.size,
+            target: validation.target,
+            exitCode: validation.exitCode,
+            durationMs: validation.durationMs,
+            timedOut: validation.timedOut,
+          },
+        });
+        validationArtifactIds.push(id);
+      }
+      if (validationResults.some((result) => result.exitCode !== 0)) {
+        taskStore!.updateIntegration(integration.id, {
+          status: "failed",
+          validationArtifactIds,
+          workerTaskIds,
+        });
+        this.#tasks.finishIntegrationCoordinator(
+          integrationCoordinator.task.id,
+          integrationCoordinator.run.id,
+          "failed",
+          "集成验证失败",
+        );
+        this.#tasks.failActiveTask(
+          context.taskId,
+          "集成验证失败，结果未应用到用户工作区",
+        );
+        throw new Error("集成验证失败，结果未应用到用户工作区");
+      }
       taskStore!.updateRunnerResource(integrationResource.id, "cleanup_pending");
       await runner.cleanup(integrationResource);
       cleaned = true;
       taskStore!.updateRunnerResource(integrationResource.id, "cleaned");
+      this.#tasks.finishIntegrationCoordinator(
+        integrationCoordinator.task.id,
+        integrationCoordinator.run.id,
+        "succeeded",
+      );
       taskStore!.updateIntegration(integration.id, {
         status: "awaiting_apply",
         integrationCommit: finalized.commit,
@@ -2425,8 +2564,24 @@ class DesktopController {
       }
     } catch (error) {
       const current = taskStore!.getIntegration(integration.id);
-      if (current && current.status !== "conflicted" && current.status !== "failed") {
+      if (
+        current
+        && current.status !== "conflicted"
+        && current.status !== "paused"
+        && current.status !== "failed"
+      ) {
         taskStore!.updateIntegration(integration.id, { status: "failed" });
+      }
+      const coordinatorTask = taskStore!.getTask(integrationCoordinator.task.id);
+      if (coordinatorTask && !["succeeded", "failed", "cancelled", "paused"].includes(
+        coordinatorTask.status,
+      )) {
+        this.#tasks.finishIntegrationCoordinator(
+          integrationCoordinator.task.id,
+          integrationCoordinator.run.id,
+          batchSignal.aborted ? "cancelled" : "failed",
+          formatError(error),
+        );
       }
       throw error;
     } finally {
@@ -2889,13 +3044,20 @@ function registerIpcHandlers(): void {
       "任务不存在或不能恢复",
     ));
   });
-  ipcMain.handle(IPC_CHANNELS.retryTask, (event, raw) => {
+  ipcMain.handle(IPC_CHANNELS.retryTask, async (event, raw) => {
     assertTrustedSender(event);
     const { taskId } = taskIdInputSchema.parse(raw);
-    return commandResultSchema.parse(runTaskCommandSync(
-      () => taskOrchestrator?.retryTask(taskId),
-      "任务不存在或不能重试",
-    ));
+    try {
+      if (await retryPersistedIntegration(taskId)) {
+        return commandResultSchema.parse({ ok: true });
+      }
+      return commandResultSchema.parse(runTaskCommandSync(
+        () => taskOrchestrator?.retryTask(taskId),
+        "任务不存在或不能重试",
+      ));
+    } catch (error) {
+      return commandResultSchema.parse({ ok: false, error: formatError(error) });
+    }
   });
   ipcMain.handle(IPC_CHANNELS.promoteTask, (event, raw) => {
     assertTrustedSender(event);
@@ -3905,6 +4067,228 @@ async function acquireRepositoryWriteLock(key: string): Promise<() => void> {
     releaseCurrent();
     if (repositoryWriteLocks.get(key) === tail) repositoryWriteLocks.delete(key);
   };
+}
+
+async function retryPersistedIntegration(taskId: string): Promise<boolean> {
+  const detail = taskStore?.getTaskDetail(taskId);
+  const integration = detail?.integration;
+  if (
+    !detail
+    || detail.task.status !== "failed"
+    || integration?.status !== "failed"
+    || !integration.integrationCommit
+    || !integration.patchArtifactId
+    || !integration.diffArtifactId
+    || integration.validationTargets.length === 0
+    || !detail.task.workspacePath
+  ) return false;
+
+  const paths = getDekiPaths();
+  const runner = new WorktreeRunner(detail.task.workspacePath, {
+    worktreesRoot: join(paths.worktreesRoot, detail.task.workspaceId),
+    timeoutMs: 600_000,
+  });
+  const repository = await runner.inspectRepository();
+  const release = await acquireRepositoryWriteLock(repository.commonDirectory);
+  let rootRun: import("@deki-ai/shared").RunRecord | undefined;
+  let coordinatorTaskId = integration.integrationTaskId;
+  let coordinatorRun: import("@deki-ai/shared").RunRecord | undefined;
+  let resource: WorktreeResource | undefined;
+  let allocated: WorktreeResource | undefined;
+  try {
+    taskStore!.requeueTask(taskId, "failed");
+    rootRun = taskStore!.createRun(taskId, "integration-validation-retry");
+    rootRun = taskStore!.bindRun(taskId, rootRun.id, {
+      sessionId: `integration-retry:${taskId}`,
+    });
+
+    const existingCoordinator = coordinatorTaskId
+      ? taskStore!.getTask(coordinatorTaskId)
+      : undefined;
+    if (existingCoordinator?.status === "failed") {
+      taskStore!.requeueTask(existingCoordinator.id, "failed");
+      coordinatorRun = taskStore!.createRun(existingCoordinator.id, "worktree-integration-retry");
+      coordinatorRun = taskStore!.bindRun(existingCoordinator.id, coordinatorRun.id, {
+        sessionId: existingCoordinator.sessionId
+          ?? detail.task.sessionId
+          ?? `integration-retry:${existingCoordinator.id}`,
+      });
+    } else {
+      const created = taskOrchestrator!.createIntegrationCoordinator({
+        parentTaskId: taskId,
+        sourceSessionId: detail.task.sessionId ?? `integration-retry:${taskId}`,
+        objective: "从持久 Commit Artifact 重试集成验证",
+      });
+      coordinatorTaskId = created.task.id;
+      coordinatorRun = created.run;
+    }
+    if (!coordinatorTaskId || !coordinatorRun) {
+      throw new Error("无法创建 Integration Task 重试运行");
+    }
+    taskStore!.updateIntegration(integration.id, {
+      status: "retrying",
+      integrationTaskId: coordinatorTaskId,
+      pausedReason: undefined,
+      cleanupStatus: "pending",
+      cleanupError: undefined,
+    });
+
+    resource = await runner.createWorktree({
+      rootTaskId: detail.task.rootTaskId,
+      resourceId: randomUUID(),
+      kind: "integration",
+      baseCommit: integration.integrationCommit,
+      repository,
+      onAllocated: (candidate) => {
+        allocated = candidate;
+        taskStore!.saveRunnerResource({
+          id: candidate.id,
+          rootTaskId: detail.task.rootTaskId,
+          taskId: coordinatorTaskId!,
+          runId: coordinatorRun!.id,
+          kind: "integration",
+          path: candidate.path,
+          branchRef: candidate.branchRef,
+          baseCommit: candidate.baseCommit,
+          status: "allocating",
+        });
+      },
+    });
+    taskStore!.updateRunnerResource(resource.id, "active");
+    taskStore!.updateIntegration(integration.id, { status: "testing" });
+    const validationResults = await runner.validateIntegration(
+      resource,
+      integration.validationTargets,
+    );
+    const validationArtifactIds: string[] = [];
+    const artifactStore = new ArtifactStore(paths.artifactsRoot);
+    for (const validation of validationResults) {
+      const id = randomUUID();
+      const file = await artifactStore.write(
+        detail.task.workspaceId,
+        detail.task.rootTaskId,
+        id,
+        "log",
+        validation.output,
+      );
+      taskStore!.createArtifact({
+        id,
+        taskId,
+        runId: rootRun.id,
+        kind: "test-result",
+        title: `Integration retry ${validation.target.cwd ?? "."}: ${validation.target.script}`,
+        uri: file.uri,
+        metadata: {
+          sha256: file.sha256,
+          size: file.size,
+          target: validation.target,
+          exitCode: validation.exitCode,
+          durationMs: validation.durationMs,
+          timedOut: validation.timedOut,
+          retry: true,
+        },
+      });
+      validationArtifactIds.push(id);
+    }
+    if (validationResults.some((result) => result.exitCode !== 0)) {
+      taskStore!.updateIntegration(integration.id, {
+        status: "failed",
+        validationArtifactIds,
+      });
+      taskOrchestrator!.finishIntegrationCoordinator(
+        coordinatorTaskId,
+        coordinatorRun.id,
+        "failed",
+        "重试后的集成验证仍然失败",
+      );
+      taskStore!.finishRun(
+        taskId,
+        rootRun.id,
+        "failed",
+        "重试后的集成验证仍然失败",
+      );
+      throw new Error("重试后的集成验证仍然失败，持久产物已保留");
+    }
+
+    taskStore!.updateRunnerResource(resource.id, "cleanup_pending");
+    await runner.cleanup(resource);
+    taskStore!.updateRunnerResource(resource.id, "cleaned");
+    resource = undefined;
+    taskOrchestrator!.finishIntegrationCoordinator(
+      coordinatorTaskId,
+      coordinatorRun.id,
+      "succeeded",
+    );
+    const patchArtifact = taskStore!.getArtifact(integration.patchArtifactId);
+    const changedFiles = Array.isArray(patchArtifact?.metadata.changedFiles)
+      ? patchArtifact.metadata.changedFiles.filter(
+        (value): value is string => typeof value === "string",
+      )
+      : [];
+    taskStore!.updateIntegration(integration.id, {
+      status: "awaiting_apply",
+      validationArtifactIds,
+      cleanupStatus: "cleaned",
+    });
+    taskStore!.setIntegrationAwaitingApply(
+      taskId,
+      rootRun.id,
+      randomUUID(),
+      {
+        integrationId: integration.id,
+        patchArtifactId: integration.patchArtifactId,
+        diffArtifactId: integration.diffArtifactId,
+        validationArtifactIds,
+        changedFiles,
+        baselineCommit: integration.baselineCommit,
+        integrationCommit: integration.integrationCommit,
+        retried: true,
+      },
+    );
+    return true;
+  } catch (error) {
+    const currentIntegration = taskStore!.getIntegration(integration.id);
+    if (
+      currentIntegration
+      && currentIntegration.status !== "failed"
+      && currentIntegration.status !== "awaiting_apply"
+    ) {
+      taskStore!.updateIntegration(integration.id, { status: "failed" });
+    }
+    if (rootRun && taskStore!.getTask(taskId)?.status === "running") {
+      taskStore!.finishRun(taskId, rootRun.id, "failed", formatError(error));
+    }
+    if (
+      coordinatorTaskId
+      && coordinatorRun
+      && taskStore!.getTask(coordinatorTaskId)?.status === "running"
+    ) {
+      taskOrchestrator!.finishIntegrationCoordinator(
+        coordinatorTaskId,
+        coordinatorRun.id,
+        "failed",
+        formatError(error),
+      );
+    }
+    if (allocated && !resource) resource = allocated;
+    throw error;
+  } finally {
+    if (resource) {
+      try {
+        taskStore!.updateRunnerResource(resource.id, "cleanup_pending");
+        await runner.cleanup(resource);
+        taskStore!.updateRunnerResource(resource.id, "cleaned");
+        taskStore!.updateIntegration(integration.id, { cleanupStatus: "cleaned" });
+      } catch (error) {
+        taskStore!.updateRunnerResource(resource.id, "cleanup_failed", formatError(error));
+        taskStore!.updateIntegration(integration.id, {
+          cleanupStatus: "failed",
+          cleanupError: formatError(error),
+        });
+      }
+    }
+    release();
+  }
 }
 
 async function respondToPersistedIntegration(input: {

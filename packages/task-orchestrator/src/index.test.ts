@@ -768,6 +768,56 @@ describe("TaskStore", () => {
 });
 
 describe("TaskOrchestrator", () => {
+  it("creates a coordinator Integration Task for every write batch", async () => {
+    const store = await createStore();
+    const parent = store.createTask({
+      workspaceId: "workspace-a",
+      workspacePath: "/tmp/workspace-a",
+      kind: "background",
+      title: "parent",
+      goal: "integrate",
+      execution: promptExecution(),
+    });
+    const orchestrator = new TaskOrchestrator({
+      store,
+      concurrency: 1,
+      recoverOnStart: false,
+      executor: async () => {
+        throw new Error("coordinator must not start an Agent runtime");
+      },
+    });
+    const coordinator = orchestrator.createIntegrationCoordinator({
+      parentTaskId: parent.id,
+      sourceSessionId: "source-session",
+      objective: "integrate two isolated commits",
+    });
+    expect(store.getTaskDetail(parent.id)?.children).toMatchObject([{
+      task: {
+        id: coordinator.task.id,
+        kind: "integration",
+        assignedProfile: "integration-runner",
+        status: "running",
+      },
+    }]);
+    const integration = store.createIntegration({
+      rootTaskId: parent.id,
+      taskId: parent.id,
+      integrationTaskId: coordinator.task.id,
+      baselineCommit: "a".repeat(40),
+      workerTaskIds: [],
+      validationTargets: [{ script: "test" }],
+    });
+    expect(store.getTaskDetail(parent.id)?.integration).toMatchObject({
+      id: integration.id,
+      integrationTaskId: coordinator.task.id,
+      validationTargets: [{ script: "test" }],
+    });
+    expect(store.getTaskDetail(coordinator.task.id)?.integration?.id).toBe(integration.id);
+    orchestrator.pauseIntegrationCoordinator(coordinator.task.id, coordinator.run.id);
+    expect(store.getTask(coordinator.task.id)?.status).toBe("paused");
+    await orchestrator.dispose();
+  });
+
   it("cancels a persisted awaiting-apply task without a live Agent", async () => {
     const store = await createStore();
     const task = store.createTask({

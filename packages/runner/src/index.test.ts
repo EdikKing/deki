@@ -1,5 +1,15 @@
 import { execFile } from "node:child_process";
-import { access, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  access,
+  lstat,
+  mkdtemp,
+  mkdir,
+  readFile,
+  readlink,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -20,6 +30,22 @@ afterEach(async () => {
 });
 
 describe("WorktreeRunner", () => {
+  it("rejects path injection and marks lockfiles, SQL and migrations exclusive", () => {
+    for (const path of ["../escape", "/absolute", ".git/config", "C:/windows"]) {
+      expect(() => validateWriteSet([{ path, kind: "file", exclusive: false }]))
+        .toThrow("工作区相对路径");
+    }
+    expect(validateWriteSet([
+      { path: "pnpm-lock.yaml", kind: "file", exclusive: false },
+      { path: "db/schema.sql", kind: "file", exclusive: false },
+      { path: "db/migrations", kind: "directory", exclusive: false },
+    ])).toEqual([
+      { path: "pnpm-lock.yaml", kind: "file", exclusive: true },
+      { path: "db/schema.sql", kind: "file", exclusive: true },
+      { path: "db/migrations", kind: "directory", exclusive: true },
+    ]);
+  });
+
   it("captures a dirty baseline without changing HEAD or the index", async () => {
     const fixture = await repository();
     await writeFile(join(fixture.repo, "tracked.txt"), "dirty\n");
@@ -38,6 +64,42 @@ describe("WorktreeRunner", () => {
       .toBe("dirty\n");
     expect((await git(fixture.repo, "show", `${baseline.commit}:untracked.txt`)).stdout)
       .toBe("untracked\n");
+  });
+
+  it("maps a repository subdirectory workspace into every isolated worktree", async () => {
+    const fixture = await repository();
+    const workspace = join(fixture.repo, "packages", "app");
+    await mkdir(workspace, { recursive: true });
+    await writeFile(join(workspace, "package.json"), JSON.stringify({
+      scripts: { test: "node -e \"process.exit(0)\"" },
+    }));
+    await writeFile(join(workspace, "module.txt"), "workspace base\n");
+    await git(fixture.repo, "add", "-A");
+    await git(fixture.repo, "-c", "user.name=Fixture", "-c",
+      "user.email=fixture@example.com", "commit", "-m", "workspace");
+    await writeFile(join(workspace, "dirty.txt"), "dirty baseline\n");
+    const before = await snapshot(fixture.repo);
+    const runner = new WorktreeRunner(workspace, { worktreesRoot: fixture.worktrees });
+    const baseline = await runner.createBaseline("subdirectory baseline");
+    expect(baseline.repository.workspaceRelativePath).toBe("packages/app");
+    expect(await snapshot(fixture.repo)).toEqual(before);
+    const resource = await runner.createWorktree({
+      rootTaskId: "root-task",
+      resourceId: "subdirectory-worker",
+      kind: "worker",
+      baseCommit: baseline.commit,
+      repository: baseline.repository,
+    });
+    expect(resource.cwd).toBe(join(resource.path, "packages", "app"));
+    await writeFile(join(resource.cwd, "module.txt"), "implemented\n");
+    const result = await runner.finalizeImplementer({
+      resource,
+      writeSet: [{ path: "module.txt", kind: "file", exclusive: false }],
+      validationTargets: [{ script: "test" }],
+    });
+    expect(result.changedFiles).toEqual(["module.txt"]);
+    expect(result.commit).toMatch(/^[0-9a-f]{40}$/);
+    await runner.cleanup(resource);
   });
 
   it("finalizes scoped changes and preserves a commit after worktree cleanup", async () => {
@@ -86,6 +148,27 @@ describe("WorktreeRunner", () => {
     });
     expect(callbackObservedMissingPath).toBe(true);
     await runner.cleanup(resource);
+  });
+
+  it("rescues an uncommitted patch and cleans a recorded resource idempotently", async () => {
+    const fixture = await repository();
+    const runner = new WorktreeRunner(fixture.repo, { worktreesRoot: fixture.worktrees });
+    const baseline = await runner.createBaseline("recovery baseline");
+    const resource = await runner.createWorktree({
+      rootTaskId: "root-task",
+      resourceId: "recovery-worker",
+      kind: "worker",
+      baseCommit: baseline.commit,
+      repository: baseline.repository,
+    });
+    await writeFile(join(resource.cwd, "tracked.txt"), "recover me\n");
+    expect(await runner.rescuePatch(resource)).toMatchObject({
+      changedFiles: ["tracked.txt"],
+      patch: expect.stringContaining("+recover me"),
+    });
+    await runner.cleanup(resource);
+    await runner.cleanup(resource);
+    await expect(access(resource.path)).rejects.toThrow();
   });
 
   it("rejects out-of-scope changes", async () => {
@@ -164,6 +247,110 @@ describe("WorktreeRunner", () => {
     expect(await readFile(join(fixture.repo, "tracked.txt"), "utf8")).toBe("approved\n");
     expect((await git(fixture.repo, "rev-parse", "HEAD")).stdout).toBe(beforeHead);
     expect((await git(fixture.repo, "diff", "--cached")).stdout).toBe(beforeIndex);
+    await runner.cleanup(resource);
+  });
+
+  it("rolls back every affected path when apply fails after preflight", async () => {
+    const fixture = await repository();
+    const baselineRunner = new WorktreeRunner(fixture.repo, {
+      worktreesRoot: fixture.worktrees,
+    });
+    const baseline = await baselineRunner.createBaseline("rollback baseline");
+    const resource = await baselineRunner.createWorktree({
+      rootTaskId: "root-task",
+      resourceId: "rollback-integration",
+      kind: "integration",
+      baseCommit: baseline.commit,
+      repository: baseline.repository,
+    });
+    await writeFile(join(resource.cwd, "tracked.txt"), "integrated\n");
+    await writeFile(join(resource.cwd, "created.txt"), "created\n");
+    await git(resource.path, "add", "-A");
+    await git(resource.path, "-c", "user.name=Deki", "-c", "user.email=test@deki.local",
+      "commit", "-m", "integration");
+    const integrated = await baselineRunner.integrationPatch(resource, baseline.commit);
+    const runner = new WorktreeRunner(fixture.repo, {
+      worktreesRoot: fixture.worktrees,
+      beforePatchApply: async () => {
+        await writeFile(join(fixture.repo, "tracked.txt"), "raced edit\n");
+      },
+    });
+    await expect(runner.applyPatch({
+      baselineCommit: baseline.commit,
+      integrationCommit: integrated.commit,
+      patch: integrated.patch,
+    })).rejects.toThrow();
+    expect(await readFile(join(fixture.repo, "tracked.txt"), "utf8")).toBe("base\n");
+    await expect(access(join(fixture.repo, "created.txt"))).rejects.toThrow();
+    await baselineRunner.cleanup(resource);
+  });
+
+  it("applies deletes, renames and symlinks without touching the index", async () => {
+    const fixture = await repository();
+    await writeFile(join(fixture.repo, "delete-me.txt"), "delete\n");
+    await writeFile(join(fixture.repo, "rename-me.txt"), "rename\n");
+    await git(fixture.repo, "add", "-A");
+    await git(fixture.repo, "-c", "user.name=Fixture", "-c",
+      "user.email=fixture@example.com", "commit", "-m", "paths");
+    const runner = new WorktreeRunner(fixture.repo, { worktreesRoot: fixture.worktrees });
+    const baseline = await runner.createBaseline("path baseline");
+    const resource = await runner.createWorktree({
+      rootTaskId: "root-task",
+      resourceId: "path-integration",
+      kind: "integration",
+      baseCommit: baseline.commit,
+      repository: baseline.repository,
+    });
+    await rm(join(resource.cwd, "delete-me.txt"));
+    await git(resource.path, "mv", "rename-me.txt", "renamed.txt");
+    await symlink("tracked.txt", join(resource.cwd, "tracked-link"));
+    await git(resource.path, "add", "-A");
+    await git(resource.path, "-c", "user.name=Deki", "-c", "user.email=test@deki.local",
+      "commit", "-m", "path integration");
+    const integrated = await runner.integrationPatch(resource, baseline.commit);
+    const beforeIndex = (await git(fixture.repo, "diff", "--cached")).stdout;
+    await runner.applyPatch({
+      baselineCommit: baseline.commit,
+      integrationCommit: integrated.commit,
+      patch: integrated.patch,
+    });
+    await expect(access(join(fixture.repo, "delete-me.txt"))).rejects.toThrow();
+    await expect(access(join(fixture.repo, "rename-me.txt"))).rejects.toThrow();
+    expect(await readFile(join(fixture.repo, "renamed.txt"), "utf8")).toBe("rename\n");
+    expect((await lstat(join(fixture.repo, "tracked-link"))).isSymbolicLink()).toBe(true);
+    expect(await readlink(join(fixture.repo, "tracked-link"))).toBe("tracked.txt");
+    expect((await git(fixture.repo, "diff", "--cached")).stdout).toBe(beforeIndex);
+    await runner.cleanup(resource);
+  });
+
+  it("rejects baselines during an in-progress merge and write sets inside submodules", async () => {
+    const fixture = await repository();
+    const runner = new WorktreeRunner(fixture.repo, { worktreesRoot: fixture.worktrees });
+    await writeFile(join(fixture.repo, ".git", "MERGE_HEAD"), "a".repeat(40));
+    await expect(runner.createBaseline("merge baseline")).rejects.toThrow("MERGE_HEAD");
+    await rm(join(fixture.repo, ".git", "MERGE_HEAD"));
+    await writeFile(join(fixture.repo, ".gitmodules"), [
+      "[submodule \"vendor/lib\"]",
+      "\tpath = vendor/lib",
+      "\turl = ../lib",
+      "",
+    ].join("\n"));
+    await git(fixture.repo, "add", ".gitmodules");
+    await git(fixture.repo, "-c", "user.name=Fixture", "-c",
+      "user.email=fixture@example.com", "commit", "-m", "submodule declaration");
+    const baseline = await runner.createBaseline("submodule baseline");
+    const resource = await runner.createWorktree({
+      rootTaskId: "root-task",
+      resourceId: "submodule-worker",
+      kind: "worker",
+      baseCommit: baseline.commit,
+      repository: baseline.repository,
+    });
+    await expect(runner.finalizeImplementer({
+      resource,
+      writeSet: [{ path: "vendor/lib/file.txt", kind: "file", exclusive: false }],
+      validationTargets: [{ script: "test" }],
+    })).rejects.toThrow("submodule");
     await runner.cleanup(resource);
   });
 

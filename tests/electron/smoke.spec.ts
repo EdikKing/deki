@@ -217,6 +217,7 @@ test("shows Plan progress and previews persisted artifacts inside Task Center", 
 // Playwright requires an object-destructured fixtures parameter.
 // eslint-disable-next-line no-empty-pattern
 test("runs a real Plan revision and replan flow through an OpenAI-compatible fixture", async ({}) => {
+  test.setTimeout(60_000);
   const temporaryHome = await mkdtemp(resolve(tmpdir(), "deki-electron-plan-flow-"));
   const workspace = await mkdtemp(resolve(tmpdir(), "deki-electron-plan-workspace-"));
   const modelServer = await startFixtureModelServer();
@@ -251,7 +252,7 @@ test("runs a real Plan revision and replan flow through an OpenAI-compatible fix
     await composer.getByRole("group", { name: "交互模式" })
       .getByRole("button", { name: "规划" }).click();
     await composer.locator(".composer-input").fill("创建一个会触发重新规划的单步骤计划");
-    await composer.getByRole("button", { name: "发送" }).click();
+    await composer.getByRole("button", { name: "生成计划", exact: true }).click();
 
     const panel = window.getByTestId("plan-panel");
     await expect(panel).toBeVisible();
@@ -352,6 +353,61 @@ test("runs two real read-only Workers and renders their Agent Tree", async ({}) 
 
 // Playwright requires an object-destructured fixtures parameter.
 // eslint-disable-next-line no-empty-pattern
+test("keeps M4 read-only Worker behavior in a non-Git workspace", async ({}) => {
+  const temporaryHome = await mkdtemp(resolve(tmpdir(), "deki-electron-nongit-home-"));
+  const workspace = await mkdtemp(resolve(tmpdir(), "deki-electron-nongit-workspace-"));
+  const modelServer = await startFixtureModelServer();
+  await seedChineseSettings(temporaryHome, { agent: { maxConcurrentRuns: 2 } });
+  await seedFixtureModel(temporaryHome, modelServer.baseUrl);
+  await writeFile(join(workspace, "README.md"), "non-git worker fixture\n");
+  const electronApp = await electron.launch({
+    executablePath: electronPath,
+    args: createElectronArguments(temporaryHome, "--workspace", workspace),
+    env: createTestEnvironment(temporaryHome),
+  });
+
+  try {
+    const window = await electronApp.firstWindow();
+    await window.getByRole("button", { name: /信任并继续|Trust and continue/ }).click();
+    await expect(
+      window.locator(".composer-card").getByRole("button", { name: "选择模型" }),
+    ).toContainText("Fixture Model");
+    const submission = await window.evaluate(
+      () => (globalThis as unknown as { deki: DekiDesktopApi }).deki.sendPrompt(
+        "测试多 Agent 只读调查",
+        { mode: "background", interactionMode: "act" },
+      ),
+    );
+    expect(submission.ok, JSON.stringify(submission)).toBe(true);
+    await window.getByTestId("open-task-center").click();
+    const row = window.locator(".task-row").filter({ hasText: "测试多 Agent 只读调查" });
+    await expect(row).toContainText("2/2", { timeout: 20_000 });
+    await row.click();
+    await expect(window.locator(".task-status-pill")).toHaveText("已完成", {
+      timeout: 20_000,
+    });
+    const detail = await window.evaluate(async () => {
+      const api = (globalThis as unknown as { deki: DekiDesktopApi }).deki;
+      const summary = (await api.listTasks({
+        query: "测试多 Agent 只读调查",
+        limit: 10,
+      })).find((candidate) => candidate.task.kind === "background");
+      return summary ? api.getTask(summary.task.id) : null;
+    });
+    expect(detail?.children).toHaveLength(2);
+    expect(detail?.children.every((child) => child.task.kind === "worker")).toBe(true);
+    expect(await readFile(join(workspace, "README.md"), "utf8"))
+      .toBe("non-git worker fixture\n");
+  } finally {
+    await electronApp.close();
+    await modelServer.close();
+    await rm(temporaryHome, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+// Playwright requires an object-destructured fixtures parameter.
+// eslint-disable-next-line no-empty-pattern
 test("runs two isolated Implementers and applies only after final approval", async ({}) => {
   test.setTimeout(60_000);
   const temporaryHome = await mkdtemp(resolve(tmpdir(), "deki-electron-implementer-flow-"));
@@ -426,6 +482,100 @@ test("runs two isolated Implementers and applies only after final approval", asy
 
 // Playwright requires an object-destructured fixtures parameter.
 // eslint-disable-next-line no-empty-pattern
+test("keeps failed integration artifacts and retries validation from its commit", async ({}) => {
+  test.setTimeout(60_000);
+  const temporaryHome = await mkdtemp(resolve(tmpdir(), "deki-electron-retry-home-"));
+  const workspace = await mkdtemp(resolve(tmpdir(), "deki-electron-retry-workspace-"));
+  const validationMarker = join(temporaryHome, "allow-integration-validation");
+  const modelServer = await startFixtureModelServer();
+  await seedChineseSettings(temporaryHome, { agent: { maxConcurrentRuns: 2 } });
+  await seedFixtureModel(temporaryHome, modelServer.baseUrl);
+  await writeFile(join(workspace, "validate.cjs"), [
+    "const fs = require('node:fs');",
+    "const both = fs.existsSync('alpha.txt') && fs.existsSync('beta.txt');",
+    `process.exit(both && !fs.existsSync(${JSON.stringify(validationMarker)}) ? 1 : 0);`,
+    "",
+  ].join("\n"));
+  await writeFile(join(workspace, "package.json"), JSON.stringify({
+    name: "integration-retry-fixture",
+    private: true,
+    scripts: { test: "node validate.cjs" },
+  }));
+  await execFileAsync("git", ["init"], { cwd: workspace });
+  await execFileAsync("git", ["add", "-A"], { cwd: workspace });
+  await execFileAsync("git", [
+    "-c", "user.name=Deki Test",
+    "-c", "user.email=deki@example.com",
+    "commit", "-m", "fixture",
+  ], { cwd: workspace });
+  const before = await gitWorkspaceSnapshot(workspace);
+  const electronApp = await electron.launch({
+    executablePath: electronPath,
+    args: createElectronArguments(temporaryHome, "--workspace", workspace),
+    env: createTestEnvironment(temporaryHome),
+  });
+
+  try {
+    const window = await electronApp.firstWindow();
+    await window.getByRole("button", { name: /信任并继续|Trust and continue/ }).click();
+    await expect(
+      window.locator(".composer-card").getByRole("button", { name: "选择模型" }),
+    ).toContainText("Fixture Model");
+    const submission = await window.evaluate(
+      () => (globalThis as unknown as { deki: DekiDesktopApi }).deki.sendPrompt(
+        "测试集成验证失败重试",
+        { mode: "background", interactionMode: "act" },
+      ),
+    );
+    expect(submission.ok, JSON.stringify(submission)).toBe(true);
+    await window.getByTestId("open-task-center").click();
+    const row = window.locator(".task-row").filter({ hasText: "测试集成验证失败重试" });
+    await expect(row).toContainText("失败", { timeout: 30_000 });
+    await row.click();
+    await expect(window.getByText("failed", { exact: true })).toBeVisible();
+    await expect(window.getByRole("button", { name: "应用到工作区" })).toHaveCount(0);
+    const detail = await window.evaluate(async () => {
+      const api = (globalThis as unknown as { deki: DekiDesktopApi }).deki;
+      const summary = (await api.listTasks({
+        query: "测试集成验证失败重试",
+        limit: 10,
+      })).find((candidate) => candidate.task.kind === "background");
+      return summary ? api.getTask(summary.task.id) : null;
+    });
+    expect(detail?.integration).toMatchObject({
+      status: "failed",
+      integrationCommit: expect.stringMatching(/^[0-9a-f]{40}$/),
+      patchArtifactId: expect.any(String),
+      diffArtifactId: expect.any(String),
+      commitArtifactId: expect.any(String),
+    });
+    expect(detail?.children.some((child) =>
+      child.task.kind === "integration"
+      && child.task.assignedProfile === "integration-runner")).toBe(true);
+    expect(await gitWorkspaceSnapshot(workspace)).toEqual(before);
+
+    await writeFile(validationMarker, "allow\n");
+    await window.getByRole("button", { name: "重试", exact: true }).click();
+    await expect(window.locator(".task-status-pill")).toHaveText("等待应用", {
+      timeout: 20_000,
+    });
+    await expect(window.getByText("awaiting_apply", { exact: true })).toBeVisible();
+    await expect(window.getByRole("button", { name: "应用到工作区" })).toBeVisible();
+    await window.getByRole("button", { name: "仅保留产物" }).click();
+    await expect(window.locator(".task-status-pill")).toHaveText("已完成", {
+      timeout: 20_000,
+    });
+    expect(await gitWorkspaceSnapshot(workspace)).toEqual(before);
+  } finally {
+    await electronApp.close();
+    await modelServer.close();
+    await rm(temporaryHome, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+// Playwright requires an object-destructured fixtures parameter.
+// eslint-disable-next-line no-empty-pattern
 test("serializes predicted overlap and runs a read-only Integrator review", async ({}) => {
   test.setTimeout(60_000);
   const temporaryHome = await mkdtemp(resolve(tmpdir(), "deki-electron-overlap-flow-"));
@@ -480,6 +630,80 @@ test("serializes predicted overlap and runs a read-only Integrator review", asyn
       timeout: 20_000,
     });
     expect(await readFile(join(workspace, "overlap.txt"), "utf8")).toBe("base\n");
+  } finally {
+    await electronApp.close();
+    await modelServer.close();
+    await rm(temporaryHome, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+// Playwright requires an object-destructured fixtures parameter.
+// eslint-disable-next-line no-empty-pattern
+test("pauses exclusive real overlap without silently choosing a result", async ({}) => {
+  test.setTimeout(60_000);
+  const temporaryHome = await mkdtemp(resolve(tmpdir(), "deki-electron-conflict-home-"));
+  const workspace = await mkdtemp(resolve(tmpdir(), "deki-electron-conflict-workspace-"));
+  const modelServer = await startFixtureModelServer();
+  await seedChineseSettings(temporaryHome, { agent: { maxConcurrentRuns: 2 } });
+  await seedFixtureModel(temporaryHome, modelServer.baseUrl);
+  await writeFile(join(workspace, "package.json"), JSON.stringify({
+    name: "exclusive-conflict-fixture",
+    private: true,
+    scripts: { test: "node -e \"process.exit(0)\"" },
+  }));
+  await writeFile(join(workspace, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
+  await execFileAsync("git", ["init"], { cwd: workspace });
+  await execFileAsync("git", ["add", "-A"], { cwd: workspace });
+  await execFileAsync("git", [
+    "-c", "user.name=Deki Test",
+    "-c", "user.email=deki@example.com",
+    "commit", "-m", "fixture",
+  ], { cwd: workspace });
+  const before = await gitWorkspaceSnapshot(workspace);
+  const electronApp = await electron.launch({
+    executablePath: electronPath,
+    args: createElectronArguments(temporaryHome, "--workspace", workspace),
+    env: createTestEnvironment(temporaryHome),
+  });
+
+  try {
+    const window = await electronApp.firstWindow();
+    await window.getByRole("button", { name: /信任并继续|Trust and continue/ }).click();
+    await expect(
+      window.locator(".composer-card").getByRole("button", { name: "选择模型" }),
+    ).toContainText("Fixture Model");
+    const submission = await window.evaluate(
+      () => (globalThis as unknown as { deki: DekiDesktopApi }).deki.sendPrompt(
+        "测试 exclusive 重叠安全暂停",
+        { mode: "background", interactionMode: "act" },
+      ),
+    );
+    expect(submission.ok, JSON.stringify(submission)).toBe(true);
+    await window.getByTestId("open-task-center").click();
+    const row = window.locator(".task-row").filter({ hasText: "测试 exclusive 重叠安全暂停" });
+    await expect(row).toContainText("已暂停", { timeout: 30_000 });
+    await row.click();
+    await expect(window.getByText(/paused ·/)).toBeVisible();
+    await expect(window.getByText(/exclusive 写入范围存在真实文件重叠/)).toBeVisible();
+    await expect(window.getByRole("button", { name: "应用到工作区" })).toHaveCount(0);
+    const detail = await window.evaluate(async () => {
+      const api = (globalThis as unknown as { deki: DekiDesktopApi }).deki;
+      const summary = (await api.listTasks({
+        query: "测试 exclusive 重叠安全暂停",
+        limit: 10,
+      })).find((candidate) => candidate.task.kind === "background");
+      return summary ? api.getTask(summary.task.id) : null;
+    });
+    expect(detail?.integration).toMatchObject({
+      status: "paused",
+      conflictFiles: ["pnpm-lock.yaml"],
+      commitArtifactId: expect.any(String),
+    });
+    expect(detail?.integration?.conflictArtifactIds.length).toBeGreaterThanOrEqual(2);
+    expect(await readFile(join(workspace, "pnpm-lock.yaml"), "utf8"))
+      .toBe("lockfileVersion: '9.0'\n");
+    expect(await gitWorkspaceSnapshot(workspace)).toEqual(before);
   } finally {
     await electronApp.close();
     await modelServer.close();
@@ -1274,6 +1498,40 @@ function fixtureCompletion(
   text: string;
   tool?: { name: string; arguments: Record<string, unknown> };
 } {
+  if (prompt.includes("测试 exclusive 重叠安全暂停")) {
+    if (calledTools.includes("worker__delegate")) {
+      return { text: "Exclusive overlap was paused for explicit replanning." };
+    }
+    return {
+      text: "",
+      tool: {
+        name: "worker__delegate",
+        arguments: {
+          requests: [{
+            profile: "implementer",
+            objective: "第一阶段更新 pnpm-lock.yaml",
+            successCriteria: ["lockfile 第一阶段更新完成"],
+            constraints: ["只修改 pnpm-lock.yaml"],
+            knownFacts: [],
+            fileHints: ["pnpm-lock.yaml"],
+            symbolHints: [],
+            writeSet: [{ path: "pnpm-lock.yaml", kind: "file" }],
+            validationTargets: [{ script: "test" }],
+          }, {
+            profile: "implementer",
+            objective: "第二阶段更新 pnpm-lock.yaml",
+            successCriteria: ["lockfile 第二阶段更新完成"],
+            constraints: ["只修改 pnpm-lock.yaml"],
+            knownFacts: [],
+            fileHints: ["pnpm-lock.yaml"],
+            symbolHints: [],
+            writeSet: [{ path: "pnpm-lock.yaml", kind: "file" }],
+            validationTargets: [{ script: "test" }],
+          }],
+        },
+      },
+    };
+  }
   if (prompt.includes("测试预测重叠和 Integrator 审查")) {
     if (calledTools.includes("worker__delegate")) {
       return { text: "Overlapping implementations reviewed by Integrator." };
@@ -1308,7 +1566,10 @@ function fixtureCompletion(
       },
     };
   }
-  if (prompt.includes("测试隔离 Implementer 最终审批")) {
+  if (
+    prompt.includes("测试隔离 Implementer 最终审批")
+    || prompt.includes("测试集成验证失败重试")
+  ) {
     if (calledTools.includes("worker__delegate")) {
       return { text: "Isolated implementation integrated after user delivery decision." };
     }
@@ -1344,12 +1605,17 @@ function fixtureCompletion(
   }
   if (prompt.includes("你是 Implementer")) {
     const overlap = prompt.includes("\"path\":\"overlap.txt\"");
-    const alpha = !overlap && prompt.includes("\"path\":\"alpha.txt\"");
-    const target = overlap ? "overlap.txt" : alpha ? "alpha.txt" : "beta.txt";
-    const content = overlap
+    const exclusive = prompt.includes("\"path\":\"pnpm-lock.yaml\"");
+    const alpha = !overlap && !exclusive && prompt.includes("\"path\":\"alpha.txt\"");
+    const target = overlap
+      ? "overlap.txt"
+      : exclusive
+        ? "pnpm-lock.yaml"
+        : alpha ? "alpha.txt" : "beta.txt";
+    const content = overlap || exclusive
       ? prompt.includes("第二阶段")
-        ? "second implementation\n"
-        : "first implementation\n"
+        ? exclusive ? "lockfileVersion: '9.0'\nsecond: true\n" : "second implementation\n"
+        : exclusive ? "lockfileVersion: '9.0'\nfirst: true\n" : "first implementation\n"
       : `${alpha ? "alpha" : "beta"} implemented\n`;
     if (!calledTools.includes("workspace__write")) {
       return {

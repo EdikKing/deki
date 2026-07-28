@@ -439,6 +439,12 @@ export function TaskCenter(props: TaskCenterProps) {
                         : props.zh ? "已审查冲突：" : "Reviewed conflicts: "}
                       {detail.integration.conflictFiles.join("；")}</p>
                   )}
+                  {detail.integration.pausedReason && (
+                    <p className="error">
+                      {props.zh ? "集成已安全暂停：" : "Integration safely paused: "}
+                      {detail.integration.pausedReason}
+                    </p>
+                  )}
                   {detail.integration.resolutionSummaries.map((summary, index) => (
                     <p key={`${index}-${summary.slice(0, 20)}`}>
                       {props.zh ? "Integrator 说明：" : "Integrator note: "}{summary}

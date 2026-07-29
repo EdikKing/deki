@@ -2895,6 +2895,9 @@ export class TaskStore {
     const planRevision = plan
       ? plan.executingRevision ?? plan.approvedRevision
       : undefined;
+    const planFailureReason = plan && status === "failed"
+      ? (error ?? "计划执行任务失败").slice(0, 10_000)
+      : undefined;
     if (plan && status === "succeeded") {
       const revision = planRevision;
       if (!revision) throw new Error("计划没有可完成的执行版本");
@@ -2935,7 +2938,7 @@ export class TaskStore {
         runId,
         task.sessionId,
       ));
-      if (plan && planRevision && status === "failed") {
+      if (plan && planRevision && planFailureReason !== undefined) {
         const runningStates = this.#listPlanStepStates(plan.id, planRevision)
           .filter((state) => state.status === "running");
         for (const state of runningStates) {
@@ -2944,7 +2947,7 @@ export class TaskStore {
             SET status = 'blocked', reason = ?, updated_at = ?
             WHERE plan_id = ? AND revision = ? AND step_id = ? AND status = 'running'
           `).run(
-            error ?? "计划执行任务失败",
+            planFailureReason,
             now,
             plan.id,
             planRevision,
@@ -2956,7 +2959,7 @@ export class TaskStore {
             {
               revision: planRevision,
               stepId: state.stepId,
-              reason: error ?? "计划执行任务失败",
+              reason: planFailureReason,
             },
             taskId,
             runId,

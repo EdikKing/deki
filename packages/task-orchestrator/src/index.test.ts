@@ -567,6 +567,56 @@ describe("TaskStore", () => {
     store.close();
   });
 
+  it("keeps a failed Plan readable when the execution error exceeds the step reason limit", async () => {
+    const store = await createStore();
+    const planning = store.createTask({
+      workspaceId: "workspace-a",
+      kind: "planning",
+      title: "plan",
+      goal: "plan",
+      execution: { ...promptExecution(), interactionMode: "plan" },
+    });
+    const plan = store.createPlan({
+      workspaceId: "workspace-a",
+      sessionId: "session-plan",
+      planningTaskId: planning.id,
+      goal: "plan",
+      assumptions: [],
+      constraints: [],
+      steps: planSteps(),
+    });
+    succeedPlanningTask(store, planning.id);
+    const execution = store.approvePlan(plan.id, 1, {
+      title: "execute",
+      execution: {
+        ...promptExecution(true),
+        interactionMode: "plan-execution",
+        planId: plan.id,
+        planRevision: 1,
+      },
+    });
+    const run = store.createRun(execution.id);
+    store.bindRun(execution.id, run.id, { sessionId: "session-execution" });
+    store.updatePlanStep(plan.id, {
+      revision: 1,
+      stepId: "inspect",
+      status: "running",
+      taskId: execution.id,
+      runId: run.id,
+    });
+    const error = `provider failure: ${"x".repeat(12_000)}`;
+
+    store.finishRun(execution.id, run.id, "failed", error);
+
+    const failedPlan = store.getPlan(plan.id)!;
+    const failedStep = failedPlan.stepStates.find((state) => state.stepId === "inspect");
+    expect(failedStep).toMatchObject({ status: "blocked" });
+    expect(failedStep?.reason).toHaveLength(10_000);
+    expect(failedStep?.reason).toBe(error.slice(0, 10_000));
+    expect(store.getTaskDetail(execution.id)?.runs.at(-1)?.error).toBe(error);
+    store.close();
+  });
+
   it("interrupts active rows on recovery and leaves queued tasks intact", async () => {
     const database = await createDatabasePath();
     const first = new TaskStore(database);

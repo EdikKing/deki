@@ -12,6 +12,7 @@ import type {
   DekiSettings,
   DataUsage,
   AuditRecordSummary,
+  UpdateEvent,
   GitCheckpoint,
   ModelProviderInput,
   McpServerEditor,
@@ -1320,15 +1321,58 @@ function AdvancedSettings({ value, source, zh, update }: SettingsComponentProps)
 }
 
 function AboutSettings({ value, zh, update }: Pick<SettingsComponentProps, "value" | "zh" | "update">) {
-  const [updateMessage, setUpdateMessage] = useState<string>();
+  const [updateEvent, setUpdateEvent] = useState<UpdateEvent | null>(null);
+  useEffect(() => window.deki.subscribeUpdateEvents(setUpdateEvent), []);
+  const checkNow = async () => {
+    setUpdateEvent({ type: "checking" });
+    const result = await window.deki.checkForUpdates();
+    if (!result.ok) {
+      setUpdateEvent({ type: "error", error: result.error });
+    } else if (result.updateAvailable) {
+      setUpdateEvent({ type: "available", version: result.availableVersion ?? undefined });
+    } else {
+      setUpdateEvent({ type: "not-available" });
+    }
+  };
+  let description: string;
+  let extra: ReactNode = null;
+  if (updateEvent) {
+    switch (updateEvent.type) {
+      case "checking":
+        description = zh ? "正在检查更新……" : "Checking for updates…";
+        break;
+      case "available":
+        description = zh ? `发现新版本 ${updateEvent.version}` : `New version ${updateEvent.version} available`;
+        break;
+      case "not-available":
+        description = zh ? "当前已是最新版本" : "Up to date";
+        break;
+      case "downloading":
+        description = zh
+          ? `正在下载 ${updateEvent.percent?.toFixed(1) ?? "?"}%（${formatBytes(updateEvent.transferred ?? 0)} / ${formatBytes(updateEvent.total ?? 0)}）`
+          : `Downloading ${updateEvent.percent?.toFixed(1) ?? "?"}% (${formatBytes(updateEvent.transferred ?? 0)} / ${formatBytes(updateEvent.total ?? 0)})`;
+        extra = <progress className="update-progress" max={100} value={updateEvent.percent ?? 0} />;
+        break;
+      case "downloaded":
+        description = zh ? `已下载 ${updateEvent.version ?? ""}，重启后安装` : `Downloaded ${updateEvent.version ?? ""}, installs on restart`;
+        extra = <button className="primary" onClick={async () => { await window.deki.checkForUpdates(); }}>{zh ? "立即重启" : "Restart now"}</button>;
+        break;
+      case "error":
+        description = updateEvent.error ?? (zh ? "更新检查失败" : "Update check failed");
+        break;
+    }
+  } else {
+    description = zh ? "从 edik-labs/deki 的 GitHub Releases 检查、下载，并在退出后安装。" : "Checks and downloads from edik-labs/deki GitHub Releases, then installs on quit.";
+  }
   return <>
     <div className="about-card"><div className="brand-mark">D</div><div><h2>Deki {DEKI_VERSION}</h2><p>Electron 43.2.0 · Pi SDK 0.82.1 · MCP SDK 1.29.0</p></div></div>
     <Setting title={zh ? "开源许可证" : "Open-source license"} description="AGPL-3.0-or-later" source="product"><span className="value-text">GNU Affero General Public License v3.0 or later</span></Setting>
     <Setting title={zh ? "第三方许可证" : "Third-party licenses"} description={zh ? "根据锁文件自动生成完整依赖清单，并随应用打包。" : "A complete inventory is generated from the lockfile and packaged with the app."} source="product"><button className="ghost" onClick={() => void window.deki.openThirdPartyLicenses()}>{zh ? "打开完整清单" : "Open complete inventory"}</button></Setting>
     <Setting title={zh ? "更新通道" : "Update channel"} description={zh ? "Stable 仅接收正式版；Beta 可接收预发布版本。发布源为 GitHub Releases。" : "Stable receives final releases; Beta can receive prereleases. Updates are served by GitHub Releases."} source="global"><select value={value.updates.channel} onChange={(e) => void update({ updates: { channel: e.target.value as "stable" | "beta" } })}><option value="stable">Stable</option><option value="beta">Beta</option></select></Setting>
-    <Setting title={zh ? "客户端更新" : "Client updates"} description={updateMessage ?? (zh ? "从 edik-labs/deki 的 GitHub Releases 检查、下载，并在退出后安装。" : "Checks and downloads from edik-labs/deki GitHub Releases, then installs on quit.")} source="product"><button className="primary" onClick={async () => { const result = await window.deki.checkForUpdates(); setUpdateMessage(result.error ?? (result.ok ? (zh ? "检查完成" : "Check complete") : (zh ? "检查失败" : "Check failed"))); }}>{zh ? "立即检查" : "Check now"}</button></Setting>
+    <Setting title={zh ? "客户端更新" : "Client updates"} description={description} source="product"><button className="primary" disabled={updateEvent?.type === "checking" || updateEvent?.type === "downloading"} onClick={checkNow}>{zh ? "立即检查" : "Check now"}{extra}</button></Setting>
   </>;
 }
+
 
 function Setting(props: { title: string; description?: string | undefined; source: string; children: ReactNode }) {
   return <div className="setting-row"><div className="setting-copy"><div><strong>{props.title}</strong><span className="source-badge">{formatSource(props.source)}</span></div>{props.description && <p>{props.description}</p>}</div><div className="setting-control">{labelControls(props.children, props.title)}</div></div>;

@@ -134,10 +134,13 @@ import {
   resetSettingsInputSchema,
   selectModelInputSchema,
   sendPromptInputSchema,
+  checkForUpdatesResultSchema,
   settingsSnapshotSchema,
+  updateEventSchema,
   updateSettingsInputSchema,
   updateSessionConfigurationInputSchema,
   type AgentEvent,
+  type UpdateEvent,
   type BootstrapState,
   type CommandResult,
   type McpServerEditor,
@@ -176,6 +179,7 @@ let quitting = false;
 let shutdownComplete = false;
 let updateCheckTimer: NodeJS.Timeout | undefined;
 let appliedUpdateConfiguration = "";
+let updateEventListenersRegistered = false;
 const repositoryWriteLocks = new Map<string, Promise<void>>();
 const { autoUpdater } = electronUpdater;
 
@@ -2851,6 +2855,7 @@ async function writeDiagnosticLog(
 
 async function bootstrap(): Promise<void> {
   const workspace = await resolveStartupWorkspace(process.argv);
+  registerAutoUpdaterListeners();
   await initializeDesktopState(
     workspace,
     process.argv.includes("--resume"),
@@ -3455,20 +3460,26 @@ function registerIpcHandlers(): void {
   ipcMain.handle(IPC_CHANNELS.checkForUpdates, async (event) => {
     assertTrustedSender(event);
     if (!app.isPackaged) {
-      return commandResultSchema.parse({
+      return checkForUpdatesResultSchema.parse({
         ok: false,
+        currentVersion: app.getVersion(),
         error: "开发构建不检查更新；请使用已签名安装包验证更新源",
       });
     }
     try {
-      const result = await autoUpdater.checkForUpdatesAndNotify();
-      const version = result?.updateInfo.version;
-      return commandResultSchema.parse({
+      const result = await autoUpdater.checkForUpdates();
+      return checkForUpdatesResultSchema.parse({
         ok: true,
-        ...(version ? { error: `更新检查完成，远端版本 ${version}` } : {}),
+        currentVersion: app.getVersion(),
+        availableVersion: result?.updateInfo.version ?? null,
+        updateAvailable: result !== null,
       });
     } catch (error) {
-      return commandResultSchema.parse({ ok: false, error: formatError(error) });
+      return checkForUpdatesResultSchema.parse({
+        ok: false,
+        currentVersion: app.getVersion(),
+        error: formatError(error),
+      });
     }
   });
   ipcMain.handle(IPC_CHANNELS.exportDiagnostics, async (event) => {
@@ -5211,6 +5222,54 @@ function maybeNotifyTaskEvent(event: TaskEvent): void {
   notification.show();
 }
 
+function broadcastUpdateEvent(raw: UpdateEvent): void {
+  const event = updateEventSchema.parse(raw);
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.isDestroyed()) {
+      window.webContents.send(IPC_CHANNELS.updateEvent, event);
+    }
+  }
+}
+
+function registerAutoUpdaterListeners(): void {
+  if (updateEventListenersRegistered) return;
+  updateEventListenersRegistered = true;
+
+  autoUpdater.on("checking-for-update", () => {
+    broadcastUpdateEvent({ type: "checking" });
+  });
+  autoUpdater.on("update-available", (info) => {
+    broadcastUpdateEvent({
+      type: "available",
+      version: info.version,
+    });
+  });
+  autoUpdater.on("update-not-available", () => {
+    broadcastUpdateEvent({ type: "not-available" });
+  });
+  autoUpdater.on("download-progress", (progress) => {
+    broadcastUpdateEvent({
+      type: "downloading",
+      percent: progress.percent,
+      bytesPerSecond: progress.bytesPerSecond,
+      total: progress.total,
+      transferred: progress.transferred,
+    });
+  });
+  autoUpdater.on("update-downloaded", (info) => {
+    broadcastUpdateEvent({
+      type: "downloaded",
+      version: info.version,
+    });
+  });
+  autoUpdater.on("error", (error) => {
+    broadcastUpdateEvent({
+      type: "error",
+      error: formatError(error),
+    });
+  });
+}
+
 function broadcastSettings(raw: SettingsSnapshot): void {
   const settings = settingsSnapshotSchema.parse(raw);
   for (const window of BrowserWindow.getAllWindows()) {
@@ -5610,7 +5669,6 @@ function applyAutoUpdateSettings(snapshot: SettingsSnapshot): void {
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;
   autoUpdater.allowPrerelease = channel === "beta";
-  autoUpdater.channel = channel;
   updateCheckTimer = setTimeout(() => {
     updateCheckTimer = undefined;
     void autoUpdater.checkForUpdatesAndNotify().catch((error: unknown) => {
@@ -5855,10 +5913,16 @@ app.on("window-all-closed", () => {
   }
 });
 
-app.on("before-quit", (event) => {
+app.on("before-quit", () => {
+  if (shutdownComplete) return;
+  quitting = true;
+  // 不移除 event.preventDefault() — 让 electron-updater 的 once('before-quit')
+  // 监听器能正常处理待安装的更新。异步清理已移至 will-quit。
+});
+
+app.on("will-quit", (event) => {
   if (shutdownComplete) return;
   event.preventDefault();
-  quitting = true;
   void shutdownDesktopState().finally(() => {
     shutdownComplete = true;
     app.quit();

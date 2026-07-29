@@ -1422,6 +1422,27 @@ export const clearDataInputSchema = z.object({
   category: z.enum(["sessions", "memories", "tasks", "logs"]),
 }).strict();
 
+export const updateEventSchema = z.object({
+  type: z.enum(["checking", "available", "not-available", "downloading", "downloaded", "error"]),
+  version: z.string().optional(),
+  currentVersion: z.string().optional(),
+  percent: z.number().min(0).max(100).optional(),
+  bytesPerSecond: z.number().nonnegative().optional(),
+  total: z.number().nonnegative().optional(),
+  transferred: z.number().nonnegative().optional(),
+  error: z.string().optional(),
+}).strict();
+export type UpdateEvent = z.infer<typeof updateEventSchema>;
+
+export const checkForUpdatesResultSchema = z.object({
+  ok: z.boolean(),
+  currentVersion: z.string().optional(),
+  availableVersion: z.string().nullable().optional(),
+  updateAvailable: z.boolean().optional(),
+  error: z.string().optional(),
+}).strict();
+export type CheckForUpdatesResult = z.infer<typeof checkForUpdatesResultSchema>;
+
 export const commandResultSchema = z.object({
   ok: z.boolean(),
   error: z.string().optional(),
@@ -1598,6 +1619,7 @@ export const IPC_CHANNELS = {
   planEvent: "deki:plan-event",
   openTask: "deki:open-task",
   openPlan: "deki:open-plan",
+  updateEvent: "deki:update-event",
 } as const;
 
 export interface DekiDesktopApi {
@@ -1689,7 +1711,7 @@ export interface DekiDesktopApi {
   exportDiagnostics(): Promise<CommandResult>;
   openDataDirectory(): Promise<CommandResult>;
   openThirdPartyLicenses(): Promise<CommandResult>;
-  checkForUpdates(): Promise<CommandResult>;
+  checkForUpdates(): Promise<CheckForUpdatesResult>;
   listMcpServers(): Promise<McpServerEditor[]>;
   upsertMcpServer(server: McpServerEditor): Promise<CommandResult>;
   removeMcpServer(id: string): Promise<CommandResult>;
@@ -1727,6 +1749,7 @@ export interface DekiDesktopApi {
   subscribePlanEvents(listener: (event: PlanEvent) => void): () => void;
   subscribeOpenTask(listener: (taskId: string) => void): () => void;
   subscribeOpenPlan(listener: (planId: string) => void): () => void;
+  subscribeUpdateEvents(listener: (event: UpdateEvent) => void): () => void;
 }
 
 export type ToolEffect =

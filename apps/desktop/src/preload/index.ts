@@ -51,7 +51,9 @@ import {
   artifactChunkSchema,
   settingsPatchSchema,
   settingsScopeSchema,
+  checkForUpdatesResultSchema,
   settingsSnapshotSchema,
+  updateEventSchema,
   updateSessionConfigurationInputSchema,
   type DekiDesktopApi,
 } from "@deki-ai/shared";
@@ -429,7 +431,7 @@ const api: DekiDesktopApi = {
     );
   },
   async checkForUpdates() {
-    return commandResultSchema.parse(
+    return checkForUpdatesResultSchema.parse(
       await ipcRenderer.invoke(IPC_CHANNELS.checkForUpdates),
     );
   },
@@ -643,6 +645,13 @@ const api: DekiDesktopApi = {
     };
     ipcRenderer.on(IPC_CHANNELS.openPlan, wrapped);
     return () => ipcRenderer.removeListener(IPC_CHANNELS.openPlan, wrapped);
+  },
+  subscribeUpdateEvents(listener) {
+    const handler = (_event: Electron.IpcRendererEvent, raw: unknown) => {
+      listener(updateEventSchema.parse(raw));
+    };
+    ipcRenderer.on(IPC_CHANNELS.updateEvent, handler);
+    return () => ipcRenderer.removeListener(IPC_CHANNELS.updateEvent, handler);
   },
 };
 

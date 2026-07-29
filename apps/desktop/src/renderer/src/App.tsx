@@ -30,6 +30,7 @@ import {
   builtinModelProviders,
 } from "./builtinModelProviders";
 import { PermissionModeIcon } from "./PermissionModeIcon";
+import { findPendingApproval } from "./approvalState";
 import {
   detectPermissionMode,
   permissionModeCopy,
@@ -330,15 +331,7 @@ export function App() {
         setMessages(history.messages);
         setEvents(history.events);
         setBusy(history.runState === "running");
-        const pending = [...history.events].reverse().find(
-          (event): event is Extract<AgentEvent, { type: "approval.requested" }> =>
-            event.type === "approval.requested"
-            && !history.events.some(
-              (candidate) => candidate.type === "approval.resolved"
-                && candidate.requestId === event.requestId,
-            ),
-        );
-        setApproval(pending);
+        setApproval(findPendingApproval(history.events));
       })
       .catch((reason) => setError(String(reason)));
     void refreshPlan().catch((reason) => setError(String(reason)));

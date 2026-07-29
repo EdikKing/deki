@@ -67,6 +67,7 @@ interface PendingApproval {
   request: PermissionRequest;
   resolve: (decision: ApprovalDecision) => void;
   timeout: ReturnType<typeof setTimeout>;
+  sessionId?: string;
   taskId?: string;
   runId?: string;
   resolving: boolean;
@@ -236,7 +237,7 @@ export class PermissionEngine {
       decision,
       ...(pending.taskId ? { taskId: pending.taskId } : {}),
       ...(pending.runId ? { runId: pending.runId } : {}),
-    });
+    }, pending.sessionId);
     pending.resolve(decision);
     return true;
   }
@@ -290,6 +291,7 @@ export class PermissionEngine {
     ).toISOString();
     const taskId = this.#options.taskId?.();
     const runId = this.#options.runId?.();
+    const sessionId = this.#options.sessionId();
     const decision = new Promise<ApprovalDecision>((resolveDecision) => {
       const timeout = setTimeout(() => {
         void this.#resolvePending(requestId, "deny");
@@ -298,6 +300,7 @@ export class PermissionEngine {
         request,
         resolve: resolveDecision,
         timeout,
+        ...(sessionId ? { sessionId } : {}),
         ...(taskId ? { taskId } : {}),
         ...(runId ? { runId } : {}),
         resolving: false,
@@ -354,12 +357,12 @@ export class PermissionEngine {
     this.#emit({ type: "audit.recorded", recordId });
   }
 
-  #emit(event: AgentEventInput): void {
+  #emit(event: AgentEventInput, sessionId = this.#options.sessionId()): void {
     this.#options.emit({
       ...event,
       eventId: randomUUID(),
       timestamp: new Date().toISOString(),
-      ...(this.#options.sessionId() ? { sessionId: this.#options.sessionId() } : {}),
+      ...(sessionId ? { sessionId } : {}),
     } as AgentEvent);
   }
 }

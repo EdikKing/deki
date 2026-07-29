@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import { defaultSettings } from "@deki-ai/settings";
+import type { AgentEvent } from "@deki-ai/shared";
 import {
   classifyShell,
   createUnifiedDiff,
@@ -90,6 +91,40 @@ describe("PermissionEngine", () => {
     expect(acquired).toBe(`task-1:${requestId}`);
     expect(committed).toBe(true);
     expect(resolvedContext).toBe("task-1:run-1");
+  });
+
+  it("resolves an approval in the session where it was requested", async () => {
+    const root = await mkdtemp(join(tmpdir(), "deki-permissions-session-"));
+    const settings = structuredClone(defaultSettings);
+    settings.permissions.policies["shell.unknown"] = "ask";
+    const events: AgentEvent[] = [];
+    let currentSessionId = "session-a";
+    let requestId = "";
+    const engine = new PermissionEngine({
+      workspace: root,
+      logsRoot: join(root, "logs"),
+      settings,
+      sessionId: () => currentSessionId,
+      model: () => "provider/model",
+      emit: (event) => {
+        events.push(event);
+        if (event.type === "approval.requested") requestId = event.requestId;
+      },
+    });
+    const authorization = engine.authorize({
+      callId: "session-approval",
+      category: "shell.unknown",
+      title: "shell",
+      description: "shell",
+      details: {},
+    });
+    await Promise.resolve();
+    currentSessionId = "session-b";
+    expect(await engine.respond(requestId, "allow_once")).toBe(true);
+    await authorization;
+    expect(events.find(
+      (event) => event.type === "approval.resolved",
+    )?.sessionId).toBe("session-a");
   });
 
   it("classifies privileged, git, install and safe shell commands", () => {

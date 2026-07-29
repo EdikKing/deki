@@ -61,6 +61,7 @@ const thinkingLevels: readonly ThinkingLevel[] = [
   "xhigh",
 ];
 const GENERAL_PROJECT_KEY = "__general__";
+const PINNED_SESSIONS_STORAGE_KEY = "deki:pinned-sessions";
 
 export function App() {
   const [state, setState] = useState<BootstrapState>();
@@ -85,6 +86,8 @@ export function App() {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [activeSession, setActiveSession] = useState<SessionSummary>();
   const [showAllSessions, setShowAllSessions] = useState(false);
+  const [sessionMenuId, setSessionMenuId] = useState<string>();
+  const [pinnedSessionIds, setPinnedSessionIds] = useState(readPinnedSessionIds);
   const [expandedProjectKey, setExpandedProjectKey] = useState<string>(GENERAL_PROJECT_KEY);
   const [settingsSection, setSettingsSection] = useState<"models" | "permissions">();
   const [compactLayout, setCompactLayout] = useState(() => window.innerWidth <= 980);
@@ -93,6 +96,30 @@ export function App() {
   const activeSessionId = useRef<string | undefined>(undefined);
   const attachmentInputRef = useRef<HTMLInputElement>(null);
   const messagesRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    window.localStorage.setItem(
+      PINNED_SESSIONS_STORAGE_KEY,
+      JSON.stringify([...pinnedSessionIds]),
+    );
+  }, [pinnedSessionIds]);
+
+  useEffect(() => {
+    if (!sessionMenuId) return;
+    const closeMenu = (event: PointerEvent) => {
+      if (event.target instanceof Element && event.target.closest("[data-session-menu-root]")) return;
+      setSessionMenuId(undefined);
+    };
+    const closeMenuOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setSessionMenuId(undefined);
+    };
+    document.addEventListener("pointerdown", closeMenu);
+    document.addEventListener("keydown", closeMenuOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeMenu);
+      document.removeEventListener("keydown", closeMenuOnEscape);
+    };
+  }, [sessionMenuId]);
 
   async function refresh() {
     setState(await window.deki.getBootstrapState());
@@ -376,9 +403,11 @@ export function App() {
   ].slice(0, 7);
   const sortedSessions = useMemo(
     () => [...sessions].sort(
-      (left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt),
+      (left, right) => Number(pinnedSessionIds.has(right.id))
+        - Number(pinnedSessionIds.has(left.id))
+        || Date.parse(right.updatedAt) - Date.parse(left.updatedAt),
     ),
-    [sessions],
+    [pinnedSessionIds, sessions],
   );
   const visibleSessions = showAllSessions
     ? sortedSessions
@@ -705,7 +734,10 @@ export function App() {
                     {expanded && active && (
                       <div className="project-session-list">
                         {visibleSessions.map((session) => (
-                          <div className={`session-tree-row${session.current ? " active" : ""}`} key={session.id}>
+                          <div
+                            className={`session-tree-row${session.current ? " active" : ""}${pinnedSessionIds.has(session.id) ? " pinned" : ""}`}
+                            key={session.id}
+                          >
                             <button
                               className="session-tree-item"
                               disabled={busy}
@@ -724,31 +756,15 @@ export function App() {
                                 );
                               }}
                             >
-                              <strong>{getSessionTitle(session, zh)}</strong>
+                              <strong>
+                                {pinnedSessionIds.has(session.id) && <PinIcon />}
+                                <span>{getSessionTitle(session, zh)}</span>
+                              </strong>
                               <time dateTime={session.updatedAt}>
                                 {session.runState !== "idle" ? `${session.runState} · ` : ""}
                                 {formatRelativeTime(session.updatedAt, zh)}
                               </time>
                             </button>
-                            <div className="session-actions">
-                              <button
-                                className="icon-button"
-                                aria-label={zh ? "重命名会话" : "Rename session"}
-                                onClick={() => {
-                                  const name = window.prompt(zh ? "输入会话名称" : "Session name", session.name ?? session.firstMessage);
-                                  if (name?.trim()) void runCommand(window.deki.renameSession(session.id, name.trim()), setError, refreshSessions);
-                                }}
-                              >✎</button>
-                              {!session.current && <button
-                                className="icon-button danger-text"
-                                aria-label={zh ? "删除会话" : "Delete session"}
-                                onClick={() => {
-                                  if (window.confirm(zh ? "将此会话移到废纸篓？" : "Move this session to the trash?")) {
-                                    void runCommand(window.deki.deleteSession(session.id), setError, refreshSessions);
-                                  }
-                                }}
-                              >×</button>}
-                            </div>
                           </div>
                         ))}
                         {sortedSessions.length > 5 && (
@@ -823,6 +839,60 @@ export function App() {
         <header className="topbar">
           <div className="project-heading">
             <strong>{sessionTitle}</strong>
+            {activeSession && <div className="topbar-session-actions" data-session-menu-root>
+              <button
+                className="icon-button session-more-button"
+                aria-label={zh ? "会话操作" : "Session actions"}
+                aria-haspopup="menu"
+                aria-expanded={sessionMenuId === activeSession.id}
+                onClick={() => {
+                  setSessionMenuId((current) => current === activeSession.id
+                    ? undefined
+                    : activeSession.id);
+                }}
+              >
+                <MoreIcon />
+              </button>
+              {sessionMenuId === activeSession.id && <div className="session-action-menu" role="menu">
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    setPinnedSessionIds((current) => {
+                      const next = new Set(current);
+                      if (next.has(activeSession.id)) next.delete(activeSession.id);
+                      else next.add(activeSession.id);
+                      return next;
+                    });
+                    setSessionMenuId(undefined);
+                  }}
+                >
+                  <PinIcon />
+                  <span>{pinnedSessionIds.has(activeSession.id)
+                    ? (zh ? "取消置顶" : "Unpin")
+                    : (zh ? "置顶会话" : "Pin session")}</span>
+                </button>
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    setSessionMenuId(undefined);
+                    const name = window.prompt(
+                      zh ? "输入会话名称" : "Session name",
+                      activeSession.name ?? activeSession.firstMessage,
+                    );
+                    if (name?.trim()) {
+                      void runCommand(
+                        window.deki.renameSession(activeSession.id, name.trim()),
+                        setError,
+                        refreshSessions,
+                      );
+                    }
+                  }}
+                >
+                  <RenameIcon />
+                  <span>{zh ? "重命名会话" : "Rename session"}</span>
+                </button>
+              </div>}
+            </div>}
           </div>
           <div className="top-actions">
             <button
@@ -1775,6 +1845,28 @@ function FolderIcon() {
   </svg>;
 }
 
+function MoreIcon() {
+  return <svg className="session-action-icon more" viewBox="0 0 20 20" aria-hidden="true">
+    <circle cx="4" cy="10" r="1.5" />
+    <circle cx="10" cy="10" r="1.5" />
+    <circle cx="16" cy="10" r="1.5" />
+  </svg>;
+}
+
+function PinIcon() {
+  return <svg className="session-action-icon pin" viewBox="0 0 20 20" aria-hidden="true">
+    <path d="m7.1 3.2 6.3 1.7-1.5 3 2.2 2.2-3.9 3.9-2.2-2.2-3 1.5-1.7-6.3 3.8-3.8Z" />
+    <path d="m7.9 12.1-4.7 4.7" />
+  </svg>;
+}
+
+function RenameIcon() {
+  return <svg className="session-action-icon" viewBox="0 0 20 20" aria-hidden="true">
+    <path d="m4 13.8-.8 3 3-.8L15.5 6.7l-2.2-2.2L4 13.8Z" />
+    <path d="m11.9 5.9 2.2 2.2" />
+  </svg>;
+}
+
 function SettingsIcon() {
   return <svg
     className="settings-icon"
@@ -1785,6 +1877,21 @@ function SettingsIcon() {
     <circle cx="14" cy="8" r="2.25" />
     <circle cx="10" cy="16" r="2.25" />
   </svg>;
+}
+
+function readPinnedSessionIds(): Set<string> {
+  try {
+    const value: unknown = JSON.parse(
+      window.localStorage.getItem(PINNED_SESSIONS_STORAGE_KEY) ?? "[]",
+    );
+    return new Set(
+      Array.isArray(value)
+        ? value.filter((id): id is string => typeof id === "string")
+        : [],
+    );
+  } catch {
+    return new Set();
+  }
 }
 
 function resolveLocale(settings: SettingsSnapshot | undefined): "zh-CN" | "en-US" {

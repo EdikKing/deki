@@ -94,6 +94,7 @@ export function App() {
   const [inspectorOpen, setInspectorOpen] = useState(() => window.innerWidth > 980);
   const [inspectorWidth, setInspectorWidth] = useState(330);
   const activeSessionId = useRef<string | undefined>(undefined);
+  const foregroundTaskIdRef = useRef<string | undefined>(undefined);
   const attachmentInputRef = useRef<HTMLInputElement>(null);
   const messagesRef = useRef<HTMLDivElement>(null);
 
@@ -182,10 +183,6 @@ export function App() {
         }]);
         setBusy(false);
       }
-      if (belongsToActiveSession && (event.type === "run.completed" || event.type === "run.failed")) {
-        setBusy(false);
-        setForegroundTaskId(undefined);
-      }
       if (event.type === "run.completed" || event.type === "run.failed") void refreshSessions();
       if (belongsToActiveSession && event.type === "run.failed") {
         setError(event.error);
@@ -254,6 +251,19 @@ export function App() {
       void refreshAttention();
       void refreshLinkedTask();
       void refresh();
+      if (
+        event.taskId === foregroundTaskIdRef.current
+        && [
+          "task.succeeded",
+          "task.failed",
+          "task.cancelled",
+          "task.interrupted",
+        ].includes(event.type)
+      ) {
+        foregroundTaskIdRef.current = undefined;
+        setBusy(false);
+        setForegroundTaskId(undefined);
+      }
       if (
         event.taskId === activePlan?.plan.planningTaskId
         || event.taskId === activePlan?.plan.executionTaskId
@@ -538,6 +548,7 @@ export function App() {
     } else if (result.task && mode === "background") {
       setBackgroundTask({ id: result.task.id, title: result.task.title });
     } else if (result.task) {
+      foregroundTaskIdRef.current = result.task.id;
       setForegroundTaskId(result.task.id);
     }
     await refresh();
@@ -601,6 +612,7 @@ export function App() {
         setError(promoted.error ?? (zh ? "当前任务无法转到后台" : "Unable to move the current task to background"));
         return undefined;
       }
+      foregroundTaskIdRef.current = undefined;
       setForegroundTaskId(undefined);
       setBusy(false);
     }
@@ -1163,6 +1175,7 @@ export function App() {
                             window.deki.promoteTask(foregroundTaskId),
                             setError,
                             async () => {
+                              foregroundTaskIdRef.current = undefined;
                               setForegroundTaskId(undefined);
                               setBusy(false);
                               await refresh();

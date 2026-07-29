@@ -156,6 +156,7 @@ import {
   workerRequestSchema,
   workerResultSchema,
 } from "@deki-ai/shared";
+import { decidePromptDispatch } from "./promptDispatch.js";
 
 protocol.registerSchemesAsPrivileged([{
   scheme: "app",
@@ -403,16 +404,19 @@ class DesktopController {
       const snapshot = runtime.snapshot();
       const sessionId = snapshot.sessionId;
       if (!sessionId) throw new Error("当前会话尚未就绪");
-      if (mode === "foreground" && snapshot.streaming) {
-        return { ok: false, error: "当前会话正在运行，请使用“后台运行”提交新任务" };
-      }
-      const storedAttachments = await this.#storePromptAttachments(attachments);
-      const hasPending = this.#tasks.listTasks({
+      const hasPendingSessionTask = this.#tasks.listTasks({
         statuses: ["queued", "running", "waiting_approval", "waiting_user"],
         workspaceIds: [this.#scopeId],
         limit: 500,
       }).some((task) => task.sessionId === sessionId || !task.sessionId);
-      const preferFork = mode === "background" || snapshot.streaming || hasPending;
+      const dispatch = decidePromptDispatch({
+        mode,
+        sessionStreaming: snapshot.streaming,
+        hasPendingSessionTask,
+      });
+      if (!dispatch.ok) return dispatch;
+      const storedAttachments = await this.#storePromptAttachments(attachments);
+      const { preferFork } = dispatch;
       const context = runtime.capturePromptContext(preferFork);
       const task = this.#tasks.submitPrompt({
         workspaceId: this.#scopeId,

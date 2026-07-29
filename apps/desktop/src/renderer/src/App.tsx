@@ -105,10 +105,15 @@ export function App() {
     left: number;
     top: number;
   }>();
+  const [conversationMapScrollState, setConversationMapScrollState] = useState({
+    canScrollUp: false,
+    canScrollDown: false,
+  });
   const activeSessionId = useRef<string | undefined>(undefined);
   const foregroundTaskIdRef = useRef<string | undefined>(undefined);
   const attachmentInputRef = useRef<HTMLInputElement>(null);
   const messagesRef = useRef<HTMLDivElement>(null);
+  const conversationMapRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     window.localStorage.setItem(
@@ -454,11 +459,51 @@ export function App() {
     }
     setActiveConversationId(currentId);
   }, [conversationMessages]);
+  const updateConversationMapScrollState = useCallback(() => {
+    const track = conversationMapRef.current;
+    if (!track) {
+      setConversationMapScrollState({ canScrollUp: false, canScrollDown: false });
+      return;
+    }
+    const threshold = 1;
+    setConversationMapScrollState({
+      canScrollUp: track.scrollTop > threshold,
+      canScrollDown: track.scrollTop + track.clientHeight < track.scrollHeight - threshold,
+    });
+  }, []);
 
   useEffect(() => {
     const frame = window.requestAnimationFrame(updateActiveConversation);
     return () => window.cancelAnimationFrame(frame);
   }, [updateActiveConversation]);
+
+  useEffect(() => {
+    const track = conversationMapRef.current;
+    if (!track) return;
+    const frame = window.requestAnimationFrame(updateConversationMapScrollState);
+    const observer = new ResizeObserver(updateConversationMapScrollState);
+    observer.observe(track);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      observer.disconnect();
+    };
+  }, [conversationMessages.length, updateConversationMapScrollState]);
+
+  useEffect(() => {
+    const track = conversationMapRef.current;
+    if (!track || !activeConversationId) return;
+    const activeItem = [...track.querySelectorAll<HTMLElement>("[data-conversation-map-id]")]
+      .find((element) => element.dataset.conversationMapId === activeConversationId);
+    if (!activeItem) return;
+    const itemTop = activeItem.offsetTop;
+    const itemBottom = itemTop + activeItem.offsetHeight;
+    if (itemTop < track.scrollTop || itemBottom > track.scrollTop + track.clientHeight) {
+      track.scrollTo({
+        top: itemTop - track.clientHeight / 2 + activeItem.offsetHeight / 2,
+        behavior: document.documentElement.classList.contains("reduce-motion") ? "auto" : "smooth",
+      });
+    }
+  }, [activeConversationId]);
 
   function scrollToConversation(messageId: string) {
     const container = messagesRef.current;
@@ -1119,8 +1164,13 @@ export function App() {
               {conversationMessages.length > 0 && (
                 <nav className="conversation-map" aria-label={zh ? "对话导航" : "Conversation navigation"}>
                   <div
-                    className="conversation-map-track"
+                    className={`conversation-map-track${conversationMapScrollState.canScrollUp ? " can-scroll-up" : ""}${conversationMapScrollState.canScrollDown ? " can-scroll-down" : ""}`}
+                    ref={conversationMapRef}
                     style={{ "--conversation-count": conversationMessages.length } as React.CSSProperties}
+                    onScroll={updateConversationMapScrollState}
+                    onWheel={(event) => {
+                      event.stopPropagation();
+                    }}
                   >
                     {conversationMessages.map((message, index) => {
                       const summary = buildConversationSummary(message, zh);
@@ -1135,6 +1185,7 @@ export function App() {
                         <button
                           className={`conversation-map-item${selected ? " active" : ""}${hoveredConversation?.id === message.id ? " hovered" : ""}${proximityClass}`}
                           key={message.id}
+                          data-conversation-map-id={message.id}
                           aria-label={`${zh ? `第 ${index + 1} 轮` : `Turn ${index + 1}`}: ${summary.title}`}
                           aria-current={selected ? "true" : undefined}
                           onClick={() => scrollToConversation(message.id)}

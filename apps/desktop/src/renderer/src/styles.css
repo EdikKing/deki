@@ -810,13 +810,47 @@ select {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: none;
   pointer-events: auto;
+}
+
+.conversation-map-track::-webkit-scrollbar {
+  display: none;
+}
+
+.conversation-map-track.can-scroll-up {
+  mask-image: linear-gradient(to bottom, transparent 0, #000 38px, #000 100%);
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 38px, #000 100%);
+}
+
+.conversation-map-track.can-scroll-down {
+  mask-image: linear-gradient(to bottom, #000 0, #000 calc(100% - 38px), transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, #000 0, #000 calc(100% - 38px), transparent 100%);
+}
+
+.conversation-map-track.can-scroll-up.can-scroll-down {
+  mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    #000 38px,
+    #000 calc(100% - 38px),
+    transparent 100%
+  );
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    #000 38px,
+    #000 calc(100% - 38px),
+    transparent 100%
+  );
 }
 
 .conversation-map-item {
   width: 44px;
-  min-height: 1px;
-  flex: 1 1 0;
+  min-height: 12px;
+  flex: 0 0 12px;
   display: flex;
   align-items: center;
   padding: 0;

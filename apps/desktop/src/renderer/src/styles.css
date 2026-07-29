@@ -767,7 +767,7 @@ select {
 
 .chat-panel {
   --chat-column-max-width: 740px;
-  --chat-column-gutter: clamp(54px, 7vw, 86px);
+  --chat-column-gutter: clamp(64px, 7vw, 86px);
 
   min-width: 0;
   min-height: 0;
@@ -775,6 +775,7 @@ select {
   grid-template-rows: minmax(0, 1fr) auto auto;
   overflow: hidden;
   border-right: 0;
+  container: chat-panel / inline-size;
 }
 
 .messages-shell {
@@ -795,7 +796,7 @@ select {
   z-index: 12;
   top: 16px;
   bottom: 16px;
-  left: max(10px, calc(50% - 422px));
+  left: 15px;
   width: 44px;
   display: grid;
   place-items: center start;
@@ -825,7 +826,7 @@ select {
 }
 
 .conversation-map-item > span {
-  width: 9px;
+  width: 5px;
   height: min(2px, 100%);
   min-height: 1px;
   display: block;
@@ -841,19 +842,19 @@ select {
 }
 
 .conversation-map-item.active > span {
-  width: 15px;
+  width: 8px;
 }
 
 .conversation-map-item.proximity-3 > span {
-  width: 14px;
+  width: 8px;
 }
 
 .conversation-map-item.proximity-2 > span {
-  width: 20px;
+  width: 11px;
 }
 
 .conversation-map-item.proximity-1 > span {
-  width: 28px;
+  width: 15px;
 }
 
 .conversation-map-item:hover,
@@ -863,7 +864,7 @@ select {
 
 .conversation-map-item:hover > span,
 .conversation-map-item.hovered > span {
-  width: 40px;
+  width: 20px;
 }
 
 .conversation-map-preview {
@@ -3950,7 +3951,6 @@ html[data-theme="light"] .settings-error {
   }
 
   .conversation-map {
-    left: 12px;
     width: 32px;
   }
 
@@ -3961,19 +3961,19 @@ html[data-theme="light"] .settings-error {
 
   .conversation-map-item:hover > span,
   .conversation-map-item.hovered > span {
-    width: 28px;
+    width: 20px;
   }
 
   .conversation-map-item.proximity-1 > span {
-    width: 22px;
+    width: 15px;
   }
 
   .conversation-map-item.proximity-2 > span {
-    width: 16px;
+    width: 11px;
   }
 
   .conversation-map-item.proximity-3 > span {
-    width: 12px;
+    width: 8px;
   }
 
   .composer {
@@ -4003,6 +4003,18 @@ html[data-theme="light"] .settings-error {
 
   .message-turn.user .message-turn-content {
     margin-right: 0;
+  }
+}
+
+@container chat-panel (max-width: 759px) {
+  .conversation-map,
+  .conversation-map-preview {
+    display: none;
+  }
+
+  .messages,
+  .composer {
+    padding-inline: 22px;
   }
 }
 

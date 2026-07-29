@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { PlanRevisionRecord } from "@deki-ai/shared";
-import { diffPlanRevisions } from "./PlanPanel";
+import { diffPlanRevisions, effectivePlanStepStatus } from "./PlanPanel";
 
 describe("diffPlanRevisions", () => {
   it("reports context, field, ordering, addition, and removal changes", () => {
@@ -37,6 +37,14 @@ describe("diffPlanRevisions", () => {
       after: after.steps[0],
       fields: ["title", "description", "validation"],
     }]);
+  });
+});
+
+describe("effectivePlanStepStatus", () => {
+  it("does not leave a step displayed as running after its execution task failed", () => {
+    expect(effectivePlanStepStatus("running", true)).toBe("blocked");
+    expect(effectivePlanStepStatus("running", false)).toBe("running");
+    expect(effectivePlanStepStatus("completed", true)).toBe("completed");
   });
 });
 

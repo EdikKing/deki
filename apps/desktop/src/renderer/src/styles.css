@@ -4153,6 +4153,24 @@ html[data-theme="light"] .settings-error {
   line-height: 1.45;
 }
 
+.plan-execution-alert {
+  display: grid;
+  gap: 4px;
+  margin: 8px 0;
+  padding: 9px 10px;
+  border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--danger) 9%, transparent);
+  color: var(--danger);
+  font-size: 11px;
+}
+
+.plan-execution-alert p {
+  margin: 0;
+  color: var(--text-secondary);
+  line-height: 1.45;
+}
+
 .plan-replan-reason {
   display: grid;
   gap: 4px;

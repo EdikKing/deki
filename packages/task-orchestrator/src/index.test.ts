@@ -533,13 +533,37 @@ describe("TaskStore", () => {
     });
     const run = store.createRun(execution.id);
     store.bindRun(execution.id, run.id, { sessionId: "session-execution" });
+    store.updatePlanStep(plan.id, {
+      revision: 1,
+      stepId: "inspect",
+      status: "running",
+      taskId: execution.id,
+      runId: run.id,
+    });
 
     expect(() => store.finishRun(execution.id, run.id, "succeeded"))
       .toThrow("计划仍有未完成步骤");
     expect(store.getPlan(plan.id)?.plan.status).toBe("executing");
     store.finishRun(execution.id, run.id, "failed", "Agent 提前结束");
     expect(store.getTask(execution.id)?.status).toBe("failed");
-    expect(store.getPlan(plan.id)?.plan.status).toBe("approved");
+    const failedPlan = store.getPlan(plan.id)!;
+    expect(failedPlan.plan.status).toBe("approved");
+    expect(failedPlan.stepStates.find((state) => state.stepId === "inspect"))
+      .toMatchObject({
+        status: "blocked",
+        reason: "Agent 提前结束",
+      });
+    expect(failedPlan.events.at(-2)).toMatchObject({
+      type: "plan.step_blocked",
+      payload: {
+        revision: 1,
+        stepId: "inspect",
+        reason: "Agent 提前结束",
+      },
+    });
+    expect(failedPlan.events.at(-1)).toMatchObject({
+      type: "plan.execution_failed",
+    });
     store.close();
   });
 

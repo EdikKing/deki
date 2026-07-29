@@ -139,6 +139,16 @@ export function PlanPanel(props: PlanPanelProps) {
       </header>
 
       <p className="plan-goal">{detail.plan.goal}</p>
+      {detail.executionTask?.status === "failed" && (
+        <div className="plan-execution-alert" role="alert">
+          <strong>{zh ? "计划执行失败" : "Plan execution failed"}</strong>
+          <p>
+            {zh
+              ? "当前执行已停止。请打开任务查看错误详情，修复后可重试执行。"
+              : "Execution has stopped. Open the task for error details, then retry after fixing the cause."}
+          </p>
+        </div>
+      )}
       {detail.plan.replanReason && (
         <div className="plan-replan-reason">
           <strong>{zh ? "重新规划原因" : "Replan reason"}</strong>
@@ -170,6 +180,7 @@ export function PlanPanel(props: PlanPanelProps) {
                 {...(states.get(step.id) ? { state: states.get(step.id)! } : {})}
                 workers={stepWorkers.filter((worker) =>
                   worker.summary.workerPlanStepId === step.id)}
+                executionFailed={detail.executionTask?.status === "failed"}
                 zh={zh}
               />
             ))}
@@ -474,9 +485,11 @@ function PlanStepRow(props: {
   step: NonNullable<PlanDetail["revisions"][number]>["steps"][number];
   state?: PlanStepState;
   workers: Array<{ summary: TaskSummary; result?: WorkerResult }>;
+  executionFailed: boolean;
   zh: boolean;
 }) {
-  const status = props.state?.status ?? "pending";
+  const persistedStatus = props.state?.status ?? "pending";
+  const status = effectivePlanStepStatus(persistedStatus, props.executionFailed);
   return (
     <details className={`plan-step ${status}`} open={status === "running" || status === "blocked"}>
       <summary>
@@ -496,6 +509,11 @@ function PlanStepRow(props: {
       {props.step.validation.map((item) => <p key={item}>✓ {item}</p>)}
       {props.state?.summary && <p>{props.state.summary}</p>}
       {props.state?.reason && <p className="error">{props.state.reason}</p>}
+      {!props.state?.reason && persistedStatus === "running" && props.executionFailed && (
+        <p className="error">
+          {props.zh ? "计划执行任务已失败，此步骤已停止。" : "The plan execution failed; this step has stopped."}
+        </p>
+      )}
       {props.workers.length > 0 && (
         <div className="plan-step-workers">
           <strong>{props.zh ? "关联 Worker" : "Workers"}</strong>
@@ -511,6 +529,13 @@ function PlanStepRow(props: {
       )}
     </details>
   );
+}
+
+export function effectivePlanStepStatus(
+  status: PlanStepState["status"],
+  executionFailed: boolean,
+): PlanStepState["status"] {
+  return executionFailed && status === "running" ? "blocked" : status;
 }
 
 function planStatusLabel(status: PlanDetail["plan"]["status"], zh: boolean): string {

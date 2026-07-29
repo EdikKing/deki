@@ -2892,8 +2892,11 @@ export class TaskStore {
     const plan = task.kind === "plan-execution" && task.planId
       ? this.#requirePlan(task.planId)
       : undefined;
+    const planRevision = plan
+      ? plan.executingRevision ?? plan.approvedRevision
+      : undefined;
     if (plan && status === "succeeded") {
-      const revision = plan.executingRevision ?? plan.approvedRevision;
+      const revision = planRevision;
       if (!revision) throw new Error("计划没有可完成的执行版本");
       const states = this.#listPlanStepStates(plan.id, revision);
       if (states.some((state) => state.status !== "completed" && state.status !== "skipped")) {
@@ -2932,6 +2935,34 @@ export class TaskStore {
         runId,
         task.sessionId,
       ));
+      if (plan && planRevision && status === "failed") {
+        const runningStates = this.#listPlanStepStates(plan.id, planRevision)
+          .filter((state) => state.status === "running");
+        for (const state of runningStates) {
+          this.#database.prepare(`
+            UPDATE plan_step_states
+            SET status = 'blocked', reason = ?, updated_at = ?
+            WHERE plan_id = ? AND revision = ? AND step_id = ? AND status = 'running'
+          `).run(
+            error ?? "计划执行任务失败",
+            now,
+            plan.id,
+            planRevision,
+            state.stepId,
+          );
+          planEvents.push(this.#appendPlanEvent(
+            plan.id,
+            "plan.step_blocked",
+            {
+              revision: planRevision,
+              stepId: state.stepId,
+              reason: error ?? "计划执行任务失败",
+            },
+            taskId,
+            runId,
+          ));
+        }
+      }
       if (plan && (plan.status === "executing" || plan.status === "approved")) {
         const dagBlocked = status === "failed"
           && this.getPlanExecutionGraph(plan.id)?.status === "blocked";

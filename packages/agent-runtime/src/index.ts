@@ -1553,7 +1553,9 @@ export class DekiAgentRuntime {
             agentsFiles: workerProfile ? [] : dedupeContextFiles([
               {
                 path: "deki://built-in/git-commit-conventions.md",
-                content: renderBuiltInGitCommitInstructions(),
+                content: renderBuiltInGitCommitInstructions(
+                  this.#options.settings.general.locale,
+                ),
               },
               ...current.agentsFiles.filter((file) =>
                 !matchesContextIgnore(file.path, this.#options.settings.workspace.contextIgnore)),
@@ -3025,8 +3027,10 @@ function renderMemoryContext(memories: readonly MemoryRecord[]): string {
 }
 
 export function renderBuiltInGitCommitInstructions(
-  locale = resolveSystemLocale(),
+  configuredLocale: DekiSettings["general"]["locale"] = "system",
+  systemLocale = resolveSystemLocale(),
 ): string {
+  const locale = configuredLocale === "system" ? systemLocale : configuredLocale;
   const language = locale === "zh-CN" ? "简体中文（zh-CN）" : "English (en-US)";
   return [
     "# Deki 内置 Git 提交规范",
@@ -3036,7 +3040,7 @@ export function renderBuiltInGitCommitInstructions(
     "- 使用 Conventional Commits 格式：`type(scope): description`；scope 可省略。",
     "- type 使用标准英文关键字，例如 `feat`、`fix`、`docs`、`style`、`refactor`、`perf`、`test`、`build`、`ci`、`chore`、`revert`。",
     "- 破坏性变更使用 `type(scope)!: description`，并按需添加 `BREAKING CHANGE:` footer。",
-    `- 当前系统语言是 ${language}。description、正文和说明性 footer 使用该语言；type、scope、Git trailer 键、路径、符号和代码标识符不翻译。`,
+    `- 当前提交语言是 ${language}。description、正文和说明性 footer 使用该语言；type、scope、Git trailer 键、路径、符号和代码标识符不翻译。`,
     "- description 使用祈使语气，简洁说明本次提交完成的单一变更，不以句号结尾。",
     "- 提交前检查实际暂存差异，根据变更内容选择 type 和 scope；不要提交与用户任务无关的文件。",
     "- 仓库自身的提交规则（例如 DCO 签署、必需 footer 或更严格的格式）仍须同时遵守。",

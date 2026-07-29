@@ -5679,6 +5679,7 @@ function applyAutoUpdateSettings(snapshot: SettingsSnapshot): void {
 
 function requiresRuntimeReload(before: SettingsSnapshot, after: SettingsSnapshot): boolean {
   return JSON.stringify({
+    locale: before.effective.general.locale,
     agent: before.effective.agent,
     advanced: before.effective.advanced,
     models: before.effective.models,
@@ -5688,6 +5689,7 @@ function requiresRuntimeReload(before: SettingsSnapshot, after: SettingsSnapshot
     permissions: before.effective.permissions,
     workspace: before.effective.workspace,
   }) !== JSON.stringify({
+    locale: after.effective.general.locale,
     agent: after.effective.agent,
     advanced: after.effective.advanced,
     models: after.effective.models,

@@ -12,7 +12,7 @@ import {
 } from "./index.js";
 
 describe("built-in Git commit instructions", () => {
-  it("requires Conventional Commits in the system language", () => {
+  it("requires Conventional Commits in the configured application language", () => {
     const chinese = renderBuiltInGitCommitInstructions("zh-CN");
     const english = renderBuiltInGitCommitInstructions("en-US");
 
@@ -20,6 +20,13 @@ describe("built-in Git commit instructions", () => {
     expect(chinese).toContain("简体中文（zh-CN）");
     expect(chinese).toContain("BREAKING CHANGE:");
     expect(english).toContain("English (en-US)");
+  });
+
+  it("uses the operating-system language only when configured to follow it", () => {
+    expect(renderBuiltInGitCommitInstructions("system", "zh-CN"))
+      .toContain("简体中文（zh-CN）");
+    expect(renderBuiltInGitCommitInstructions("system", "en-US"))
+      .toContain("English (en-US)");
   });
 });
 

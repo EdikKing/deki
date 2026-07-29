@@ -214,33 +214,78 @@ export function TaskCenter(props: TaskCenterProps) {
   return (
     <section className="task-center" data-testid="task-center">
       <header className="task-center-header">
-        <div>
-          <p className="eyebrow">TASK CENTER</p>
-          <h1>{props.zh ? "后台任务" : "Background tasks"}</h1>
+        <div className="task-center-title">
+          <span className="task-center-title-icon" aria-hidden="true">✓</span>
+          <div>
+            <h1>{props.zh ? "后台任务" : "Background tasks"}</h1>
+            <p>
+              {props.zh
+                ? "查看运行进度、处理待办并回到相关会话"
+                : "Track progress, resolve requests, and return to related chats"}
+            </p>
+          </div>
         </div>
-        <span>{props.zh ? `${rootTasks.length} 个任务` : `${rootTasks.length} tasks`}</span>
+        <span className="task-center-count">
+          {props.zh ? `${rootTasks.length} 个任务` : `${rootTasks.length} tasks`}
+        </span>
       </header>
 
       <div className="task-center-filters">
-        <input
-          type="search"
-          value={query}
-          placeholder={props.zh ? "搜索任务、结果或错误" : "Search tasks, results, or errors"}
-          onChange={(event) => setQuery(event.target.value)}
-        />
-        <select value={workspaceId} onChange={(event) => setWorkspaceId(event.target.value)}>
-          <option value="">{props.zh ? "全部项目" : "All projects"}</option>
-          {workspaces.map(([id, name]) => <option key={id} value={id}>{name}</option>)}
-        </select>
-        <select
-          value={status}
-          onChange={(event) => setStatus(event.target.value as TaskStatus | "")}
-        >
-          <option value="">{props.zh ? "全部状态" : "All statuses"}</option>
-          {Object.entries(statusCopy).map(([value, copy]) => (
-            <option key={value} value={value}>{props.zh ? copy.zh : copy.en}</option>
-          ))}
-        </select>
+        <label className="task-center-search">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="11" cy="11" r="6.5" />
+            <path d="m16 16 4 4" />
+          </svg>
+          <input
+            type="search"
+            value={query}
+            aria-label={props.zh ? "搜索后台任务" : "Search background tasks"}
+            placeholder={props.zh ? "搜索任务、结果或错误" : "Search tasks, results, or errors"}
+            onChange={(event) => setQuery(event.target.value)}
+          />
+        </label>
+        <div className="task-center-filter-group">
+          <label className="task-filter-control">
+            <span>{props.zh ? "项目" : "Project"}</span>
+            <span className="task-filter-select">
+              <select
+                value={workspaceId}
+                aria-label={props.zh ? "筛选项目" : "Filter project"}
+                onChange={(event) => setWorkspaceId(event.target.value)}
+              >
+                <option value="">{props.zh ? "全部项目" : "All projects"}</option>
+                {workspaces.map(([id, name]) => <option key={id} value={id}>{name}</option>)}
+              </select>
+            </span>
+          </label>
+          <label className="task-filter-control">
+            <span>{props.zh ? "状态" : "Status"}</span>
+            <span className="task-filter-select">
+              <select
+                value={status}
+                aria-label={props.zh ? "筛选状态" : "Filter status"}
+                onChange={(event) => setStatus(event.target.value as TaskStatus | "")}
+              >
+                <option value="">{props.zh ? "全部状态" : "All statuses"}</option>
+                {Object.entries(statusCopy).map(([value, copy]) => (
+                  <option key={value} value={value}>{props.zh ? copy.zh : copy.en}</option>
+                ))}
+              </select>
+            </span>
+          </label>
+          {(query || workspaceId || status) && (
+            <button
+              className="task-filter-reset"
+              onClick={() => {
+                setQuery("");
+                setWorkspaceId("");
+                setStatus("");
+              }}
+            >
+              {props.zh ? "清除" : "Clear"}
+            </button>
+          )}
+        </div>
       </div>
 
       <div className="task-center-grid">

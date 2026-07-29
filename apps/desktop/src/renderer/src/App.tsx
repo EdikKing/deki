@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import anthropicLogo from "@lobehub/icons-static-svg/icons/anthropic.svg?url";
@@ -99,6 +99,12 @@ export function App() {
   const [compactLayout, setCompactLayout] = useState(() => window.innerWidth <= 980);
   const [inspectorOpen, setInspectorOpen] = useState(() => window.innerWidth > 980);
   const [inspectorWidth, setInspectorWidth] = useState(330);
+  const [activeConversationId, setActiveConversationId] = useState<string>();
+  const [hoveredConversation, setHoveredConversation] = useState<{
+    id: string;
+    left: number;
+    top: number;
+  }>();
   const activeSessionId = useRef<string | undefined>(undefined);
   const foregroundTaskIdRef = useRef<string | undefined>(undefined);
   const attachmentInputRef = useRef<HTMLInputElement>(null);
@@ -424,6 +430,48 @@ export function App() {
   const visibleSessions = showAllSessions
     ? sortedSessions
     : sortedSessions.slice(0, 5);
+  const conversationMessages = useMemo(
+    () => messages.filter((message) => message.role === "user"),
+    [messages],
+  );
+  const hoveredConversationMessage = hoveredConversation
+    ? conversationMessages.find((message) => message.id === hoveredConversation.id)
+    : undefined;
+  const hoveredConversationIndex = hoveredConversation
+    ? conversationMessages.findIndex((message) => message.id === hoveredConversation.id)
+    : -1;
+  const updateActiveConversation = useCallback(() => {
+    const container = messagesRef.current;
+    if (!container || conversationMessages.length === 0) {
+      setActiveConversationId(undefined);
+      return;
+    }
+    const focusLine = container.scrollTop + container.clientHeight * 0.36;
+    let currentId = conversationMessages[0]?.id;
+    for (const element of container.querySelectorAll<HTMLElement>("[data-conversation-anchor]")) {
+      if (element.offsetTop > focusLine) break;
+      currentId = element.dataset.messageId;
+    }
+    setActiveConversationId(currentId);
+  }, [conversationMessages]);
+
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(updateActiveConversation);
+    return () => window.cancelAnimationFrame(frame);
+  }, [updateActiveConversation]);
+
+  function scrollToConversation(messageId: string) {
+    const container = messagesRef.current;
+    const target = container
+      ? [...container.querySelectorAll<HTMLElement>("[data-conversation-anchor]")]
+        .find((element) => element.dataset.messageId === messageId)
+      : undefined;
+    target?.scrollIntoView({
+      behavior: document.documentElement.classList.contains("reduce-motion") ? "auto" : "smooth",
+      block: "center",
+    });
+    setActiveConversationId(messageId);
+  }
 
   if (!state) {
     return <main className="loading">正在启动 Deki…</main>;
@@ -1004,61 +1052,131 @@ export function App() {
           style={{ "--inspector-width": `${inspectorWidth}px` } as React.CSSProperties}
         >
           <section className="chat-panel">
-            <div className="messages" ref={messagesRef}>
-              {messages.length === 0 && (
-                <div className="empty-state">
-                  <p className="eyebrow">
-                    {state.workspace ? "PERMISSION-PROTECTED AGENT" : "GENERAL CHAT"}
-                  </p>
-                  <h2>{state.workspace ? (zh ? "从理解项目开始" : "Start by understanding the project") : (zh ? "开始一个普通会话" : "Start a general chat")}</h2>
-                  <p>
-                    {state.workspace
-                      ? (zh
-                          ? <>试试“概览当前项目”，或输入 <code>/remember 项目使用 Electron</code>。</>
-                          : <>Try “summarize this project”, or enter <code>/remember This project uses Electron</code>.</>)
-                      : (zh ? "普通会话无需选择项目，也不会读取本地项目内容。" : "General chat needs no project and cannot read local project content.")}
-                  </p>
-                  {!state.ready && (
-                    <button
-                      className="primary empty-state-action"
-                      onClick={() => {
-                        setSettingsSection("models");
-                        setShowSettings(true);
-                      }}
-                    >
-                      {zh ? "配置模型" : "Configure a model"}
-                    </button>
-                  )}
-                  {!state.workspace && (
-                    <button
-                      className="ghost empty-state-action"
-                      onClick={() => void runCommand(window.deki.chooseWorkspace(), setError, refresh)}
-                    >
-                      {zh ? "关联项目" : "Connect a project"}
-                    </button>
-                  )}
+            <div className={`messages-shell${conversationMessages.length > 0 ? " has-conversation-map" : ""}`}>
+              <div
+                className="messages"
+                ref={messagesRef}
+                onScroll={() => {
+                  setHoveredConversation(undefined);
+                  updateActiveConversation();
+                }}
+              >
+                {messages.length === 0 && (
+                  <div className="empty-state">
+                    <p className="eyebrow">
+                      {state.workspace ? "PERMISSION-PROTECTED AGENT" : "GENERAL CHAT"}
+                    </p>
+                    <h2>{state.workspace ? (zh ? "从理解项目开始" : "Start by understanding the project") : (zh ? "开始一个普通会话" : "Start a general chat")}</h2>
+                    <p>
+                      {state.workspace
+                        ? (zh
+                            ? <>试试“概览当前项目”，或输入 <code>/remember 项目使用 Electron</code>。</>
+                            : <>Try “summarize this project”, or enter <code>/remember This project uses Electron</code>.</>)
+                        : (zh ? "普通会话无需选择项目，也不会读取本地项目内容。" : "General chat needs no project and cannot read local project content.")}
+                    </p>
+                    {!state.ready && (
+                      <button
+                        className="primary empty-state-action"
+                        onClick={() => {
+                          setSettingsSection("models");
+                          setShowSettings(true);
+                        }}
+                      >
+                        {zh ? "配置模型" : "Configure a model"}
+                      </button>
+                    )}
+                    {!state.workspace && (
+                      <button
+                        className="ghost empty-state-action"
+                        onClick={() => void runCommand(window.deki.chooseWorkspace(), setError, refresh)}
+                      >
+                        {zh ? "关联项目" : "Connect a project"}
+                      </button>
+                    )}
+                  </div>
+                )}
+                {messages.map((message) => (
+                  <ConversationTurn
+                    key={message.id}
+                    message={message}
+                    models={state.models}
+                    selectedModel={state.selectedModel}
+                    showReasoning={settings?.effective.agent.showThinkingSummary ?? true}
+                    zh={zh}
+                    {...(message.entryId
+                      ? { onFork: () => void runCommand(
+                          window.deki.forkSession(message.entryId!),
+                          setError,
+                          async () => {
+                            await refresh();
+                            await refreshSessions();
+                          },
+                        ) }
+                      : {})}
+                  />
+                ))}
+              </div>
+              {conversationMessages.length > 0 && (
+                <nav className="conversation-map" aria-label={zh ? "对话导航" : "Conversation navigation"}>
+                  <div
+                    className="conversation-map-track"
+                    style={{ "--conversation-count": conversationMessages.length } as React.CSSProperties}
+                  >
+                    {conversationMessages.map((message, index) => {
+                      const summary = buildConversationSummary(message, zh);
+                      const selected = activeConversationId === message.id;
+                      const hoverDistance = hoveredConversationIndex < 0
+                        ? -1
+                        : Math.abs(index - hoveredConversationIndex);
+                      const proximityClass = hoverDistance >= 1 && hoverDistance <= 3
+                        ? ` proximity-${hoverDistance}`
+                        : "";
+                      return (
+                        <button
+                          className={`conversation-map-item${selected ? " active" : ""}${hoveredConversation?.id === message.id ? " hovered" : ""}${proximityClass}`}
+                          key={message.id}
+                          aria-label={`${zh ? `第 ${index + 1} 轮` : `Turn ${index + 1}`}: ${summary.title}`}
+                          aria-current={selected ? "true" : undefined}
+                          onClick={() => scrollToConversation(message.id)}
+                          onMouseEnter={(event) => {
+                            const rect = event.currentTarget.getBoundingClientRect();
+                            setHoveredConversation({
+                              id: message.id,
+                              left: rect.right + 12,
+                              top: Math.max(10, Math.min(
+                                rect.top + rect.height / 2 - 54,
+                                window.innerHeight - 132,
+                              )),
+                            });
+                          }}
+                          onMouseLeave={() => {
+                            setHoveredConversation((current) => current?.id === message.id
+                              ? undefined
+                              : current);
+                          }}
+                        >
+                          <span aria-hidden="true" />
+                        </button>
+                      );
+                    })}
+                  </div>
+                </nav>
+              )}
+              {hoveredConversation && hoveredConversationMessage && (
+                <div
+                  className="conversation-map-preview"
+                  role="tooltip"
+                  style={{ left: hoveredConversation.left, top: hoveredConversation.top }}
+                >
+                  <small>
+                    {zh
+                      ? `第 ${conversationMessages.indexOf(hoveredConversationMessage) + 1} 轮对话`
+                      : `Turn ${conversationMessages.indexOf(hoveredConversationMessage) + 1}`}
+                  </small>
+                  <strong>{buildConversationSummary(hoveredConversationMessage, zh).title}</strong>
+                  <p>{buildConversationSummary(hoveredConversationMessage, zh).detail}</p>
                 </div>
               )}
-              {messages.map((message) => (
-                <ConversationTurn
-                  key={message.id}
-                  message={message}
-                  models={state.models}
-                  selectedModel={state.selectedModel}
-                  showReasoning={settings?.effective.agent.showThinkingSummary ?? true}
-                  zh={zh}
-                  {...(message.entryId
-                    ? { onFork: () => void runCommand(
-                        window.deki.forkSession(message.entryId!),
-                        setError,
-                        async () => {
-                          await refresh();
-                          await refreshSessions();
-                        },
-                      ) }
-                    : {})}
-                />
-              ))}
             </div>
             <div className="composer">
               <div className="composer-card">
@@ -1482,7 +1600,11 @@ function ConversationTurn(props: {
     ? (model?.name ?? props.message.modelId ?? "Deki")
     : (props.zh ? "你" : "You");
   return (
-    <article className={`message-turn ${props.message.role}`}>
+    <article
+      className={`message-turn ${props.message.role}`}
+      data-conversation-anchor={assistant ? undefined : "true"}
+      data-message-id={props.message.id}
+    >
       <header className="message-turn-header">
         <div className={`message-avatar${assistant ? " assistant" : " user"}`}>
           {assistant
@@ -2238,6 +2360,35 @@ function getSessionTitle(session: SessionSummary, zh: boolean): string {
   return session.name?.trim()
     || session.firstMessage.trim()
     || (zh ? "新会话" : "New chat");
+}
+
+function buildConversationSummary(
+  message: ChatMessage,
+  zh: boolean,
+): { title: string; detail: string } {
+  const lines = message.content
+    .split(/\n+/)
+    .map((line) => line
+      .replace(/!\[[^\]]*\]\([^)]*\)/g, "")
+      .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+      .replace(/^[\s>*#\-+`\d.)]+/, "")
+      .replace(/[*_~`]/g, "")
+      .trim())
+    .filter(Boolean);
+  const attachmentNames = message.attachments?.map((attachment) => attachment.name).join("、");
+  const titleSource = lines[0]
+    || attachmentNames
+    || (zh ? "附件消息" : "Attachment message");
+  const detailSource = lines.slice(1).join(" ")
+    || (lines[0] && lines[0].length > 42 ? lines[0].slice(42) : "")
+    || attachmentNames
+    || (message.timestamp
+      ? `${zh ? "发送于" : "Sent at"} ${formatMessageTimestamp(message.timestamp, zh)}`
+      : (zh ? "用户消息" : "User message"));
+  return {
+    title: titleSource.length > 42 ? `${titleSource.slice(0, 42)}…` : titleSource,
+    detail: detailSource.length > 110 ? `${detailSource.slice(0, 110)}…` : detailSource,
+  };
 }
 
 function formatRelativeTime(value: string, zh: boolean): string {

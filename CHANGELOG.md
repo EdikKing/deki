@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.0.2] - 2026-07-29
+
 ### Fixed
 
 - Tool Gateway 统一限制并脱敏工作区与 MCP Tool 返回值，并对 Provider 调用实施并发控制。

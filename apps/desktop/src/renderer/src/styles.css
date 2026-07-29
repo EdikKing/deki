@@ -4613,3 +4613,216 @@ html[data-theme="light"] .settings-error {
     display: block;
   }
 }
+
+/* Settings visual system */
+.settings-page {
+  --settings-control-height: 34px;
+  --settings-control-radius: 7px;
+  --settings-control-border: color-mix(in srgb, var(--border) 82%, var(--text-muted));
+  --settings-divider: color-mix(in srgb, var(--border) 82%, transparent);
+}
+
+.settings-content,
+.settings-toolbar,
+.settings-section {
+  background: var(--bg-app);
+}
+
+.settings-nav {
+  border-color: var(--border);
+  background: color-mix(in srgb, var(--bg-surface) 94%, var(--bg-app));
+}
+
+.settings-nav > header {
+  color: var(--text-primary);
+}
+
+.settings-nav nav button {
+  color: var(--text-secondary);
+}
+
+.settings-nav nav button:hover {
+  color: var(--text-primary);
+  background: var(--bg-hover);
+}
+
+.settings-nav nav button.active {
+  color: var(--text-primary);
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg-surface));
+}
+
+.settings-toolbar {
+  border-color: var(--settings-divider);
+}
+
+.settings-toolbar p {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.scope-picker {
+  gap: 8px;
+  flex-wrap: nowrap;
+}
+
+.scope-picker label {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.scope-picker select,
+.scope-picker .small-action {
+  height: var(--settings-control-height);
+  flex: 0 0 auto;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.scope-picker .small-action {
+  padding-inline: 11px;
+}
+
+.scope-picker > .scope-select {
+  width: 150px;
+  min-width: 150px;
+}
+
+.scope-picker > .reset-select {
+  width: 190px;
+  min-width: 190px;
+}
+
+.settings-page :is(
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="color"]),
+  select,
+  textarea
+) {
+  border-color: var(--settings-control-border);
+  border-radius: var(--settings-control-radius);
+  color: var(--text-primary);
+  background-color: var(--bg-input);
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--shadow) 55%, transparent);
+  font-size: 12px;
+}
+
+.settings-page :is(
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="color"]),
+  select
+) {
+  min-height: var(--settings-control-height);
+}
+
+.settings-select-shell {
+  position: relative;
+  min-width: 0;
+  display: inline-block;
+  max-width: 100%;
+}
+
+.settings-select-shell::after {
+  position: absolute;
+  top: 50%;
+  right: 15px;
+  width: 7px;
+  height: 7px;
+  border-right: 1.5px solid var(--text-muted);
+  border-bottom: 1.5px solid var(--text-muted);
+  pointer-events: none;
+  content: "";
+  transform: translateY(-70%) rotate(45deg);
+}
+
+.settings-select-shell:has(select:disabled)::after {
+  opacity: 0.45;
+}
+
+.settings-select-shell > select {
+  width: 100%;
+  min-width: 0;
+  appearance: none;
+  padding-right: 38px;
+  background-image: none;
+}
+
+.setting-control > .settings-select-shell {
+  width: min(360px, 100%);
+  min-width: 220px;
+}
+
+.provider-type-picker > .settings-select-shell,
+.provider-detail-field > .settings-select-shell {
+  width: 100%;
+}
+
+.setting-control .button-group .settings-select-shell {
+  width: 150px;
+}
+
+.settings-page :is(
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="color"]),
+  select,
+  textarea
+):hover:not(:disabled) {
+  border-color: var(--border-strong);
+}
+
+.settings-page :is(
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="color"]),
+  select,
+  textarea
+):focus-visible {
+  outline: 0;
+  border-color: color-mix(in srgb, var(--accent) 72%, var(--border-strong));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+.settings-search {
+  color: var(--text-primary);
+  background: var(--bg-input);
+}
+
+.setting-row {
+  border-color: var(--settings-divider);
+}
+
+.setting-copy strong {
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.setting-copy p,
+.subsection-heading p {
+  color: var(--text-muted);
+}
+
+.source-badge {
+  padding: 2px 6px;
+  border-color: var(--border);
+  color: var(--text-muted);
+  background: var(--bg-surface);
+  font-size: 9px;
+}
+
+.settings-footer {
+  border-color: var(--settings-divider);
+  color: var(--text-muted);
+  background: var(--bg-surface);
+}
+
+.settings-footer .danger-outline {
+  border-color: color-mix(in srgb, var(--danger) 66%, var(--border));
+  color: var(--danger);
+}
+
+.settings-footer .danger-outline:hover {
+  color: white;
+  background: var(--danger);
+}
+
+@media (max-width: 700px) {
+  .scope-picker {
+    flex-wrap: wrap;
+  }
+}

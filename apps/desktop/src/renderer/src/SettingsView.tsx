@@ -265,19 +265,23 @@ export function SettingsView(props: {
           </div>
           <div className="scope-picker">
             <label>{zh ? "作用域" : "Scope"}</label>
-            <select aria-label={zh ? "设置作用域" : "Settings scope"} value={scope} onChange={(event) => setScope(event.target.value as SettingsScope)}>
-              <option value="global">{zh ? "全局" : "Global"}</option>
-              <option value="session">{zh ? "当前会话" : "Current session"}</option>
-              <option value="projectShared" disabled={!props.hasWorkspace || !projectScopedSections.has(section)}>{zh ? "当前项目（共享）" : "Current project (shared)"}</option>
-              <option value="projectLocal" disabled={!props.hasWorkspace || !projectScopedSections.has(section)}>{zh ? "当前项目（本机）" : "Current project (local)"}</option>
-            </select>
+            <SelectShell className="scope-select">
+              <select aria-label={zh ? "设置作用域" : "Settings scope"} value={scope} onChange={(event) => setScope(event.target.value as SettingsScope)}>
+                <option value="global">{zh ? "全局" : "Global"}</option>
+                <option value="session">{zh ? "当前会话" : "Current session"}</option>
+                <option value="projectShared" disabled={!props.hasWorkspace || !projectScopedSections.has(section)}>{zh ? "当前项目（共享）" : "Current project (shared)"}</option>
+                <option value="projectLocal" disabled={!props.hasWorkspace || !projectScopedSections.has(section)}>{zh ? "当前项目（本机）" : "Current project (local)"}</option>
+              </select>
+            </SelectShell>
             <button className="ghost small-action" disabled={saving} onClick={() => void reset([section])}>
               {zh ? "恢复本分类" : "Reset section"}
             </button>
-            <select aria-label={zh ? "选择单项设置" : "Select one setting"} value={resetKey} onChange={(event) => setResetKey(event.target.value)}>
-              <option value="">{zh ? "选择单项…" : "Select one…"}</option>
-              {resettableKeys.map((key) => <option value={key} key={key}>{key}</option>)}
-            </select>
+            <SelectShell className="reset-select">
+              <select aria-label={zh ? "选择单项设置" : "Select one setting"} value={resetKey} onChange={(event) => setResetKey(event.target.value)}>
+                <option value="">{zh ? "选择单项…" : "Select one…"}</option>
+                {resettableKeys.map((key) => <option value={key} key={key}>{key}</option>)}
+              </select>
+            </SelectShell>
             <button className="ghost small-action" disabled={saving || !resetKey} onClick={() => void reset([resetKey])}>
               {zh ? "恢复单项" : "Reset item"}
             </button>
@@ -433,32 +437,34 @@ function ModelSettings(props: SettingsComponentProps & {
       <section className="provider-picker-panel">
         <label className="provider-type-picker">
           <span>{zh ? "供应商类型" : "Provider type"}</span>
-          <select
-            aria-label={zh ? "供应商类型" : "Provider type"}
-            value={selectedProviderType}
-            onChange={(event) => {
-              const next = event.target.value;
-              setSelectedProviderType(next);
-              if (next === "custom") {
-                props.setEditing(emptyProvider(props.providers));
-              } else {
-                props.setEditing(undefined);
-              }
-            }}
-          >
-            <option value="">{zh ? "选择模型供应商…" : "Choose a model provider…"}</option>
-            {builtinModelProviders.map((definition) => {
-              const configured = props.providers.some((provider) => provider.id === definition.id);
-              return <option key={definition.id} value={definition.id}>
-                {definition.name}{configured ? (zh ? "（已添加）" : " (added)") : ""}
-              </option>;
-            })}
-            <option value="custom">
-              {customProviders.length > 0
-                ? (zh ? "自定义模型（已添加）" : "Custom model (added)")
-                : (zh ? "自定义模型" : "Custom model")}
-            </option>
-          </select>
+          <SelectShell>
+            <select
+              aria-label={zh ? "供应商类型" : "Provider type"}
+              value={selectedProviderType}
+              onChange={(event) => {
+                const next = event.target.value;
+                setSelectedProviderType(next);
+                if (next === "custom") {
+                  props.setEditing(emptyProvider(props.providers));
+                } else {
+                  props.setEditing(undefined);
+                }
+              }}
+            >
+              <option value="">{zh ? "选择模型供应商…" : "Choose a model provider…"}</option>
+              {builtinModelProviders.map((definition) => {
+                const configured = props.providers.some((provider) => provider.id === definition.id);
+                return <option key={definition.id} value={definition.id}>
+                  {definition.name}{configured ? (zh ? "（已添加）" : " (added)") : ""}
+                </option>;
+              })}
+              <option value="custom">
+                {customProviders.length > 0
+                  ? (zh ? "自定义模型（已添加）" : "Custom model (added)")
+                  : (zh ? "自定义模型" : "Custom model")}
+              </option>
+            </select>
+          </SelectShell>
         </label>
         {!selectedProviderType && <div className="provider-picker-empty">
           <span aria-hidden="true">＋</span>
@@ -722,12 +728,14 @@ function ProviderManager(props: {
         </label>
         <label className="provider-detail-field">
           <span>{props.zh ? "API 格式" : "API format"}</span>
-          <select value={draft.api ?? "openai-completions"} onChange={(event) => set({ api: event.target.value })}>
-            <option value="openai-completions">OpenAI Chat Completions</option>
-            <option value="openai-responses">OpenAI Responses</option>
-            <option value="anthropic-messages">Anthropic Messages</option>
-            <option value="google-generative-ai">Google Generative AI</option>
-          </select>
+          <SelectShell>
+            <select value={draft.api ?? "openai-completions"} onChange={(event) => set({ api: event.target.value })}>
+              <option value="openai-completions">OpenAI Chat Completions</option>
+              <option value="openai-responses">OpenAI Responses</option>
+              <option value="anthropic-messages">Anthropic Messages</option>
+              <option value="google-generative-ai">Google Generative AI</option>
+            </select>
+          </SelectShell>
         </label>
         <div className="provider-detail-field provider-key-field">
           <div className="provider-field-heading">
@@ -1097,19 +1105,21 @@ function McpSettings({ value, source, zh, update, hasWorkspace }: SettingsCompon
               });
               await refresh();
             }} /> {zh ? "启用" : "Enabled"}</label>
-            <select value={tool.permission ?? ""} onChange={async (event) => {
-              const rule = server.tools[tool.name] ?? { enabled: true };
-              const permission = event.target.value as PermissionPolicy | "";
-              const { permission: _permission, ...withoutPermission } = rule;
-              await window.deki.upsertMcpServer({
-                ...server,
-                tools: {
-                  ...server.tools,
-                  [tool.name]: permission ? { ...rule, permission } : withoutPermission,
-                },
-              });
-              await refresh();
-            }}><option value="">{zh ? "自动策略" : "Automatic"}</option><option value="allow">allow</option><option value="ask">ask</option><option value="deny">deny</option></select>
+            <SelectShell>
+              <select value={tool.permission ?? ""} onChange={async (event) => {
+                const rule = server.tools[tool.name] ?? { enabled: true };
+                const permission = event.target.value as PermissionPolicy | "";
+                const { permission: _permission, ...withoutPermission } = rule;
+                await window.deki.upsertMcpServer({
+                  ...server,
+                  tools: {
+                    ...server.tools,
+                    [tool.name]: permission ? { ...rule, permission } : withoutPermission,
+                  },
+                });
+                await refresh();
+              }}><option value="">{zh ? "自动策略" : "Automatic"}</option><option value="allow">allow</option><option value="ask">ask</option><option value="deny">deny</option></select>
+            </SelectShell>
             <input type="number" min={1} max={600} value={(tool.timeoutMs ?? value.mcp.callTimeoutMs) / 1000} aria-label={`${tool.name} timeout`} onChange={async (event) => {
               const rule = server.tools[tool.name] ?? { enabled: true };
               await window.deki.upsertMcpServer({
@@ -1244,7 +1254,7 @@ function MemorySettings({ value, source, zh, update, hasWorkspace, taskId }: Set
     <Range title={zh ? "任务记忆 Token 预算" : "Task memory token budget"} path="memory.taskTokenBudget" value={value.memory.taskTokenBudget} min={0} max={10000} step={50} source={source} onChange={(taskTokenBudget) => update({ memory: { taskTokenBudget } })} />
     </>}
     {view === "center" && <div className="settings-subsection memory-center">
-      <div className="subsection-heading"><div><h2>{zh ? "记忆中心" : "Memory center"}</h2><p>{scopeDescription}</p></div><div className="button-group"><select value={memoryScope} onChange={(event) => setMemoryScope(event.target.value as MemoryScope)}>{scopeChoices.map((choice) => <option value={choice.scope} key={choice.scope}>{choice.label}</option>)}</select><button className="ghost small-action" onClick={() => void refresh()}>{zh ? "刷新" : "Refresh"}</button><button className="danger small-action" onClick={async () => {
+      <div className="subsection-heading"><div><h2>{zh ? "记忆中心" : "Memory center"}</h2><p>{scopeDescription}</p></div><div className="button-group"><SelectShell><select value={memoryScope} onChange={(event) => setMemoryScope(event.target.value as MemoryScope)}>{scopeChoices.map((choice) => <option value={choice.scope} key={choice.scope}>{choice.label}</option>)}</select></SelectShell><button className="ghost small-action" onClick={() => void refresh()}>{zh ? "刷新" : "Refresh"}</button><button className="danger small-action" onClick={async () => {
         if (!window.confirm(zh ? "彻底清理当前作用域全部记忆？" : "Permanently clear all memories in this scope?")) return;
         await window.deki.clearMemoryScope(memoryScope);
         await refresh();
@@ -1324,6 +1334,12 @@ function Setting(props: { title: string; description?: string | undefined; sourc
   return <div className="setting-row"><div className="setting-copy"><div><strong>{props.title}</strong><span className="source-badge">{formatSource(props.source)}</span></div>{props.description && <p>{props.description}</p>}</div><div className="setting-control">{labelControls(props.children, props.title)}</div></div>;
 }
 
+function SelectShell(props: { children: ReactElement; className?: string }) {
+  return <span className={`settings-select-shell${props.className ? ` ${props.className}` : ""}`}>
+    {props.children}
+  </span>;
+}
+
 function Toggle(props: { title: string; description?: string; path: string; checked: boolean; disabled?: boolean; source: (path: string) => string; onChange: (value: boolean) => Promise<void> }) {
   return <Setting title={props.title} description={props.description} source={props.source(props.path)}><label className="toggle"><input type="checkbox" disabled={props.disabled} checked={props.checked} onChange={(e) => void props.onChange(e.target.checked)} /><span /></label></Setting>;
 }
@@ -1349,7 +1365,11 @@ function labelControls(node: ReactNode, label: string): ReactNode {
   return Children.map(node, (child) => {
     if (!isValidElement(child)) return child;
     const element = child as ReactElement<{ children?: ReactNode; "aria-label"?: string }>;
-    if (typeof element.type === "string" && ["input", "select", "textarea"].includes(element.type)) {
+    if (element.type === "select") {
+      const select = cloneElement(element, element.props["aria-label"] ? {} : { "aria-label": label });
+      return <SelectShell>{select}</SelectShell>;
+    }
+    if (typeof element.type === "string" && ["input", "textarea"].includes(element.type)) {
       return cloneElement(element, element.props["aria-label"] ? {} : { "aria-label": label });
     }
     if (element.props.children !== undefined) {

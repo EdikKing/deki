@@ -766,6 +766,9 @@ select {
 }
 
 .chat-panel {
+  --chat-column-max-width: 740px;
+  --chat-column-gutter: clamp(54px, 7vw, 86px);
+
   min-width: 0;
   min-height: 0;
   display: grid;
@@ -784,11 +787,7 @@ select {
   height: 100%;
   overflow: auto;
   overscroll-behavior: contain;
-  padding: 22px clamp(18px, 3vw, 40px);
-}
-
-.messages-shell.has-conversation-map .messages {
-  padding-left: clamp(76px, 7vw, 104px);
+  padding: 22px var(--chat-column-gutter);
 }
 
 .conversation-map {
@@ -796,7 +795,7 @@ select {
   z-index: 12;
   top: 16px;
   bottom: 16px;
-  left: clamp(18px, 2.3vw, 34px);
+  left: max(10px, calc(50% - 422px));
   width: 44px;
   display: grid;
   place-items: center start;
@@ -925,8 +924,8 @@ select {
 }
 
 .message-turn {
-  width: 100%;
-  margin: 0 0 22px;
+  width: min(var(--chat-column-max-width), 100%);
+  margin: 0 auto 22px;
 }
 
 .message-turn-header {
@@ -1134,13 +1133,13 @@ select {
 }
 
 .composer {
-  padding: 12px 22px 20px;
+  padding: 12px var(--chat-column-gutter) 20px;
   background: linear-gradient(transparent, #080d19 25%);
 }
 
 .composer-card {
   position: relative;
-  width: min(920px, 100%);
+  width: min(var(--chat-column-max-width), 100%);
   margin: 0 auto;
   overflow: visible;
   border: 1px solid #2b3a58;
@@ -3913,6 +3912,10 @@ html[data-theme="light"] .settings-error {
 }
 
 @media (max-width: 700px) {
+  .chat-panel {
+    --chat-column-gutter: 46px;
+  }
+
   .app-shell {
     grid-template-columns: 72px minmax(0, 1fr);
   }
@@ -3946,14 +3949,6 @@ html[data-theme="light"] .settings-error {
     justify-content: center;
   }
 
-  .messages {
-    padding-inline: 18px;
-  }
-
-  .messages-shell.has-conversation-map .messages {
-    padding-left: 54px;
-  }
-
   .conversation-map {
     left: 12px;
     width: 32px;
@@ -3982,7 +3977,7 @@ html[data-theme="light"] .settings-error {
   }
 
   .composer {
-    padding-inline: 12px;
+    padding-inline: var(--chat-column-gutter);
   }
 
   .composer-input {

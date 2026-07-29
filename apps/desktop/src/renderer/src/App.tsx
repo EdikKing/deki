@@ -791,7 +791,7 @@ export function App() {
               setShowSettings(true);
             }}
           >
-            <span aria-hidden="true">⚙</span>
+            <SettingsIcon />
           </button>
         </div>
       </aside>
@@ -1772,6 +1772,18 @@ function FolderIcon() {
     aria-hidden="true"
   >
     <path d="M2.75 6.25A2.25 2.25 0 0 1 5 4h4.05c.6 0 1.17.24 1.59.66l1.34 1.34H19a2.25 2.25 0 0 1 2.25 2.25v8.5A2.25 2.25 0 0 1 19 19H5a2.25 2.25 0 0 1-2.25-2.25V6.25Z" />
+  </svg>;
+}
+
+function SettingsIcon() {
+  return <svg
+    className="settings-icon"
+    viewBox="0 0 24 24"
+    aria-hidden="true"
+  >
+    <path d="M4 8h7m6 0h3M4 16h3m6 0h7" />
+    <circle cx="14" cy="8" r="2.25" />
+    <circle cx="10" cy="16" r="2.25" />
   </svg>;
 }
 

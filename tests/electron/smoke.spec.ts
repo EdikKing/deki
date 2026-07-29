@@ -56,6 +56,11 @@ test("starts a general chat without a workspace", async ({}, testInfo) => {
     const defaultWorkspace = navigation.getByRole("button", { name: /默认工作区|Default workspace/ }).first();
     await expect(defaultWorkspace).toHaveAttribute("aria-expanded", "true");
     await expect(navigation.getByText(/新会话|New chat/)).toBeVisible();
+    const sessionListFontSizes = await navigation.locator(".session-tree-item").evaluate((element) => ({
+      metadata: getComputedStyle(element.querySelector("span")!).fontSize,
+      title: getComputedStyle(element.querySelector("strong")!).fontSize,
+    }));
+    expect(sessionListFontSizes).toEqual({ metadata: "9px", title: "11px" });
     await expect(navigation.getByRole("button", { name: "添加项目" })).toBeVisible();
     await defaultWorkspace.click();
     await expect(defaultWorkspace).toHaveAttribute("aria-expanded", "false");
@@ -1277,6 +1282,18 @@ test("trusts a workspace, streams fixture events, and recalls memory", async ({}
       inspectorBorder: "1px",
     });
     await expect(window.getByText("这是模拟的流式响应。")).toBeVisible();
+    const conversationFontSizes = await window.locator(".message-turn").evaluate((element) => ({
+      body: getComputedStyle(element.querySelector(".message-body")!).fontSize,
+      reasoning: getComputedStyle(element.querySelector(".reasoning-content")!).fontSize,
+      reasoningSummary: getComputedStyle(element.querySelector(".message-reasoning > summary")!).fontSize,
+      sender: getComputedStyle(element.querySelector(".message-sender strong")!).fontSize,
+    }));
+    expect(conversationFontSizes).toEqual({
+      body: "13px",
+      reasoning: "11px",
+      reasoningSummary: "11px",
+      sender: "13px",
+    });
     await expect.poll(() => window.locator(".messages").evaluate((element) => ({
       atBottom: Math.abs(element.scrollHeight - element.clientHeight - element.scrollTop) <= 1,
       scrollable: element.scrollHeight > element.clientHeight,

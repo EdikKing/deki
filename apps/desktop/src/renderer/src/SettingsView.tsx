@@ -118,6 +118,7 @@ export function SettingsView(props: {
   const [query, setQuery] = useState("");
   const [error, setError] = useState<string>();
   const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
   const [sessionPermissionPolicies, setSessionPermissionPolicies] = useState(
     props.sessionPermissionPolicies,
   );
@@ -138,6 +139,12 @@ export function SettingsView(props: {
   useEffect(() => {
     if (!props.hasWorkspace && scope !== "global" && scope !== "session") setScope("global");
   }, [props.hasWorkspace, scope]);
+
+  useEffect(() => {
+    if (!saved) return;
+    const timer = window.setTimeout(() => setSaved(false), 2400);
+    return () => window.clearTimeout(timer);
+  }, [saved]);
 
   useEffect(() => {
     if (
@@ -161,6 +168,7 @@ export function SettingsView(props: {
 
   async function update(patch: SettingsPatch) {
     setSaving(true);
+    setSaved(false);
     setError(undefined);
     try {
       const policies = patch.permissions?.policies;
@@ -172,10 +180,12 @@ export function SettingsView(props: {
       ) {
         await props.onSessionPermissionPoliciesChanged(policies);
         setSessionPermissionPolicies(policies);
+        setSaved(true);
         return;
       }
       const next = await window.deki.updateSettings(scope, patch, props.snapshot.revision);
       props.onChanged(next);
+      setSaved(true);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -185,10 +195,12 @@ export function SettingsView(props: {
 
   async function reset(keys?: string[]) {
     setSaving(true);
+    setSaved(false);
     setError(undefined);
     try {
       const next = await window.deki.resetSettings(scope, keys, props.snapshot.revision);
       props.onChanged(next);
+      setSaved(true);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -272,8 +284,10 @@ export function SettingsView(props: {
           </div>
         </header>
 
-        {error && <p className="settings-error">{error}</p>}
-        {props.snapshot.diagnostics.map((message) => <p className="settings-warning" key={message}>{message}</p>)}
+        <div className="settings-notices">
+          {error && <p className="settings-error">{error}</p>}
+          {props.snapshot.diagnostics.map((message) => <p className="settings-warning" key={message}>{message}</p>)}
+        </div>
 
         <div className="settings-section">
           {section === "general" && <GeneralSettings value={value} source={source} zh={zh} update={update} />}
@@ -316,7 +330,13 @@ export function SettingsView(props: {
         </div>
 
         <footer className="settings-footer">
-          <span>{saving ? (zh ? "正在保存…" : "Saving…") : (zh ? "所有更改已保存" : "All changes saved")}</span>
+          <span aria-live="polite">
+            {saving
+              ? (zh ? "正在保存…" : "Saving…")
+              : saved
+                ? (zh ? "所有更改已保存" : "All changes saved")
+                : ""}
+          </span>
           <button className="danger-outline" disabled={saving} onClick={() => {
             if (window.confirm(zh ? "恢复当前作用域的全部设置？此操作无法撤销。" : "Reset every setting in this scope? This cannot be undone.")) void reset();
           }}>

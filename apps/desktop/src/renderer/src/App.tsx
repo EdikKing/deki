@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import anthropicLogo from "@lobehub/icons-static-svg/icons/anthropic.svg?url";
@@ -92,6 +92,7 @@ export function App() {
   const [inspectorWidth, setInspectorWidth] = useState(330);
   const activeSessionId = useRef<string | undefined>(undefined);
   const attachmentInputRef = useRef<HTMLInputElement>(null);
+  const messagesRef = useRef<HTMLDivElement>(null);
 
   async function refresh() {
     setState(await window.deki.getBootstrapState());
@@ -311,6 +312,12 @@ export function App() {
     if (!state) return;
     setExpandedProjectKey(state.workspace ?? GENERAL_PROJECT_KEY);
   }, [state?.workspace]);
+
+  useLayoutEffect(() => {
+    const container = messagesRef.current;
+    if (!container) return;
+    container.scrollTop = container.scrollHeight;
+  }, [messages]);
 
   useEffect(() => {
     if (!settings) return;
@@ -836,7 +843,7 @@ export function App() {
           style={{ "--inspector-width": `${inspectorWidth}px` } as React.CSSProperties}
         >
           <section className="chat-panel">
-            <div className="messages">
+            <div className="messages" ref={messagesRef}>
               {messages.length === 0 && (
                 <div className="empty-state">
                   <p className="eyebrow">
@@ -891,13 +898,6 @@ export function App() {
                     : {})}
                 />
               ))}
-              {toolActivities.length > 0 && (
-                <section className="inline-tools" aria-label={zh ? "工具执行过程" : "Tool execution details"}>
-                  {toolActivities.slice(-6).map((activity) => (
-                    <ToolCard key={activity.callId} activity={activity} zh={zh} />
-                  ))}
-                </section>
-              )}
             </div>
             <div className="composer">
               <div className="composer-card">
@@ -1075,17 +1075,6 @@ export function App() {
                       ))}
                     >
                       <span aria-hidden="true">✦</span>
-                    </button>
-                    <button
-                      className="composer-tool"
-                      aria-label={zh ? "选择项目" : "Choose project"}
-                      onClick={() => void runCommand(
-                        window.deki.chooseWorkspace(),
-                        setError,
-                        refresh,
-                      )}
-                    >
-                      <FolderIcon />
                     </button>
                     <button
                       className="composer-submit composer-background"

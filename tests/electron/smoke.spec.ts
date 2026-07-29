@@ -91,7 +91,7 @@ test("starts a general chat without a workspace", async ({}, testInfo) => {
     await expect(generalPermissionMode).toContainText("无本地访问");
     await expect(generalPermissionMode).toBeDisabled();
     await expect(composer.getByRole("button", { name: "保存记忆" })).toBeVisible();
-    await expect(composer.getByRole("button", { name: "选择项目" })).toBeVisible();
+    await expect(composer.getByRole("button", { name: "选择项目" })).toHaveCount(0);
     await expect(composer.getByRole("button", { name: "后台运行" })).toBeVisible();
     await expect(composer.getByRole("button", { name: "后台运行" })).toBeDisabled();
     await expect(composer.getByRole("button", { name: "发送" })).toBeVisible();
@@ -1211,6 +1211,10 @@ test("automatically trusts a workspace selected from Add project", async ({}) =>
     await expect(window.getByRole("heading", { name: "从理解项目开始" })).toBeVisible();
     await expect(window.getByRole("heading", { name: "信任这个工作区？" })).toHaveCount(0);
     await expect(window.getByRole("button", { name: "选择权限模式" })).toBeDisabled();
+    const selectedWorkspace = await window.evaluate(
+      () => (globalThis as unknown as { deki: DekiDesktopApi }).deki.getBootstrapState(),
+    );
+    expect(selectedWorkspace.workspace).toBe(await realpath(workspace));
 
     const config = JSON.parse(
       await readFile(join(temporaryHome, ".deki", "config.json"), "utf8"),
@@ -1246,6 +1250,9 @@ test("trusts a workspace, streams fixture events, and recalls memory", async ({}
     const window = await electronApp.firstWindow();
     await expect(window.getByRole("heading", { name: /信任这个工作区|Trust this workspace/ })).toBeVisible();
     await expect(window.locator(".workspace-path")).toContainText("tests/fixtures/workspace");
+    const longMessageStyle = await window.addStyleTag({
+      content: ".message-turn { min-height: 1200px; }",
+    });
 
     await window.getByRole("button", { name: /信任并继续|Trust and continue/ }).click();
     await expect(window.getByText(/需要云模型凭据|Cloud credentials required/)).toBeVisible();
@@ -1270,6 +1277,13 @@ test("trusts a workspace, streams fixture events, and recalls memory", async ({}
       inspectorBorder: "1px",
     });
     await expect(window.getByText("这是模拟的流式响应。")).toBeVisible();
+    await expect.poll(() => window.locator(".messages").evaluate((element) => ({
+      atBottom: Math.abs(element.scrollHeight - element.clientHeight - element.scrollTop) <= 1,
+      scrollable: element.scrollHeight > element.clientHeight,
+    }))).toEqual({ atBottom: true, scrollable: true });
+    await longMessageStyle.evaluate((element) => {
+      element.parentNode?.removeChild(element);
+    });
     const messageLayout = await window.evaluate(() => {
       const region = document.querySelector<HTMLElement>(".messages")!.getBoundingClientRect();
       const turn = document.querySelector<HTMLElement>(".message-turn")!.getBoundingClientRect();
@@ -1291,12 +1305,13 @@ test("trusts a workspace, streams fixture events, and recalls memory", async ({}
       "先检查用户目标，再确认当前运行状态。",
     );
     await expect(window.locator(".message-sender strong", { hasText: "deepseek-v4-flash" })).toBeVisible();
-    await expect(window.locator(".tool-card summary strong").first()).toHaveText(
+    await expect(window.locator(".messages .tool-card")).toHaveCount(0);
+    const inspectorTool = window.locator(".side-panel .tool-card").first();
+    await expect(inspectorTool.locator("summary strong")).toHaveText(
       "deki__project_info",
     );
-    const inlineTool = window.locator(".inline-tools .tool-card").first();
-    await inlineTool.getByText("完成").click();
-    await expect(inlineTool.locator(".tool-payload", { hasText: "结果" })).toContainText("fixture");
+    await inspectorTool.getByText("完成").click();
+    await expect(inspectorTool.locator(".tool-payload", { hasText: "结果" })).toContainText("fixture");
     await expect(window.locator(".code-block code")).toContainText("const ready = true;");
     await expect(window.getByRole("button", { name: "复制代码" })).toBeVisible();
     await expect(window.getByRole("heading", { name: "变更 Diff" })).toBeVisible();

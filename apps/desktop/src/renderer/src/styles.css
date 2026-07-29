@@ -3331,11 +3331,6 @@ input[type="range"]::-webkit-slider-thumb {
   color: var(--text-secondary);
 }
 
-.inline-tools {
-  width: 100%;
-  margin: 0 0 16px;
-}
-
 .tool-card {
   margin: 7px 0;
   overflow: hidden;

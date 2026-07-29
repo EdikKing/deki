@@ -1400,6 +1400,7 @@ export type TaskSubmissionResult = z.infer<typeof taskSubmissionResultSchema>;
 export const taskListInputSchema = z.object({
   statuses: z.array(taskStatusSchema).max(taskStatusSchema.options.length).optional(),
   workspaceIds: z.array(z.string().min(1)).max(100).optional(),
+  kinds: z.array(taskKindSchema).max(taskKindSchema.options.length).optional(),
   query: z.string().trim().max(500).optional(),
   limit: z.number().int().min(1).max(500).default(100),
 }).strict();

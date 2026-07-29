@@ -585,11 +585,13 @@ export class TaskStore {
   listTaskSummaries(options: {
     statuses?: TaskStatus[];
     workspaceIds?: string[];
+    kinds?: TaskKind[];
     query?: string;
     limit?: number;
   } = {}): TaskSummary[] {
     const limit = Math.min(500, Math.max(1, options.limit ?? 100));
     if (options.statuses?.length === 0 || options.workspaceIds?.length === 0) return [];
+    if (options.kinds?.length === 0) return [];
     const clauses: string[] = [];
     const values: Array<string | number> = [];
     if (options.statuses?.length) {
@@ -599,6 +601,10 @@ export class TaskStore {
     if (options.workspaceIds?.length) {
       clauses.push(`workspace_id IN (${options.workspaceIds.map(() => "?").join(", ")})`);
       values.push(...options.workspaceIds);
+    }
+    if (options.kinds?.length) {
+      clauses.push(`kind IN (${options.kinds.map(() => "?").join(", ")})`);
+      values.push(...options.kinds);
     }
     if (options.query?.trim()) {
       const query = `%${options.query.trim()}%`;
@@ -4930,6 +4936,7 @@ export class TaskOrchestrator {
   listTaskSummaries(options: {
     statuses?: TaskStatus[];
     workspaceIds?: string[];
+    kinds?: TaskKind[];
     query?: string;
     limit?: number;
   } = {}): TaskSummary[] {
@@ -4943,6 +4950,7 @@ export class TaskOrchestrator {
   listTasks(options: {
     statuses?: TaskStatus[];
     workspaceIds?: string[];
+    kinds?: TaskKind[];
     query?: string;
     limit?: number;
   } = {}): TaskRecord[] {

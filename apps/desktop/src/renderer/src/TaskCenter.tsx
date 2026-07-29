@@ -4,6 +4,7 @@ import remarkGfm from "remark-gfm";
 import type {
   ArtifactRecord,
   TaskDetail,
+  TaskKind,
   TaskStatus,
   TaskSummary,
 } from "@deki-ai/shared";
@@ -80,14 +81,23 @@ export function TaskCenter(props: TaskCenterProps) {
   async function refreshTasks() {
     const sequence = taskRefreshSequence.current + 1;
     taskRefreshSequence.current = sequence;
+    const taskCenterKinds: TaskKind[] = [
+      "background",
+      "planning",
+      "worker",
+      "plan-execution",
+      "plan-step",
+      "integration",
+    ];
     const [rows, allRows] = await Promise.all([
       window.deki.listTasks({
         ...(query.trim() ? { query: query.trim() } : {}),
         ...(workspaceId ? { workspaceIds: [workspaceId] } : {}),
         ...(status ? { statuses: [status] } : {}),
+        kinds: taskCenterKinds,
         limit: 500,
       }),
-      window.deki.listTasks({ limit: 500 }),
+      window.deki.listTasks({ kinds: taskCenterKinds, limit: 500 }),
     ]);
     if (taskRefreshSequence.current !== sequence) return;
     setTasks(rows);

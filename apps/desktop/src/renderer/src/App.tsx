@@ -19,6 +19,7 @@ import type {
   PlanDetail,
   SessionSummary,
   SettingsSnapshot,
+  TaskKind,
   ThinkingLevel,
 } from "@deki-ai/shared";
 import { SettingsView } from "./SettingsView";
@@ -181,6 +182,14 @@ export function App() {
 
   useEffect(() => {
     const refreshAttention = async () => {
+      const sidebarKinds: TaskKind[] = [
+        "background",
+        "planning",
+        "worker",
+        "plan-execution",
+        "plan-step",
+        "integration",
+      ];
       const rows = await window.deki.listTasks({
         statuses: [
           "waiting_approval",
@@ -191,6 +200,7 @@ export function App() {
           "paused",
           "interrupted",
         ],
+        kinds: sidebarKinds,
         limit: 500,
       });
       setTaskAttentionCount(rows.filter((item) =>

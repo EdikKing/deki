@@ -458,6 +458,7 @@ class DesktopController {
       limit: input.limit,
       workspaceIds: input.workspaceIds ?? [this.#scopeId],
       ...(input.statuses ? { statuses: input.statuses } : {}),
+      ...(input.kinds ? { kinds: input.kinds } : {}),
       ...(input.query ? { query: input.query } : {}),
     });
   }
@@ -3052,6 +3053,7 @@ function registerIpcHandlers(): void {
         limit: input.limit,
         ...(input.statuses ? { statuses: input.statuses } : {}),
         ...(input.workspaceIds ? { workspaceIds: input.workspaceIds } : {}),
+        ...(input.kinds ? { kinds: input.kinds } : {}),
         ...(input.query ? { query: input.query } : {}),
       }) ?? [],
     );

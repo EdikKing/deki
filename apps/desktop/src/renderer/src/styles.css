@@ -788,7 +788,12 @@ select {
   height: 100%;
   overflow: auto;
   overscroll-behavior: contain;
+  scrollbar-width: none;
   padding: 22px var(--chat-column-gutter);
+}
+
+.messages::-webkit-scrollbar {
+  display: none;
 }
 
 .conversation-map {

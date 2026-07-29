@@ -31,6 +31,7 @@ import {
 } from "./builtinModelProviders";
 import { PermissionModeIcon } from "./PermissionModeIcon";
 import { findPendingApproval } from "./approvalState";
+import { shouldSubmitComposer } from "./composerKeyboard";
 import {
   detectPermissionMode,
   permissionModeCopy,
@@ -69,6 +70,7 @@ export function App() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [events, setEvents] = useState<AgentEvent[]>([]);
   const [prompt, setPrompt] = useState("");
+  const composerIsComposingRef = useRef(false);
   const [attachments, setAttachments] = useState<AttachmentDraft[]>([]);
   const [optimizingPrompt, setOptimizingPrompt] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -1272,6 +1274,12 @@ export function App() {
                       ? "未配置模型；仍可输入 /remember 保存项目记忆"
                       : (zh ? "请在设置中添加模型 Provider 或配置环境变量" : "Add a model provider in Settings or configure environment credentials")}
                   onChange={(event) => setPrompt(event.target.value)}
+                  onCompositionStart={() => {
+                    composerIsComposingRef.current = true;
+                  }}
+                  onCompositionEnd={() => {
+                    composerIsComposingRef.current = false;
+                  }}
                   onPaste={(event) => {
                     const files = Array.from(event.clipboardData.items)
                       .filter((item) => item.kind === "file")
@@ -1282,7 +1290,12 @@ export function App() {
                     void addFiles(files);
                   }}
                   onKeyDown={(event) => {
-                    if (event.key === "Enter" && !event.shiftKey) {
+                    if (shouldSubmitComposer({
+                      key: event.key,
+                      shiftKey: event.shiftKey,
+                      isComposing: composerIsComposingRef.current || event.nativeEvent.isComposing,
+                      keyCode: event.nativeEvent.keyCode,
+                    })) {
                       event.preventDefault();
                       if (optimizingPrompt) return;
                       void submit();

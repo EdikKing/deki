@@ -6,6 +6,7 @@ import {
   optimizePromptInputSchema,
   optimizePromptResultSchema,
   rememberInputSchema,
+  resolveSystemLocale,
   sendPromptInputSchema,
   taskEventSchema,
   taskListInputSchema,
@@ -19,6 +20,12 @@ import {
 } from "./index";
 
 describe("shared IPC schemas", () => {
+  it("resolves the supported locale from the system locale", () => {
+    expect(resolveSystemLocale("zh-Hans-CN")).toBe("zh-CN");
+    expect(resolveSystemLocale("en-GB")).toBe("en-US");
+    expect(resolveSystemLocale("ja-JP")).toBe("en-US");
+  });
+
   it("accepts a normalized streaming event", () => {
     const event = agentEventSchema.parse({
       type: "message.delta",

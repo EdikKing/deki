@@ -16,6 +16,7 @@ import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   ArtifactStore,
+  createImplementerCommitMessage,
   WorktreeRunner,
   scheduleWriteWaves,
   validateWriteSet,
@@ -30,6 +31,13 @@ afterEach(async () => {
 });
 
 describe("WorktreeRunner", () => {
+  it("uses a localized Conventional Commit message for internal commits", () => {
+    expect(createImplementerCommitMessage("zh-CN"))
+      .toBe("chore(deki): 保存实施任务变更");
+    expect(createImplementerCommitMessage("en-US"))
+      .toBe("chore(deki): save implementer changes");
+  });
+
   it("rejects path injection and marks lockfiles, SQL and migrations exclusive", () => {
     for (const path of ["../escape", "/absolute", ".git/config", "C:/windows"]) {
       expect(() => validateWriteSet([{ path, kind: "file", exclusive: false }]))
@@ -122,6 +130,8 @@ describe("WorktreeRunner", () => {
     expect(result.commit).toMatch(/^[0-9a-f]{40}$/);
     expect(result.changedFiles).toEqual(["tracked.txt"]);
     expect(result.validations[0]?.exitCode).toBe(0);
+    expect((await git(fixture.repo, "show", "-s", "--format=%s", result.commit!)).stdout.trim())
+      .toBe(createImplementerCommitMessage());
     const ref = await runner.createArtifactRef("commit-artifact", result.commit!);
     await runner.cleanup(resource);
     expect((await git(fixture.repo, "rev-parse", ref)).stdout.trim()).toBe(result.commit);

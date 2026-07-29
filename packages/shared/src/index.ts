@@ -1,5 +1,13 @@
 import { z } from "zod";
 
+export type DekiLocale = "zh-CN" | "en-US";
+
+export function resolveSystemLocale(
+  locale = Intl.DateTimeFormat().resolvedOptions().locale,
+): DekiLocale {
+  return locale.toLocaleLowerCase().startsWith("zh") ? "zh-CN" : "en-US";
+}
+
 export const permissionPolicySchema = z.enum(["allow", "ask", "deny"]);
 export type PermissionPolicy = z.infer<typeof permissionPolicySchema>;
 export const permissionCategorySchema = z.enum([

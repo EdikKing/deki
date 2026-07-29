@@ -5,9 +5,22 @@ import type {
 import { describe, expect, it, vi } from "vitest";
 import {
   AgentSessionEventSubscription,
+  renderBuiltInGitCommitInstructions,
   toolDefinitionSignature,
   translatePiAgentEvent,
 } from "./index.js";
+
+describe("built-in Git commit instructions", () => {
+  it("requires Conventional Commits in the system language", () => {
+    const chinese = renderBuiltInGitCommitInstructions("zh-CN");
+    const english = renderBuiltInGitCommitInstructions("en-US");
+
+    expect(chinese).toContain("`type(scope): description`");
+    expect(chinese).toContain("简体中文（zh-CN）");
+    expect(chinese).toContain("BREAKING CHANGE:");
+    expect(english).toContain("English (en-US)");
+  });
+});
 
 describe("Pi runtime event bridge", () => {
   it("translates streaming text and tool lifecycle events", () => {

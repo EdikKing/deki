@@ -23,9 +23,10 @@ import {
   resolve,
 } from "node:path";
 import { GitCheckpointManager } from "@deki-ai/git-checkpoint";
-import type {
-  ValidationTarget,
-  WorkerWriteSetEntry,
+import {
+  resolveSystemLocale,
+  type ValidationTarget,
+  type WorkerWriteSetEntry,
 } from "@deki-ai/shared";
 
 export interface RepositoryDescriptor {
@@ -104,6 +105,14 @@ const safeId = /^[A-Za-z0-9._-]{1,160}$/u;
 const gitHash = /^[0-9a-f]{40,64}$/iu;
 const temporaryBranchPrefix = "deki/";
 const defaultTimeoutMs = 120_000;
+
+export function createImplementerCommitMessage(
+  locale = resolveSystemLocale(),
+): string {
+  return locale === "zh-CN"
+    ? "chore(deki): 保存实施任务变更"
+    : "chore(deki): save implementer changes";
+}
 
 export class ArtifactStore {
   readonly #root: string;
@@ -415,7 +424,7 @@ export class WorktreeRunner {
       "-c", "user.email=agent@deki.local",
       "commit",
       "-m",
-      `Deki Implementer ${input.resource.id}`,
+      createImplementerCommitMessage(),
     ], this.#timeoutMs, input.signal);
     const commit = (await git(
       input.resource.path,

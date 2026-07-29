@@ -5,6 +5,7 @@ import type {
 import { describe, expect, it, vi } from "vitest";
 import {
   AgentSessionEventSubscription,
+  isSessionVisibleInSidebar,
   renderBuiltInGitCommitInstructions,
   toolDefinitionSignature,
   translatePiAgentEvent,
@@ -137,6 +138,51 @@ describe("MCP tool definition refresh", () => {
   });
 });
 
+describe("session sidebar visibility", () => {
+  it("hides task-only plan execution sessions", () => {
+    expect(isSessionVisibleInSidebar(fakeSessionManager([{
+      type: "custom",
+      customType: "deki.session-visibility",
+      data: { version: 1, visibility: "task-only", reason: "plan-execution" },
+    }]))).toBe(false);
+  });
+
+  it("lets an explicit user fork override inherited task-only metadata", () => {
+    expect(isSessionVisibleInSidebar(fakeSessionManager([{
+      type: "custom",
+      customType: "deki.session-visibility",
+      data: { version: 1, visibility: "task-only", reason: "plan-execution" },
+    }, {
+      type: "custom",
+      customType: "deki.session-visibility",
+      data: { version: 1, visibility: "sidebar", reason: "user-fork" },
+    }]))).toBe(true);
+  });
+
+  it("hides plan execution sessions created before visibility metadata existed", () => {
+    expect(isSessionVisibleInSidebar(fakeSessionManager([{
+      type: "message",
+      message: {
+        role: "user",
+        content: [{
+          type: "text",
+          text: "执行下面已由用户批准的计划。严格按依赖顺序串行执行，一次只执行一个步骤。\n\nplanId=fixture",
+        }],
+      },
+    }]))).toBe(false);
+  });
+
+  it("keeps ordinary user sessions visible", () => {
+    expect(isSessionVisibleInSidebar(fakeSessionManager([{
+      type: "message",
+      message: {
+        role: "user",
+        content: [{ type: "text", text: "检查当前项目的自动更新逻辑" }],
+      },
+    }]))).toBe(true);
+  });
+});
+
 function createFakeSession() {
   let listener: ((event: AgentSessionEvent) => void) | undefined;
   const unsubscribe = vi.fn(() => {
@@ -156,4 +202,12 @@ function createFakeSession() {
       listener?.(event);
     },
   };
+}
+
+function fakeSessionManager(
+  entries: unknown[],
+): Parameters<typeof isSessionVisibleInSidebar>[0] {
+  return {
+    getBranch: () => entries,
+  } as unknown as Parameters<typeof isSessionVisibleInSidebar>[0];
 }

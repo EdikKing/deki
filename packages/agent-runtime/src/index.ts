@@ -847,17 +847,16 @@ export class DekiAgentRuntime {
         || session.firstMessage.toLocaleLowerCase().includes(normalized)
         || session.allMessagesText.toLocaleLowerCase().includes(normalized))
       .sort((left, right) => right.modified.getTime() - left.modified.getTime())
-      .map((session) => {
-        const historicalRunState: ReturnType<typeof readRunState> = (() => {
-          try {
-            return readRunState(
-              SessionManager.open(session.path, directory, this.#options.workspace),
-            );
-          } catch {
-            return "failed";
-          }
-        })();
-        return {
+      .flatMap((session): SessionSummary[] => {
+        let manager: SessionManager | undefined;
+        try {
+          manager = SessionManager.open(session.path, directory, this.#options.workspace);
+        } catch {
+          // Keep damaged user sessions discoverable so they can still be inspected or removed.
+        }
+        if (manager && !isSessionVisibleInSidebar(manager)) return [];
+        const historicalRunState = manager ? readRunState(manager) : "failed";
+        return [{
           id: session.id,
           ...(session.name ? { name: session.name } : {}),
           createdAt: session.created.toISOString(),
@@ -871,7 +870,7 @@ export class DekiAgentRuntime {
           runState: runningSessionIds.has(session.id)
             ? "running" as const
             : historicalRunState,
-        };
+        }];
       });
   }
 
@@ -986,6 +985,11 @@ export class DekiAgentRuntime {
     });
     this.#sessionInteractionModes.set(runtime.session.sessionId, inheritedInteractionMode);
     this.#registerSessionConfiguration(runtime.session);
+    runtime.session.sessionManager.appendCustomEntry("deki.session-visibility", {
+      version: 1,
+      visibility: "sidebar",
+      reason: "user-fork",
+    });
     runtime.session.setSessionName(
       `${runtime.session.sessionName ?? "会话"} · 分叉`,
     );
@@ -1276,6 +1280,19 @@ export class DekiAgentRuntime {
         throw new Error("任务恢复失败：最新会话位置已不存在");
       }
       sessionManager.branch(input.context.sourceEntryId);
+    }
+    if (!workerMode) {
+      sessionManager.appendCustomEntry("deki.session-visibility", {
+        version: 1,
+        visibility: input.context.interactionMode === "plan-execution"
+          ? "task-only"
+          : "sidebar",
+        reason: input.context.interactionMode === "plan-execution"
+          ? "plan-execution"
+          : "background-prompt",
+        taskId: input.taskId,
+        runId: input.runId,
+      });
     }
     const background = await createAgentSessionRuntime(createRuntime, {
       cwd: this.#options.workspace,
@@ -2312,6 +2329,39 @@ export function toolDefinitionSignature(
       }))
       .sort((left, right) => left.name.localeCompare(right.name)),
   );
+}
+
+const LEGACY_PLAN_EXECUTION_PROMPT =
+  "执行下面已由用户批准的计划。严格按依赖顺序串行执行，一次只执行一个步骤。";
+
+export function isSessionVisibleInSidebar(
+  manager: Pick<SessionManager, "getBranch">,
+): boolean {
+  const entries = manager.getBranch();
+  const savedVisibility = [...entries].reverse().find(
+    (candidate) => candidate.type === "custom"
+      && candidate.customType === "deki.session-visibility",
+  );
+  if (
+    savedVisibility?.type === "custom"
+    && isRecord(savedVisibility.data)
+    && savedVisibility.data.visibility === "task-only"
+  ) return false;
+  if (
+    savedVisibility?.type === "custom"
+    && isRecord(savedVisibility.data)
+    && savedVisibility.data.visibility === "sidebar"
+  ) return true;
+
+  // Plan execution sessions created before visibility metadata was introduced
+  // contain this exact internal prompt. Keep those historical runs out of the
+  // user chat list while retaining their JSONL for Task Center and audit access.
+  return !entries.some((entry) => {
+    if (entry.type !== "message") return false;
+    const message = asUnknownRecord(entry.message);
+    return message.role === "user"
+      && extractMessageText(message.content).startsWith(LEGACY_PLAN_EXECUTION_PROMPT);
+  });
 }
 
 function readWorkerProfile(

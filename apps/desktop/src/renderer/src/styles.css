@@ -382,6 +382,12 @@ html[data-platform="darwin"] .sidebar-brand {
   box-shadow: 0 12px 32px var(--shadow);
 }
 
+.session-context-menu {
+  position: fixed;
+  z-index: 100;
+  width: 172px;
+}
+
 .session-action-menu > button {
   width: 100%;
   min-height: 32px;

@@ -88,6 +88,11 @@ export function App() {
   const [activeSession, setActiveSession] = useState<SessionSummary>();
   const [showAllSessions, setShowAllSessions] = useState(false);
   const [sessionMenuId, setSessionMenuId] = useState<string>();
+  const [sessionContextMenu, setSessionContextMenu] = useState<{
+    sessionId: string;
+    x: number;
+    y: number;
+  }>();
   const [pinnedSessionIds, setPinnedSessionIds] = useState(readPinnedSessionIds);
   const [expandedProjectKey, setExpandedProjectKey] = useState<string>(GENERAL_PROJECT_KEY);
   const [settingsSection, setSettingsSection] = useState<"models" | "permissions">();
@@ -107,13 +112,17 @@ export function App() {
   }, [pinnedSessionIds]);
 
   useEffect(() => {
-    if (!sessionMenuId) return;
+    if (!sessionMenuId && !sessionContextMenu) return;
     const closeMenu = (event: PointerEvent) => {
       if (event.target instanceof Element && event.target.closest("[data-session-menu-root]")) return;
       setSessionMenuId(undefined);
+      setSessionContextMenu(undefined);
     };
     const closeMenuOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setSessionMenuId(undefined);
+      if (event.key === "Escape") {
+        setSessionMenuId(undefined);
+        setSessionContextMenu(undefined);
+      }
     };
     document.addEventListener("pointerdown", closeMenu);
     document.addEventListener("keydown", closeMenuOnEscape);
@@ -121,7 +130,7 @@ export function App() {
       document.removeEventListener("pointerdown", closeMenu);
       document.removeEventListener("keydown", closeMenuOnEscape);
     };
-  }, [sessionMenuId]);
+  }, [sessionContextMenu, sessionMenuId]);
 
   async function refresh() {
     setState(await window.deki.getBootstrapState());
@@ -655,6 +664,63 @@ export function App() {
     await refreshSessions();
   }
 
+  function togglePinnedSession(sessionId: string) {
+    setPinnedSessionIds((current) => {
+      const next = new Set(current);
+      if (next.has(sessionId)) next.delete(sessionId);
+      else next.add(sessionId);
+      return next;
+    });
+    setSessionMenuId(undefined);
+    setSessionContextMenu(undefined);
+  }
+
+  function renameSessionFromMenu(session: SessionSummary) {
+    setSessionMenuId(undefined);
+    setSessionContextMenu(undefined);
+    const name = window.prompt(
+      zh ? "输入会话名称" : "Session name",
+      session.name ?? session.firstMessage,
+    );
+    if (name?.trim()) {
+      void runCommand(
+        window.deki.renameSession(session.id, name.trim()),
+        setError,
+        refreshSessions,
+      );
+    }
+  }
+
+  async function deleteSessionFromMenu(session: SessionSummary) {
+    setSessionContextMenu(undefined);
+    if (!window.confirm(zh ? "将此会话移到废纸篓？" : "Move this session to the trash?")) return;
+
+    if (session.current) {
+      const replacement = sessions.find((candidate) => candidate.id !== session.id);
+      const switchResult = replacement
+        ? await window.deki.switchSession(replacement.id)
+        : await window.deki.newSession();
+      if (!switchResult.ok) {
+        setError(switchResult.error ?? (zh ? "无法切换当前会话" : "Unable to switch the current session"));
+        return;
+      }
+      setMessages([]);
+      setEvents([]);
+    }
+
+    const result = await window.deki.deleteSession(session.id);
+    if (result.ok) {
+      setPinnedSessionIds((current) => {
+        const next = new Set(current);
+        next.delete(session.id);
+        return next;
+      });
+    }
+    setError(result.ok ? undefined : result.error ?? (zh ? "删除会话失败" : "Unable to delete session"));
+    await refresh();
+    await refreshSessions();
+  }
+
   const projectNodes = [
     ...projectWorkspaces.map((workspace) => ({
       key: workspace,
@@ -742,11 +808,21 @@ export function App() {
                           <div
                             className={`session-tree-row${session.current ? " active" : ""}${pinnedSessionIds.has(session.id) ? " pinned" : ""}`}
                             key={session.id}
+                            onContextMenu={(event) => {
+                              event.preventDefault();
+                              setSessionMenuId(undefined);
+                              setSessionContextMenu({
+                                sessionId: session.id,
+                                x: Math.max(8, Math.min(event.clientX, window.innerWidth - 180)),
+                                y: Math.max(8, Math.min(event.clientY, window.innerHeight - 126)),
+                              });
+                            }}
                           >
                             <button
                               className="session-tree-item"
                               disabled={busy}
                               onClick={() => {
+                                setSessionContextMenu(undefined);
                                 if (session.current) return;
                                 setActiveSession(session);
                                 setMessages([]);
@@ -770,6 +846,37 @@ export function App() {
                                 {formatRelativeTime(session.updatedAt, zh)}
                               </time>
                             </button>
+                            {sessionContextMenu?.sessionId === session.id && (
+                              <div
+                                className="session-action-menu session-context-menu"
+                                data-session-menu-root
+                                role="menu"
+                                style={{ left: sessionContextMenu.x, top: sessionContextMenu.y }}
+                              >
+                                <button role="menuitem" onClick={() => togglePinnedSession(session.id)}>
+                                  <PinIcon />
+                                  <span>{pinnedSessionIds.has(session.id)
+                                    ? (zh ? "取消置顶" : "Unpin")
+                                    : (zh ? "置顶会话" : "Pin session")}</span>
+                                </button>
+                                <button role="menuitem" onClick={() => renameSessionFromMenu(session)}>
+                                  <RenameIcon />
+                                  <span>{zh ? "重命名会话" : "Rename session"}</span>
+                                </button>
+                                <button
+                                  className="danger-text"
+                                  role="menuitem"
+                                  disabled={session.runState !== "idle"}
+                                  title={session.runState !== "idle"
+                                    ? (zh ? "运行中的会话不能删除" : "A running session cannot be deleted")
+                                    : undefined}
+                                  onClick={() => void deleteSessionFromMenu(session)}
+                                >
+                                  <TrashIcon />
+                                  <span>{zh ? "删除会话" : "Delete session"}</span>
+                                </button>
+                              </div>
+                            )}
                           </div>
                         ))}
                         {sortedSessions.length > 5 && (
@@ -861,15 +968,7 @@ export function App() {
               {sessionMenuId === activeSession.id && <div className="session-action-menu" role="menu">
                 <button
                   role="menuitem"
-                  onClick={() => {
-                    setPinnedSessionIds((current) => {
-                      const next = new Set(current);
-                      if (next.has(activeSession.id)) next.delete(activeSession.id);
-                      else next.add(activeSession.id);
-                      return next;
-                    });
-                    setSessionMenuId(undefined);
-                  }}
+                  onClick={() => togglePinnedSession(activeSession.id)}
                 >
                   <PinIcon />
                   <span>{pinnedSessionIds.has(activeSession.id)
@@ -878,20 +977,7 @@ export function App() {
                 </button>
                 <button
                   role="menuitem"
-                  onClick={() => {
-                    setSessionMenuId(undefined);
-                    const name = window.prompt(
-                      zh ? "输入会话名称" : "Session name",
-                      activeSession.name ?? activeSession.firstMessage,
-                    );
-                    if (name?.trim()) {
-                      void runCommand(
-                        window.deki.renameSession(activeSession.id, name.trim()),
-                        setError,
-                        refreshSessions,
-                      );
-                    }
-                  }}
+                  onClick={() => renameSessionFromMenu(activeSession)}
                 >
                   <RenameIcon />
                   <span>{zh ? "重命名会话" : "Rename session"}</span>
@@ -1870,6 +1956,13 @@ function RenameIcon() {
   return <svg className="session-action-icon" viewBox="0 0 20 20" aria-hidden="true">
     <path d="m4 13.8-.8 3 3-.8L15.5 6.7l-2.2-2.2L4 13.8Z" />
     <path d="m11.9 5.9 2.2 2.2" />
+  </svg>;
+}
+
+function TrashIcon() {
+  return <svg className="session-action-icon" viewBox="0 0 20 20" aria-hidden="true">
+    <path d="M4.5 6h11l-.7 10.3H5.2L4.5 6Z" />
+    <path d="M3.5 6h13M7.5 6V3.8h5V6M8 9v4.5M12 9v4.5" />
   </svg>;
 }
 

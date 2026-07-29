@@ -952,6 +952,132 @@ select {
   box-shadow: none;
 }
 
+.visually-hidden {
+  position: fixed;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.composer-attachments {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding: 12px 14px 0;
+}
+
+.composer-attachment {
+  min-width: 0;
+  max-width: 220px;
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr) 24px;
+  align-items: center;
+  gap: 8px;
+  padding: 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  background: var(--bg-elevated);
+}
+
+.composer-attachment img {
+  width: 38px;
+  height: 38px;
+  border-radius: 7px;
+  object-fit: cover;
+}
+
+.composer-attachment > span:nth-child(2),
+.message-attachment > span:last-child {
+  min-width: 0;
+}
+
+.composer-attachment strong,
+.composer-attachment small,
+.message-attachment strong,
+.message-attachment small {
+  display: block;
+}
+
+.composer-attachment strong,
+.message-attachment strong {
+  overflow: hidden;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-attachment small,
+.message-attachment small {
+  margin-top: 2px;
+  color: var(--text-muted);
+  font-size: 9px;
+}
+
+.composer-attachment button {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  color: var(--text-muted);
+  background: transparent;
+}
+
+.attachment-file-icon {
+  width: 38px;
+  height: 38px;
+  display: grid;
+  place-items: center;
+  border-radius: 7px;
+  color: var(--accent);
+  background: var(--accent-soft);
+  font-size: 17px;
+}
+
+.attachment-button-icon {
+  font-size: 21px;
+  font-weight: 300;
+  line-height: 1;
+}
+
+.message-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 7px;
+}
+
+.message-attachment {
+  min-width: 150px;
+  max-width: 260px;
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  padding: 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--bg-elevated) 75%, transparent);
+}
+
+.message-attachment.image {
+  display: block;
+  max-width: min(440px, 100%);
+}
+
+.message-attachment.image img {
+  display: block;
+  max-width: 100%;
+  max-height: 320px;
+  border-radius: 7px;
+  object-fit: contain;
+}
+
+.message-attachment.image > span {
+  display: block;
+  margin-top: 6px;
+}
+
 .composer-toolbar {
   min-height: 48px;
   display: flex;

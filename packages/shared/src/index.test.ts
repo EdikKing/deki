@@ -56,6 +56,24 @@ describe("shared IPC schemas", () => {
       prompt: "分析项目",
       mode: "background",
     }).mode).toBe("background");
+    expect(sendPromptInputSchema.parse({
+      prompt: "",
+      attachments: [{
+        name: "screenshot.png",
+        mimeType: "image/png",
+        size: 3,
+        data: "YWJj",
+      }],
+    }).attachments).toHaveLength(1);
+    expect(() => sendPromptInputSchema.parse({
+      prompt: "",
+      attachments: [{
+        name: "large.bin",
+        mimeType: "application/octet-stream",
+        size: 20 * 1024 * 1024 + 1,
+        data: "",
+      }],
+    })).toThrow();
   });
 
   it("validates prompt optimization requests and results", () => {

@@ -143,6 +143,8 @@ import {
   type McpServerEditor,
   type MemoryScope,
   type OptimizePromptResult,
+  type PromptAttachment,
+  type PromptAttachmentInput,
   type PlanDetail,
   type PlanEvent,
   type PlanListInput,
@@ -365,9 +367,23 @@ class DesktopController {
     prompt: string,
     mode: "foreground" | "background" = "foreground",
     interactionMode: "act" | "plan" = "act",
+    attachments: PromptAttachmentInput[] = [],
   ): Promise<TaskSubmissionResult> {
     const trimmed = prompt.trim();
+    const effectivePrompt = trimmed || (
+      attachments.length === 1
+        ? "<deki_attachment_only>Please analyze the attached file.</deki_attachment_only>"
+        : `<deki_attachment_only>Please analyze these ${attachments.length} attached files.</deki_attachment_only>`
+    );
+    const titlePrompt = trimmed || (
+      attachments.length === 1
+        ? `附件：${attachments[0]!.name}`
+        : `${attachments.length} 个附件`
+    );
     if (trimmed.startsWith("/")) {
+      if (attachments.length > 0) {
+        return { ok: false, error: "会话命令不能携带附件" };
+      }
       if (mode === "background") {
         return { ok: false, error: "会话命令不能在后台运行" };
       }
@@ -390,6 +406,7 @@ class DesktopController {
       if (mode === "foreground" && snapshot.streaming) {
         return { ok: false, error: "当前会话正在运行，请使用“后台运行”提交新任务" };
       }
+      const storedAttachments = await this.#storePromptAttachments(attachments);
       const hasPending = this.#tasks.listTasks({
         statuses: ["queued", "running", "waiting_approval", "waiting_user"],
         workspaceIds: [this.#scopeId],
@@ -400,8 +417,8 @@ class DesktopController {
       const task = this.#tasks.submitPrompt({
         workspaceId: this.#scopeId,
         ...(this.#workspace ? { workspacePath: this.#workspace } : {}),
-        title: createTaskTitle(trimmed),
-        prompt: trimmed,
+        title: createTaskTitle(titlePrompt),
+        prompt: effectivePrompt,
         kind: interactionMode === "plan"
           ? "planning"
           : mode === "background" ? "background" : "interactive",
@@ -417,12 +434,43 @@ class DesktopController {
           preferFork,
           interactionMode,
           deliveryMode: mode,
+          ...(storedAttachments.length ? { attachments: storedAttachments } : {}),
         },
       });
       return { ok: true, task };
     } catch (error) {
       return { ok: false, error: formatError(error) };
     }
+  }
+
+  async #storePromptAttachments(
+    attachments: PromptAttachmentInput[],
+  ): Promise<PromptAttachment[]> {
+    if (attachments.length === 0) return [];
+    const directory = join(this.#paths.artifactsRoot, "attachments", this.#scopeId);
+    await mkdir(directory, { recursive: true });
+    let totalBytes = 0;
+    const stored: PromptAttachment[] = [];
+    for (const attachment of attachments) {
+      const bytes = Buffer.from(attachment.data, "base64");
+      if (bytes.byteLength !== attachment.size) {
+        throw new Error(`附件大小校验失败：${attachment.name}`);
+      }
+      totalBytes += bytes.byteLength;
+      if (bytes.byteLength > 20 * 1024 * 1024 || totalBytes > 50 * 1024 * 1024) {
+        throw new Error("单个附件不能超过 20 MB，附件总大小不能超过 50 MB");
+      }
+      const safeName = attachment.name.replaceAll(/[^a-zA-Z0-9._\-\p{Script=Han}]/gu, "_");
+      const path = join(directory, `${randomUUID()}-${safeName || "attachment"}`);
+      await writeFile(path, bytes, { mode: 0o600 });
+      stored.push({
+        name: attachment.name,
+        mimeType: attachment.mimeType,
+        size: bytes.byteLength,
+        path,
+      });
+    }
+    return stored;
   }
 
   async optimizePrompt(prompt: string): Promise<OptimizePromptResult> {
@@ -713,6 +761,9 @@ class DesktopController {
       taskId: input.task.id,
       runId: input.run.id,
       prompt,
+      ...(input.execution.attachments
+        ? { attachments: input.execution.attachments }
+        : {}),
       context: {
         sourceSessionId: input.execution.sourceSessionId,
         ...(input.execution.sourceSessionFile
@@ -3028,9 +3079,9 @@ function registerIpcHandlers(): void {
   });
   ipcMain.handle(IPC_CHANNELS.sendPrompt, async (event, raw) => {
     assertTrustedSender(event);
-    const { prompt, mode, interactionMode } = sendPromptInputSchema.parse(raw);
+    const { prompt, attachments, mode, interactionMode } = sendPromptInputSchema.parse(raw);
     return taskSubmissionResultSchema.parse(
-      await controller?.sendPrompt(prompt, mode, interactionMode),
+      await controller?.sendPrompt(prompt, mode, interactionMode, attachments),
     );
   });
   ipcMain.handle(IPC_CHANNELS.optimizePrompt, async (event, raw) => {

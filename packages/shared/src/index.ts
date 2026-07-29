@@ -265,8 +265,30 @@ export const conversationMessageSchema = z.object({
   timestamp: z.string().datetime().optional(),
   providerId: z.string().optional(),
   modelId: z.string().optional(),
+  attachments: z.array(z.object({
+    name: z.string(),
+    mimeType: z.string(),
+    size: z.number().int().nonnegative(),
+    dataUrl: z.string().optional(),
+  }).strict()).max(10).optional(),
 }).strict();
 export type ConversationMessage = z.infer<typeof conversationMessageSchema>;
+
+export const promptAttachmentInputSchema = z.object({
+  name: z.string().trim().min(1).max(255),
+  mimeType: z.string().trim().min(1).max(255),
+  size: z.number().int().nonnegative().max(20 * 1024 * 1024),
+  data: z.string().max(28 * 1024 * 1024),
+}).strict();
+export type PromptAttachmentInput = z.infer<typeof promptAttachmentInputSchema>;
+
+export const promptAttachmentSchema = z.object({
+  name: z.string().min(1).max(255),
+  mimeType: z.string().min(1).max(255),
+  size: z.number().int().nonnegative().max(20 * 1024 * 1024),
+  path: z.string().min(1),
+}).strict();
+export type PromptAttachment = z.infer<typeof promptAttachmentSchema>;
 
 export const memorySourceSchema = z.object({
   kind: z.enum(["user_command", "agent_candidate", "migration"]),
@@ -1202,10 +1224,17 @@ export const trustWorkspaceInputSchema = z.object({
 });
 
 export const sendPromptInputSchema = z.object({
-  prompt: z.string().trim().min(1).max(100_000),
+  prompt: z.string().trim().max(100_000),
+  attachments: z.array(promptAttachmentInputSchema).max(10).default([]),
   mode: z.enum(["foreground", "background"]).default("foreground"),
   interactionMode: interactionModeSchema.default("act"),
-}).strict();
+}).strict().refine(
+  (input) => input.prompt.length > 0 || input.attachments.length > 0,
+  { message: "消息或附件不能为空" },
+).refine(
+  (input) => input.attachments.reduce((total, item) => total + item.size, 0) <= 50 * 1024 * 1024,
+  { message: "附件总大小不能超过 50 MB" },
+);
 
 export const optimizePromptInputSchema = z.object({
   prompt: z.string().trim().min(1).max(100_000),
@@ -1421,6 +1450,7 @@ export const taskIdInputSchema = z.object({
 export const promptSubmissionOptionsSchema = z.object({
   mode: z.enum(["foreground", "background"]).default("foreground"),
   interactionMode: interactionModeSchema.default("act"),
+  attachments: z.array(promptAttachmentInputSchema).max(10).default([]),
 }).strict();
 export type PromptSubmissionOptions = z.infer<typeof promptSubmissionOptionsSchema>;
 

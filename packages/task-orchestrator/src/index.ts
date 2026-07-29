@@ -104,6 +104,12 @@ export const promptExecutionInputSchema = z.object({
   planId: z.string().uuid().optional(),
   planRevision: z.number().int().positive().optional(),
   deliveryMode: z.enum(["foreground", "background"]).optional(),
+  attachments: z.array(z.object({
+    name: z.string().min(1).max(255),
+    mimeType: z.string().min(1).max(255),
+    size: z.number().int().nonnegative().max(20 * 1024 * 1024),
+    path: z.string().min(1),
+  }).strict()).max(10).optional(),
   workerProfile: workerProfileIdSchema.optional(),
   workerContext: workerContextPackageSchema.optional(),
   dagNodeId: z.string().uuid().optional(),

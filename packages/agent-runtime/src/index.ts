@@ -3,7 +3,11 @@ import { access, readFile, readdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { InMemoryCredentialStore, type Model } from "@earendil-works/pi-ai";
+import {
+  InMemoryCredentialStore,
+  type ImageContent,
+  type Model,
+} from "@earendil-works/pi-ai";
 import {
   createAgentSessionFromServices,
   createAgentSessionRuntime,
@@ -40,6 +44,7 @@ import {
   type MemoryScope,
   type ModelSummary,
   type PermissionPolicies,
+  type PromptAttachment,
   type PlanStep,
   type SessionSummary,
   type SessionHistoryState,
@@ -623,6 +628,7 @@ export class DekiAgentRuntime {
     taskId: string;
     runId: string;
     prompt: string;
+    attachments?: PromptAttachment[];
     context: AgentPromptContext;
   }): Promise<AgentPromptRunHandle> {
     const trimmed = input.prompt.trim();
@@ -665,7 +671,8 @@ export class DekiAgentRuntime {
     this.#emitForSession(runtime.session, { type: "run.started" }, execution);
     const completion = this.#executionContext.run(execution, async () => {
       try {
-        await runtime.session.prompt(trimmed);
+        const prepared = await preparePromptAttachments(trimmed, input.attachments ?? []);
+        await runtime.session.prompt(prepared.prompt, { images: prepared.images });
       } catch (error) {
         this.#appendRunState("failed", formatError(error));
         this.#emitForSession(runtime.session, {
@@ -879,7 +886,10 @@ export class DekiAgentRuntime {
       const reasoning = value.role === "assistant"
         ? extractMessageThinking(value.content)
         : "";
-      if (!content && !reasoning) return history;
+      const attachments = value.role === "user"
+        ? extractMessageAttachments(value.content)
+        : [];
+      if (!content && !reasoning && attachments.length === 0) return history;
       const timestamp = typeof value.timestamp === "number" && Number.isFinite(value.timestamp)
         ? new Date(value.timestamp).toISOString()
         : undefined;
@@ -892,6 +902,7 @@ export class DekiAgentRuntime {
         ...(timestamp ? { timestamp } : {}),
         ...(typeof value.provider === "string" ? { providerId: value.provider } : {}),
         ...(typeof value.model === "string" ? { modelId: value.model } : {}),
+        ...(attachments.length ? { attachments } : {}),
       };
       const previous = history.at(-1);
       if (next.role === "assistant" && previous?.role === "assistant") {
@@ -1185,6 +1196,7 @@ export class DekiAgentRuntime {
     taskId: string;
     runId: string;
     prompt: string;
+    attachments?: PromptAttachment[];
     context: AgentPromptContext;
   }): Promise<AgentPromptRunHandle> {
     const createRuntime = this.#createRuntimeFactory;
@@ -1336,7 +1348,13 @@ export class DekiAgentRuntime {
     this.#emitForSession(background.session, { type: "run.started" }, execution);
     const completion = this.#executionContext.run(
       execution,
-      async () => background.session.prompt(input.prompt),
+      async () => {
+        const prepared = await preparePromptAttachments(
+          input.prompt,
+          input.attachments ?? [],
+        );
+        await background.session.prompt(prepared.prompt, { images: prepared.images });
+      },
     )
       .catch((error: unknown) => {
         background.session.sessionManager.appendCustomEntry("deki.run-state", {
@@ -3136,14 +3154,165 @@ function asUnknownRecord(value: unknown): Record<string, unknown> {
 }
 
 function extractMessageText(content: unknown): string {
-  if (typeof content === "string") return content;
+  if (typeof content === "string") return stripAttachmentContext(content);
   if (!Array.isArray(content)) return "";
-  return content.flatMap((item) => {
+  const text = content.flatMap((item) => {
     const record = asUnknownRecord(item);
     return record.type === "text" && typeof record.text === "string"
       ? [record.text]
       : [];
   }).join("");
+  return stripAttachmentContext(text);
+}
+
+function extractMessageAttachments(
+  content: unknown,
+): NonNullable<ConversationMessage["attachments"]> {
+  const items = Array.isArray(content) ? content : [];
+  const rawText = items.flatMap((item) => {
+    const value = asUnknownRecord(item);
+    return value.type === "text" && typeof value.text === "string"
+      ? [value.text]
+      : [];
+  }).join("");
+  const metadataMatch = rawText.match(
+    /<deki_attachment_metadata>(.*?)<\/deki_attachment_metadata>/u,
+  );
+  const metadata = (() => {
+    if (!metadataMatch?.[1]) return [];
+    try {
+      const parsed = JSON.parse(metadataMatch[1]) as unknown;
+      if (!Array.isArray(parsed)) return [];
+      return parsed.flatMap((item) => {
+        const value = asUnknownRecord(item);
+        return typeof value.name === "string"
+          && typeof value.mimeType === "string"
+          && typeof value.size === "number"
+          ? [{
+              name: value.name,
+              mimeType: value.mimeType,
+              size: value.size,
+            }]
+          : [];
+      });
+    } catch {
+      return [];
+    }
+  })();
+  const imageItems = items.flatMap((item) => {
+    const value = asUnknownRecord(item);
+    if (
+      value.type !== "image"
+      || typeof value.data !== "string"
+      || typeof value.mimeType !== "string"
+    ) return [];
+    return [{
+      name: "",
+      mimeType: value.mimeType,
+      size: Math.floor(value.data.length * 0.75),
+      dataUrl: `data:${value.mimeType};base64,${value.data}`,
+    }];
+  });
+  if (metadata.length === 0) {
+    return imageItems.map((item, index) => ({
+      ...item,
+      name: `image-${index + 1}`,
+    }));
+  }
+  let imageIndex = 0;
+  return metadata.map((item) => {
+    if (!isVisionImage(item.mimeType)) return item;
+    const image = imageItems[imageIndex++];
+    return image ? { ...item, dataUrl: image.dataUrl } : item;
+  });
+}
+
+function stripAttachmentContext(text: string): string {
+  return text
+    .replace(/\n*<attached_files>[\s\S]*<\/attached_files>\s*$/u, "")
+    .replace(/^<deki_attachment_only>[\s\S]*<\/deki_attachment_only>$/u, "")
+    .trimEnd();
+}
+
+async function preparePromptAttachments(
+  prompt: string,
+  attachments: PromptAttachment[],
+): Promise<{ prompt: string; images: ImageContent[] }> {
+  if (attachments.length === 0) return { prompt, images: [] };
+  const images: ImageContent[] = [];
+  const descriptions: string[] = [];
+  let includedTextBytes = 0;
+  for (const attachment of attachments) {
+    const buffer = await readFile(attachment.path);
+    if (buffer.byteLength !== attachment.size) {
+      throw new Error(`附件已损坏或大小发生变化：${attachment.name}`);
+    }
+    if (isVisionImage(attachment.mimeType)) {
+      images.push({
+        type: "image",
+        data: buffer.toString("base64"),
+        mimeType: attachment.mimeType,
+      });
+      descriptions.push(`- ${escapeAttachmentMarkup(attachment.name)} (${attachment.mimeType}, image included)`);
+      continue;
+    }
+    if (isTextAttachment(attachment.name, attachment.mimeType)) {
+      const remaining = Math.max(0, 500_000 - includedTextBytes);
+      const slice = buffer.subarray(0, Math.min(buffer.byteLength, remaining));
+      includedTextBytes += slice.byteLength;
+      const truncated = slice.byteLength < buffer.byteLength;
+      descriptions.push([
+        `- ${escapeAttachmentMarkup(attachment.name)} (${attachment.mimeType}, ${attachment.size} bytes)`,
+        "```",
+        slice.toString("utf8"),
+        truncated ? "\n[内容过长，已截断]" : "",
+        "```",
+      ].join("\n"));
+      continue;
+    }
+    descriptions.push(
+      `- ${escapeAttachmentMarkup(attachment.name)} (${attachment.mimeType}, ${attachment.size} bytes; local path: ${escapeAttachmentMarkup(attachment.path)})`,
+    );
+  }
+  return {
+    prompt: [
+      prompt,
+      "",
+      "<attached_files>",
+      `<deki_attachment_metadata>${JSON.stringify(attachments.map((item) => ({
+        name: item.name,
+        mimeType: item.mimeType,
+        size: item.size,
+      }))).replaceAll("<", "\\u003c").replaceAll(">", "\\u003e")}</deki_attachment_metadata>`,
+      ...descriptions,
+      "</attached_files>",
+    ].join("\n"),
+    images,
+  };
+}
+
+function escapeAttachmentMarkup(value: string): string {
+  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+}
+
+function isVisionImage(mimeType: string): boolean {
+  return ["image/png", "image/jpeg", "image/gif", "image/webp"].includes(
+    mimeType.toLocaleLowerCase(),
+  );
+}
+
+function isTextAttachment(name: string, mimeType: string): boolean {
+  if (mimeType.startsWith("text/")) return true;
+  if ([
+    "application/json",
+    "application/javascript",
+    "application/typescript",
+    "application/xml",
+    "application/yaml",
+    "application/x-yaml",
+    "application/sql",
+  ].includes(mimeType.toLocaleLowerCase())) return true;
+  return /\.(?:c|cc|cpp|cs|css|csv|go|h|hpp|html|ini|java|js|json|jsx|kt|log|md|mjs|py|rb|rs|sh|sql|svg|toml|ts|tsx|txt|xml|yaml|yml)$/iu.test(name);
 }
 
 function unwrapPromptOptimization(content: string): string {

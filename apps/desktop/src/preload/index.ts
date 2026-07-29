@@ -87,6 +87,7 @@ const api: DekiDesktopApi = {
     return taskSubmissionResultSchema.parse(
       await ipcRenderer.invoke(IPC_CHANNELS.sendPrompt, {
         prompt,
+        attachments: parsedOptions.attachments,
         mode: parsedOptions.mode,
         interactionMode: parsedOptions.interactionMode,
       }),

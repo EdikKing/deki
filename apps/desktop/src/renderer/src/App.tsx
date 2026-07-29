@@ -17,6 +17,7 @@ import type {
   MemoryRecord,
   ModelSummary,
   PlanDetail,
+  PromptAttachmentInput,
   SessionSummary,
   SettingsSnapshot,
   TaskKind,
@@ -38,6 +39,11 @@ import {
 } from "./permissionModes";
 
 type ChatMessage = ConversationMessage;
+type AttachmentDraft = {
+  id: string;
+  file: File;
+  dataUrl?: string;
+};
 type ToolActivity = {
   callId: string;
   toolName: string;
@@ -61,6 +67,7 @@ export function App() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [events, setEvents] = useState<AgentEvent[]>([]);
   const [prompt, setPrompt] = useState("");
+  const [attachments, setAttachments] = useState<AttachmentDraft[]>([]);
   const [optimizingPrompt, setOptimizingPrompt] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
@@ -84,6 +91,7 @@ export function App() {
   const [inspectorOpen, setInspectorOpen] = useState(() => window.innerWidth > 980);
   const [inspectorWidth, setInspectorWidth] = useState(330);
   const activeSessionId = useRef<string | undefined>(undefined);
+  const attachmentInputRef = useRef<HTMLInputElement>(null);
 
   async function refresh() {
     setState(await window.deki.getBootstrapState());
@@ -438,13 +446,33 @@ export function App() {
 
   async function submit(mode: "foreground" | "background" = "foreground") {
     const value = prompt.trim();
-    if (!value || optimizingPrompt || (mode === "foreground" && busy)) return;
+    if ((!value && attachments.length === 0) || optimizingPrompt || (mode === "foreground" && busy)) return;
     const sessionCommand = value.startsWith("/");
-    if (mode === "background" && sessionCommand) {
-      setError(zh ? "会话命令不能在后台运行" : "Session commands cannot run in background");
+    if (sessionCommand && (mode === "background" || attachments.length > 0)) {
+      setError(zh
+        ? "会话命令不能在后台运行或携带附件"
+        : "Session commands cannot run in background or include attachments");
       return;
     }
+    let promptAttachments: PromptAttachmentInput[];
+    try {
+      promptAttachments = await Promise.all(
+        attachments.map((attachment) => fileToPromptAttachment(attachment.file)),
+      );
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+      return;
+    }
+    const optimisticAttachments = promptAttachments.map((attachment) => ({
+      name: attachment.name,
+      mimeType: attachment.mimeType,
+      size: attachment.size,
+      ...(isPreviewableImageMime(attachment.mimeType)
+        ? { dataUrl: `data:${attachment.mimeType};base64,${attachment.data}` }
+        : {}),
+    }));
     setPrompt("");
+    setAttachments([]);
     setError(undefined);
     if (mode === "foreground") {
       setMessages((current) => [
@@ -454,11 +482,18 @@ export function App() {
           role: "user",
           content: value,
           timestamp: new Date().toISOString(),
+          ...(optimisticAttachments.length
+            ? { attachments: optimisticAttachments }
+            : {}),
         },
       ]);
       setBusy(true);
     }
-    const result = await window.deki.sendPrompt(value, { mode, interactionMode });
+    const result = await window.deki.sendPrompt(value, {
+      mode,
+      interactionMode,
+      attachments: promptAttachments,
+    });
     if (mode === "foreground" && (!result.ok || sessionCommand)) {
       setBusy(false);
     }
@@ -470,6 +505,37 @@ export function App() {
       setForegroundTaskId(result.task.id);
     }
     await refresh();
+  }
+
+  async function addFiles(files: File[]) {
+    const available = Math.max(0, 10 - attachments.length);
+    const accepted = files.slice(0, available);
+    if (files.length > available) {
+      setError(zh ? "一次最多添加 10 个附件" : "You can attach up to 10 files");
+    }
+    const oversized = accepted.find((file) => file.size > 20 * 1024 * 1024);
+    if (oversized) {
+      setError(zh
+        ? `附件不能超过 20 MB：${oversized.name}`
+        : `Attachments cannot exceed 20 MB: ${oversized.name}`);
+      return;
+    }
+    const totalSize = attachments.reduce((total, item) => total + item.file.size, 0)
+      + accepted.reduce((total, file) => total + file.size, 0);
+    if (totalSize > 50 * 1024 * 1024) {
+      setError(zh
+        ? "附件总大小不能超过 50 MB"
+        : "The total attachment size cannot exceed 50 MB");
+      return;
+    }
+    const next = await Promise.all(accepted.map(async (file) => ({
+      id: crypto.randomUUID(),
+      file,
+      ...(isPreviewableImageMime(file.type)
+        ? { dataUrl: await fileToDataUrl(file) }
+        : {}),
+    })));
+    setAttachments((current) => [...current, ...next]);
   }
 
   async function optimizeCurrentPrompt() {
@@ -841,6 +907,25 @@ export function App() {
                     {zh ? "Plan 模式只读取和分析项目，不会修改文件" : "Plan mode reads and analyzes only; it cannot modify files"}
                   </div>
                 )}
+                {attachments.length > 0 && (
+                  <div className="composer-attachments" aria-label={zh ? "待发送附件" : "Pending attachments"}>
+                    {attachments.map((attachment) => (
+                      <div className="composer-attachment" key={attachment.id}>
+                        {attachment.dataUrl
+                          ? <img src={attachment.dataUrl} alt="" />
+                          : <span className="attachment-file-icon" aria-hidden="true">▤</span>}
+                        <span>
+                          <strong>{attachment.file.name}</strong>
+                          <small>{formatFileSize(attachment.file.size)}</small>
+                        </span>
+                        <button
+                          aria-label={zh ? `移除 ${attachment.file.name}` : `Remove ${attachment.file.name}`}
+                          onClick={() => setAttachments((current) => current.filter((item) => item.id !== attachment.id))}
+                        >×</button>
+                      </div>
+                    ))}
+                  </div>
+                )}
                 <textarea
                   className="composer-input"
                   value={prompt}
@@ -857,6 +942,15 @@ export function App() {
                       ? "未配置模型；仍可输入 /remember 保存项目记忆"
                       : (zh ? "请在设置中添加模型 Provider 或配置环境变量" : "Add a model provider in Settings or configure environment credentials")}
                   onChange={(event) => setPrompt(event.target.value)}
+                  onPaste={(event) => {
+                    const files = Array.from(event.clipboardData.items)
+                      .filter((item) => item.kind === "file")
+                      .map((item) => item.getAsFile())
+                      .filter((file): file is File => file !== null);
+                    if (files.length === 0) return;
+                    event.preventDefault();
+                    void addFiles(files);
+                  }}
                   onKeyDown={(event) => {
                     if (event.key === "Enter" && !event.shiftKey) {
                       event.preventDefault();
@@ -945,6 +1039,24 @@ export function App() {
                     )}
                   </div>
                   <div className="composer-actions">
+                    <input
+                      ref={attachmentInputRef}
+                      className="visually-hidden"
+                      type="file"
+                      multiple
+                      onChange={(event) => {
+                        void addFiles(Array.from(event.target.files ?? []));
+                        event.target.value = "";
+                      }}
+                    />
+                    <button
+                      className="composer-tool"
+                      aria-label={zh ? "添加图片或文件" : "Add images or files"}
+                      disabled={optimizingPrompt || attachments.length >= 10}
+                      onClick={() => attachmentInputRef.current?.click()}
+                    >
+                      <span className="attachment-button-icon" aria-hidden="true">＋</span>
+                    </button>
                     <button
                       className={`composer-tool prompt-optimizer${optimizingPrompt ? " optimizing" : ""}`}
                       aria-label={zh ? "优化输入" : "Optimize prompt"}
@@ -978,7 +1090,7 @@ export function App() {
                     <button
                       className="composer-submit composer-background"
                       aria-label={zh ? "后台运行" : "Run in background"}
-                      disabled={!prompt.trim() || optimizingPrompt || isSessionCommand || !state.ready}
+                      disabled={(!prompt.trim() && attachments.length === 0) || optimizingPrompt || isSessionCommand || !state.ready}
                       onClick={() => void submit("background")}
                     >
                       <span aria-hidden="true">↗</span>
@@ -1014,7 +1126,7 @@ export function App() {
                         aria-label={interactionMode === "plan"
                           ? (zh ? "生成计划" : "Generate plan")
                           : (zh ? "发送" : "Send")}
-                        disabled={optimizingPrompt || (!state.ready && !isSessionCommand)}
+                        disabled={optimizingPrompt || (!prompt.trim() && attachments.length === 0) || (!state.ready && !isSessionCommand)}
                         onClick={() => void submit("foreground")}
                       >
                         <span aria-hidden="true">↑</span>
@@ -1248,7 +1360,24 @@ function ConversationTurn(props: {
           </details>
         )}
         <div className={`message-body${assistant ? "" : " user-bubble"}`}>
-          <MarkdownContent content={props.message.content || "…"} zh={props.zh} />
+          {props.message.attachments && props.message.attachments.length > 0 && (
+            <div className="message-attachments">
+              {props.message.attachments.map((attachment, index) => (
+                <div className={`message-attachment${attachment.dataUrl ? " image" : ""}`} key={`${attachment.name}-${index}`}>
+                  {attachment.dataUrl
+                    ? <img src={attachment.dataUrl} alt={attachment.name} />
+                    : <span className="attachment-file-icon" aria-hidden="true">▤</span>}
+                  <span>
+                    <strong>{attachment.name}</strong>
+                    <small>{formatFileSize(attachment.size)}</small>
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+          {props.message.content
+            ? <MarkdownContent content={props.message.content} zh={props.zh} />
+            : (!props.message.attachments?.length && <MarkdownContent content="…" zh={props.zh} />)}
         </div>
         <div className="message-turn-actions">
           <button
@@ -1853,6 +1982,44 @@ async function runCommand(
   const result = await promise;
   setError(result.ok ? undefined : result.error ?? "操作失败");
   await refresh();
+}
+
+async function fileToPromptAttachment(file: File): Promise<PromptAttachmentInput> {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  let binary = "";
+  const chunkSize = 32_768;
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+  }
+  return {
+    name: file.name || "attachment",
+    mimeType: file.type || "application/octet-stream",
+    size: file.size,
+    data: btoa(binary),
+  };
+}
+
+function fileToDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.addEventListener("load", () => resolve(String(reader.result)));
+    reader.addEventListener("error", () => reject(
+      reader.error ?? new Error(`Unable to read ${file.name}`),
+    ));
+    reader.readAsDataURL(file);
+  });
+}
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.ceil(bytes / 1024)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function isPreviewableImageMime(mimeType: string): boolean {
+  return ["image/png", "image/jpeg", "image/gif", "image/webp"].includes(
+    mimeType.toLocaleLowerCase(),
+  );
 }
 
 function getWorkspaceName(workspace: string): string {

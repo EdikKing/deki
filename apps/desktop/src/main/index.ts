@@ -2955,7 +2955,7 @@ async function shutdownDesktopState(): Promise<void> {
 
 function createWindow(): BrowserWindow {
   const window = new BrowserWindow({
-    width: 1280,
+    width: 1360,
     height: 820,
     minWidth: 920,
     minHeight: 640,

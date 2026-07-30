@@ -4112,6 +4112,15 @@ html[data-theme="light"] .settings-error {
   background: color-mix(in srgb, var(--accent) 5%, var(--bg-elevated));
 }
 
+.conversation-plan-turn {
+  width: min(var(--chat-column-max-width), 100%);
+  margin: 0 auto 22px;
+}
+
+.conversation-plan-turn .plan-panel {
+  margin: 0;
+}
+
 .plan-panel-heading,
 .plan-panel-heading > div,
 .plan-panel-actions {
@@ -4313,6 +4322,84 @@ html[data-theme="light"] .settings-error {
   margin: 0;
   color: var(--text-muted);
   font-size: 12px;
+}
+
+.plan-worker-detail {
+  min-width: 0;
+  padding: 7px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-elevated);
+}
+
+.plan-worker-detail > summary {
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.plan-worker-message,
+.plan-worker-finding,
+.plan-worker-result {
+  margin-top: 8px;
+  padding: 8px;
+  border-radius: 7px;
+  background: var(--bg-input);
+  color: var(--text-secondary);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.plan-worker-message pre,
+.plan-worker-event,
+.plan-worker-finding pre,
+.plan-worker-detail > details pre,
+.plan-request pre {
+  max-height: 320px;
+  margin: 6px 0 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.plan-worker-result {
+  display: grid;
+  gap: 4px;
+}
+
+.plan-pending-requests {
+  display: grid;
+  gap: 8px;
+  padding: 9px;
+  border: 1px solid color-mix(in srgb, var(--accent) 38%, var(--border));
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+}
+
+.plan-request {
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-elevated);
+}
+
+.plan-request-input {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.plan-request-input textarea {
+  min-height: 64px;
+  flex: 1;
+  resize: vertical;
+}
+
+.plan-request-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 7px;
 }
 
 .plan-panel-actions {

@@ -667,6 +667,38 @@ describe("TaskStore", () => {
     store.close();
   });
 
+  it("filters foreground Plan work out of background task queries", async () => {
+    const store = await createStore();
+    store.createTask({
+      workspaceId: "workspace-a",
+      kind: "planning",
+      title: "前台计划",
+      goal: "前台计划",
+      execution: {
+        ...promptExecution(),
+        interactionMode: "plan",
+        deliveryMode: "foreground",
+      },
+    });
+    store.createTask({
+      workspaceId: "workspace-a",
+      kind: "background",
+      title: "后台任务",
+      goal: "后台任务",
+      execution: {
+        ...promptExecution(true),
+        deliveryMode: "background",
+      },
+    });
+
+    expect(store.listTaskSummaries({ deliveryModes: ["background"] })
+      .map((summary) => summary.task.title)).toEqual(["后台任务"]);
+    expect(store.listTaskSummaries({ deliveryModes: ["foreground"] })
+      .map((summary) => summary.task.title)).toEqual(["前台计划"]);
+    expect(store.listTaskSummaries({ deliveryModes: [] })).toEqual([]);
+    store.close();
+  });
+
   it("searches globally and persists workspace paths, requests, and summaries", async () => {
     const store = await createStore();
     const task = store.createTask({

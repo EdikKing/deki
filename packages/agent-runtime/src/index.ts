@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { access, readFile, readdir } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
   InMemoryCredentialStore,
@@ -875,85 +875,52 @@ export class DekiAgentRuntime {
   }
 
   getSessionHistory(): ConversationMessage[] {
-    const entries = this.#runtime?.session.sessionManager.getBranch() ?? [];
-    return entries.reduce<ConversationMessage[]>((history, entry, index) => {
-      if (entry.type !== "message") return history;
-      const message = entry.message;
-      const value = asUnknownRecord(message);
-      if (value.role !== "user" && value.role !== "assistant") return history;
-      const content = extractMessageText(value.content);
-      const reasoning = value.role === "assistant"
-        ? extractMessageThinking(value.content)
-        : "";
-      const attachments = value.role === "user"
-        ? extractMessageAttachments(value.content)
-        : [];
-      if (!content && !reasoning && attachments.length === 0) return history;
-      const timestamp = typeof value.timestamp === "number" && Number.isFinite(value.timestamp)
-        ? new Date(value.timestamp).toISOString()
-        : undefined;
-      const next: ConversationMessage = {
-        id: `${this.#runtime?.session.sessionId ?? "session"}-${entry.id || index}`,
-        entryId: entry.id,
-        role: value.role,
-        content,
-        ...(reasoning ? { reasoning } : {}),
-        ...(timestamp ? { timestamp } : {}),
-        ...(typeof value.provider === "string" ? { providerId: value.provider } : {}),
-        ...(typeof value.model === "string" ? { modelId: value.model } : {}),
-        ...(attachments.length ? { attachments } : {}),
-      };
-      const previous = history.at(-1);
-      if (next.role === "assistant" && previous?.role === "assistant") {
-        history[history.length - 1] = {
-          ...previous,
-          content: [previous.content, next.content].filter(Boolean).join("\n\n"),
-          ...((previous.reasoning || next.reasoning)
-            ? { reasoning: [previous.reasoning, next.reasoning].filter(Boolean).join("\n\n") }
-            : {}),
-          ...(next.providerId ? { providerId: next.providerId } : {}),
-          ...(next.modelId ? { modelId: next.modelId } : {}),
-        };
-        return history;
-      }
-      history.push(next);
-      return history;
-    }, []);
+    const manager = this.#runtime?.session.sessionManager;
+    return manager
+      ? readConversationHistory(manager, this.#runtime?.session.sessionId ?? "session")
+      : [];
   }
 
   getSessionHistoryState(): SessionHistoryState {
-    const entries = this.#runtime?.session.sessionManager.getBranch() ?? [];
-    const events = entries.flatMap((entry) => {
-      if (entry.type !== "custom" || entry.customType !== "deki.timeline") return [];
-      const parsed = agentEventSchema.safeParse(entry.data);
-      return parsed.success ? [parsed.data] : [];
-    });
-    const commandMessages = events.flatMap<ConversationMessage>((event) =>
-      event.type === "command.result"
-        ? [
-            {
-              id: `${event.eventId}-input`,
-              role: "user",
-              content: event.input ?? event.command,
-              timestamp: event.timestamp,
-            },
-            {
-              id: `${event.eventId}-output`,
-              role: "assistant",
-              content: event.output,
-              timestamp: event.timestamp,
-            },
-          ]
-        : []);
-    return {
-      messages: [...this.getSessionHistory(), ...commandMessages].sort(
-        (left, right) => (left.timestamp ?? "").localeCompare(right.timestamp ?? ""),
-      ),
-      events,
-      runState: this.#runtime?.session.isStreaming
-        ? "running"
-        : readRunState(this.#runtime?.session.sessionManager),
-    };
+    const manager = this.#runtime?.session.sessionManager;
+    return manager
+      ? readSessionHistoryState(
+          manager,
+          this.#runtime?.session.sessionId ?? "session",
+          Boolean(this.#runtime?.session.isStreaming),
+        )
+      : { messages: [], events: [], runState: "idle" };
+  }
+
+  getTaskSessionHistoryState(sessionFile: string, taskId: string): SessionHistoryState {
+    const scopeDirectory = join(
+      this.#options.paths.sessionsRoot,
+      this.#options.scopeId,
+    );
+    const workerDirectory = join(scopeDirectory, "workers");
+    const normalizedScopeDirectory = resolve(scopeDirectory);
+    const normalizedWorkerDirectory = resolve(workerDirectory);
+    const normalizedFile = resolve(sessionFile);
+    if (!normalizedFile.startsWith(`${normalizedScopeDirectory}${sep}`)) {
+      throw new Error("只能读取当前项目的内部 Plan 节点会话");
+    }
+    const manager = SessionManager.open(
+      normalizedFile,
+      scopeDirectory,
+      this.#options.workspace,
+    );
+    const workerSession = normalizedFile.startsWith(`${normalizedWorkerDirectory}${sep}`);
+    const taskOnlySession = manager.getBranch().some((entry) => (
+      entry.type === "custom"
+      && entry.customType === "deki.session-visibility"
+      && isRecord(entry.data)
+      && entry.data.visibility === "task-only"
+      && entry.data.taskId === taskId
+    ));
+    if (!workerSession && !taskOnlySession) {
+      throw new Error("只能读取当前项目的内部 Plan 节点会话");
+    }
+    return readSessionHistoryState(manager, manager.getSessionId(), false);
   }
 
   async forkSession(entryId: string): Promise<void> {
@@ -1282,14 +1249,15 @@ export class DekiAgentRuntime {
       sessionManager.branch(input.context.sourceEntryId);
     }
     if (!workerMode) {
+      const internalPlanSession = input.context.interactionMode === "plan-execution"
+        || (
+          input.context.interactionMode === "plan"
+          && Boolean(input.context.planId)
+        );
       sessionManager.appendCustomEntry("deki.session-visibility", {
         version: 1,
-        visibility: input.context.interactionMode === "plan-execution"
-          ? "task-only"
-          : "sidebar",
-        reason: input.context.interactionMode === "plan-execution"
-          ? "plan-execution"
-          : "background-prompt",
+        visibility: internalPlanSession ? "task-only" : "sidebar",
+        reason: internalPlanSession ? "plan-internal" : "background-prompt",
         taskId: input.taskId,
         runId: input.runId,
       });
@@ -2366,6 +2334,90 @@ export function isSessionVisibleInSidebar(
   });
 }
 
+function readConversationHistory(
+  manager: Pick<SessionManager, "getBranch">,
+  sessionId: string,
+): ConversationMessage[] {
+  return manager.getBranch().reduce<ConversationMessage[]>((history, entry, index) => {
+    if (entry.type !== "message") return history;
+    const value = asUnknownRecord(entry.message);
+    if (value.role !== "user" && value.role !== "assistant") return history;
+    const content = extractMessageText(value.content);
+    const reasoning = value.role === "assistant"
+      ? extractMessageThinking(value.content)
+      : "";
+    const attachments = value.role === "user"
+      ? extractMessageAttachments(value.content)
+      : [];
+    if (!content && !reasoning && attachments.length === 0) return history;
+    const timestamp = typeof value.timestamp === "number" && Number.isFinite(value.timestamp)
+      ? new Date(value.timestamp).toISOString()
+      : undefined;
+    const next: ConversationMessage = {
+      id: `${sessionId}-${entry.id || index}`,
+      entryId: entry.id,
+      role: value.role,
+      content,
+      ...(reasoning ? { reasoning } : {}),
+      ...(timestamp ? { timestamp } : {}),
+      ...(typeof value.provider === "string" ? { providerId: value.provider } : {}),
+      ...(typeof value.model === "string" ? { modelId: value.model } : {}),
+      ...(attachments.length ? { attachments } : {}),
+    };
+    const previous = history.at(-1);
+    if (next.role === "assistant" && previous?.role === "assistant") {
+      history[history.length - 1] = {
+        ...previous,
+        content: [previous.content, next.content].filter(Boolean).join("\n\n"),
+        ...((previous.reasoning || next.reasoning)
+          ? { reasoning: [previous.reasoning, next.reasoning].filter(Boolean).join("\n\n") }
+          : {}),
+        ...(next.providerId ? { providerId: next.providerId } : {}),
+        ...(next.modelId ? { modelId: next.modelId } : {}),
+      };
+      return history;
+    }
+    history.push(next);
+    return history;
+  }, []);
+}
+
+function readSessionHistoryState(
+  manager: Pick<SessionManager, "getBranch" | "getEntries">,
+  sessionId: string,
+  streaming: boolean,
+): SessionHistoryState {
+  const events = manager.getBranch().flatMap((entry) => {
+    if (entry.type !== "custom" || entry.customType !== "deki.timeline") return [];
+    const parsed = agentEventSchema.safeParse(entry.data);
+    return parsed.success ? [parsed.data] : [];
+  });
+  const commandMessages = events.flatMap<ConversationMessage>((event) =>
+    event.type === "command.result"
+      ? [
+          {
+            id: `${event.eventId}-input`,
+            role: "user",
+            content: event.input ?? event.command,
+            timestamp: event.timestamp,
+          },
+          {
+            id: `${event.eventId}-output`,
+            role: "assistant",
+            content: event.output,
+            timestamp: event.timestamp,
+          },
+        ]
+      : []);
+  return {
+    messages: [...readConversationHistory(manager, sessionId), ...commandMessages].sort(
+      (left, right) => (left.timestamp ?? "").localeCompare(right.timestamp ?? ""),
+    ),
+    events,
+    runState: streaming ? "running" : readRunState(manager),
+  };
+}
+
 function readWorkerProfile(
   manager: Pick<SessionManager, "getBranch">,
 ): WorkerProfileId | undefined {
@@ -3114,7 +3166,7 @@ async function resolveBranchScopeId(workspace: string, scopeId: string): Promise
 }
 
 function readRunState(
-  manager: SessionManager | undefined,
+  manager: Pick<SessionManager, "getEntries"> | undefined,
 ): "idle" | "running" | "interrupted" | "failed" {
   if (!manager) return "idle";
   const latest = [...manager.getEntries()].reverse().find(
@@ -3208,7 +3260,9 @@ function asUnknownRecord(value: unknown): Record<string, unknown> {
 }
 
 function extractMessageText(content: unknown): string {
-  if (typeof content === "string") return stripAttachmentContext(content);
+  if (typeof content === "string") return stripInternalPlanPrompt(
+    stripAttachmentContext(content),
+  );
   if (!Array.isArray(content)) return "";
   const text = content.flatMap((item) => {
     const record = asUnknownRecord(item);
@@ -3216,7 +3270,13 @@ function extractMessageText(content: unknown): string {
       ? [record.text]
       : [];
   }).join("");
-  return stripAttachmentContext(text);
+  return stripInternalPlanPrompt(stripAttachmentContext(text));
+}
+
+function stripInternalPlanPrompt(content: string): string {
+  return content.trimStart().startsWith("<deki_internal_plan_execution>")
+    ? ""
+    : content;
 }
 
 function extractMessageAttachments(

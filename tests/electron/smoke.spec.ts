@@ -440,6 +440,14 @@ test("runs a real Plan revision and replan flow through an OpenAI-compatible fix
     );
     await composer.getByRole("group", { name: "交互模式" })
       .getByRole("button", { name: "规划" }).click();
+    const rejectedBackgroundPlan = await window.evaluate(() => (
+      globalThis as unknown as { deki: DekiDesktopApi }
+    ).deki.sendPrompt("计划不能进入后台", {
+      mode: "background",
+      interactionMode: "plan",
+      attachments: [],
+    }));
+    expect(rejectedBackgroundPlan).toMatchObject({ ok: false });
     await composer.locator(".composer-input").fill("创建一个会触发重新规划的单步骤计划");
     await composer.getByRole("button", { name: "生成计划", exact: true }).click();
 
@@ -447,9 +455,25 @@ test("runs a real Plan revision and replan flow through an OpenAI-compatible fix
     await expect(panel).toBeVisible();
     await expect(panel.getByRole("button", { name: "批准并执行" }))
       .toBeEnabled({ timeout: 15_000 });
+    const sessionsBeforeApproval = await window.evaluate(() => (
+      globalThis as unknown as { deki: DekiDesktopApi }
+    ).deki.listSessions());
     await panel.getByRole("button", { name: "批准并执行" }).click();
 
     await expect(panel).toContainText("计划 v2", { timeout: 15_000 });
+    const planVisibility = await window.evaluate(async () => {
+      const api = (globalThis as unknown as { deki: DekiDesktopApi }).deki;
+      return {
+        sessions: await api.listSessions(),
+        backgroundPlanTasks: await api.listTasks({
+          deliveryModes: ["background"],
+          kinds: ["plan-execution"],
+          limit: 100,
+        }),
+      };
+    });
+    expect(planVisibility.sessions).toHaveLength(sessionsBeforeApproval.length);
+    expect(planVisibility.backgroundPlanTasks).toHaveLength(0);
     expect(modelServer.userPrompts.some((prompt) =>
       prompt.includes("Fixture assumption changed")
       && prompt.includes("fixture-evidence")
@@ -530,18 +554,24 @@ test("runs a budgeted DAG with mandatory Reviewer and Integrator gates", async (
     await expect(panel).toContainText("5/5", { timeout: 45_000 });
     await expect(readFile(join(workspace, "alpha.txt"), "utf8")).rejects.toThrow();
     await expect(readFile(join(workspace, "beta.txt"), "utf8")).rejects.toThrow();
+    await expect.poll(async () => window.evaluate(async () => {
+      const api = (globalThis as unknown as { deki: DekiDesktopApi }).deki;
+      const root = (await api.listTasks({ deliveryModes: ["foreground"], limit: 100 }))
+        .find((summary) => summary.task.kind === "plan-execution");
+      const detail = root ? await api.getTask(root.task.id) : null;
+      return detail?.requests.some((request) => request.status === "pending") ?? false;
+    }), { timeout: 20_000 }).toBe(true);
+    await expect(panel.getByText("需要你的处理")).toBeVisible({ timeout: 20_000 });
+    await panel.getByRole("button", { name: "应用到工作区" }).click();
 
     const result = await window.evaluate(async () => {
       const api = (globalThis as unknown as { deki: DekiDesktopApi }).deki;
-      const root = (await api.listTasks({ limit: 100 }))
+      const root = (await api.listTasks({ deliveryModes: ["foreground"], limit: 100 }))
         .find((summary) => summary.task.kind === "plan-execution");
       const detail = root ? await api.getTask(root.task.id) : null;
       const plan = (await api.listPlans({ limit: 20 }))[0];
       const planDetail = plan ? await api.getPlan(plan.plan.id) : null;
-      const request = detail?.requests.find((candidate) => candidate.status === "pending");
-      if (!root || !detail || !request) return { ok: false, detail, planDetail };
-      const decision = await api.respondToIntegration(root.task.id, request.id, "apply");
-      return { ok: decision.ok, detail, planDetail };
+      return { ok: Boolean(root && detail), detail, planDetail };
     });
     expect(result.ok).toBe(true);
     expect(result.detail?.children.filter((child) =>
@@ -551,9 +581,9 @@ test("runs a budgeted DAG with mandatory Reviewer and Integrator gates", async (
     expect(result.planDetail?.executionGraph?.usage.inputTokens ?? 0)
       .toBeLessThanOrEqual(100_000);
     expect(modelServer.maxWorkerConcurrency).toBeGreaterThanOrEqual(2);
-    await expect.poll(() => readFile(join(workspace, "alpha.txt"), "utf8"))
+    await expect.poll(() => readFile(join(workspace, "alpha.txt"), "utf8").catch(() => ""))
       .toContain("alpha implemented");
-    expect(await readFile(join(workspace, "beta.txt"), "utf8"))
+    await expect.poll(() => readFile(join(workspace, "beta.txt"), "utf8").catch(() => ""))
       .toContain("beta implemented");
   } finally {
     await electronApp.close();

@@ -84,7 +84,7 @@ export function App() {
   const [foregroundTaskId, setForegroundTaskId] = useState<string>();
   const [backgroundTask, setBackgroundTask] = useState<{ id: string; title: string }>();
   const [interactionMode, setInteractionMode] = useState<"act" | "plan">("act");
-  const [activePlan, setActivePlan] = useState<PlanDetail | null>(null);
+  const [plans, setPlans] = useState<PlanDetail[]>([]);
   const [approval, setApproval] = useState<Extract<AgentEvent, { type: "approval.requested" }>>();
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [activeSession, setActiveSession] = useState<SessionSummary>();
@@ -113,6 +113,7 @@ export function App() {
   });
   const activeSessionId = useRef<string | undefined>(undefined);
   const foregroundTaskIdRef = useRef<string | undefined>(undefined);
+  const plansRef = useRef<PlanDetail[]>([]);
   const attachmentInputRef = useRef<HTMLInputElement>(null);
   const messagesRef = useRef<HTMLDivElement>(null);
   const conversationMapRef = useRef<HTMLDivElement>(null);
@@ -157,19 +158,58 @@ export function App() {
 
   async function refreshPlan(planId?: string) {
     if (planId) {
-      setActivePlan(await window.deki.getPlan(planId));
+      const detail = await window.deki.getPlan(planId);
+      if (detail) syncForegroundPlanTask(detail);
+      setPlans((current) => detail
+        ? [...current.filter((candidate) => candidate.plan.id !== planId), detail]
+            .sort((left, right) => left.plan.createdAt.localeCompare(right.plan.createdAt))
+        : current.filter((candidate) => candidate.plan.id !== planId));
       return;
     }
     if (!activeSessionId.current) {
-      setActivePlan(null);
+      setPlans([]);
       return;
     }
-    const plans = await window.deki.listPlans({ limit: 100 });
-    const current = plans.find(
+    const summaries = await window.deki.listPlans({ limit: 100 });
+    const current = summaries.filter(
       (summary) => summary.plan.sessionId === activeSessionId.current,
     );
-    setActivePlan(current ? await window.deki.getPlan(current.plan.id) : null);
+    const details = await Promise.all(current.map((summary) =>
+      window.deki.getPlan(summary.plan.id)));
+    const loaded = details.filter((detail): detail is PlanDetail => Boolean(detail))
+      .sort((left, right) => left.plan.createdAt.localeCompare(right.plan.createdAt));
+    const running = [...loaded].reverse().find((detail) => activePlanTask(detail));
+    if (running) syncForegroundPlanTask(running);
+    setPlans(loaded);
   }
+
+  function syncForegroundPlanTask(detail: PlanDetail) {
+    const task = activePlanTask(detail);
+    if (!task) return;
+    const current = foregroundTaskIdRef.current;
+    const belongsToPlan = current === detail.plan.planningTaskId
+      || current === detail.plan.executionTaskId
+      || detail.executionGraph?.nodes.some((node) => node.taskId === current);
+    if (current && !belongsToPlan) return;
+    if (current === task.id) return;
+    foregroundTaskIdRef.current = task.id;
+    setForegroundTaskId(task.id);
+    setBusy(true);
+  }
+
+  useEffect(() => {
+    plansRef.current = plans;
+  }, [plans]);
+
+  const activePlan = plans.at(-1) ?? null;
+  const foregroundPlanTaskId = foregroundTaskId && (
+    interactionMode === "plan"
+    || plans.some((detail) =>
+      detail.plan.planningTaskId === foregroundTaskId
+      || detail.plan.executionTaskId === foregroundTaskId)
+  )
+    ? foregroundTaskId
+    : undefined;
 
   async function refreshLinkedTask(sessionId = activeSessionId.current) {
     if (!sessionId) {
@@ -210,11 +250,20 @@ export function App() {
       if (belongsToActiveSession && event.type === "run.failed") {
         setError(event.error);
       }
+      const belongsToForegroundPlan = Boolean(
+        event.taskId
+        && plansRef.current.some((detail) =>
+          detail.plan.executionTaskId === event.taskId
+          || detail.executionGraph?.nodes.some((node) => node.taskId === event.taskId)),
+      );
       if (
         belongsToActiveSession
         && event.type === "approval.requested"
         && (!event.taskId || event.sessionId === activeSessionId.current)
       ) setApproval(event);
+      if (belongsToForegroundPlan && event.type === "approval.requested") {
+        setApproval(event);
+      }
       if (event.type === "approval.resolved") {
         setApproval((current) => current?.requestId === event.requestId ? undefined : current);
       }
@@ -257,6 +306,7 @@ export function App() {
           "interrupted",
         ],
         kinds: sidebarKinds,
+        deliveryModes: ["background"],
         limit: 500,
       });
       setTaskAttentionCount(rows.filter((item) =>
@@ -304,8 +354,11 @@ export function App() {
       }
     });
     const unsubscribeOpenTask = window.deki.subscribeOpenTask((taskId) => {
-      setSelectedTaskId(taskId);
-      setShowTaskCenter(true);
+      void (async () => {
+        if (!await pauseForegroundPlanBeforeLeaving()) return;
+        setSelectedTaskId(taskId);
+        setShowTaskCenter(true);
+      })();
     });
     const unsubscribePlans = window.deki.subscribePlanEvents((event) => {
       if (event.planId === activePlan?.plan.id || event.taskId === foregroundTaskId) {
@@ -315,8 +368,18 @@ export function App() {
       }
     });
     const unsubscribeOpenPlan = window.deki.subscribeOpenPlan((planId) => {
-      setInspectorOpen(true);
-      void refreshPlan(planId);
+      void (async () => {
+        if (!await pauseForegroundPlanBeforeLeaving()) return;
+        const result = await window.deki.openPlanSession(planId);
+        if (!result.ok) {
+          setError(result.error ?? (zh ? "无法打开计划会话" : "Unable to open plan chat"));
+          return;
+        }
+        setShowTaskCenter(false);
+        await refresh();
+        await refreshSessions();
+        await refreshPlan(planId);
+      })();
     });
     return () => {
       unsubscribeTasks();
@@ -346,6 +409,7 @@ export function App() {
     if (!state.sessionId) {
       setActiveSession(undefined);
       setMessages([]);
+      setPlans([]);
       return;
     }
     void window.deki.getSessionHistoryState()
@@ -441,6 +505,18 @@ export function App() {
     () => messages.filter((message) => message.role === "user"),
     [messages],
   );
+  const conversationTimeline = useMemo(() => [
+    ...messages.map((message) => ({
+      kind: "message" as const,
+      timestamp: message.timestamp ?? "",
+      message,
+    })),
+    ...plans.map((detail) => ({
+      kind: "plan" as const,
+      timestamp: detail.plan.createdAt,
+      detail,
+    })),
+  ].sort((left, right) => left.timestamp.localeCompare(right.timestamp)), [messages, plans]);
   const hoveredConversationMessage = hoveredConversation
     ? conversationMessages.find((message) => message.id === hoveredConversation.id)
     : undefined;
@@ -702,8 +778,26 @@ export function App() {
     }
   }
 
+  async function pauseForegroundPlanBeforeLeaving(): Promise<boolean> {
+    if (!foregroundPlanTaskId) return true;
+    if (!window.confirm(zh
+      ? "当前计划仍在执行。暂停计划并离开当前对话？"
+      : "The plan is still running. Pause it and leave this chat?")) return false;
+    const result = await window.deki.pauseTask(foregroundPlanTaskId);
+    if (!result.ok) {
+      setError(result.error ?? (zh ? "无法暂停当前计划" : "Unable to pause the plan"));
+      return false;
+    }
+    foregroundTaskIdRef.current = undefined;
+    setForegroundTaskId(undefined);
+    setBusy(false);
+    await refreshPlan();
+    return true;
+  }
+
   async function switchProjectContext(workspace?: string) {
-    if (foregroundTaskId) {
+    if (!await pauseForegroundPlanBeforeLeaving()) return undefined;
+    if (foregroundTaskId && foregroundTaskId !== foregroundPlanTaskId) {
       const promoted = await window.deki.promoteTask(foregroundTaskId);
       if (!promoted.ok) {
         setError(promoted.error ?? (zh ? "当前任务无法转到后台" : "Unable to move the current task to background"));
@@ -744,6 +838,7 @@ export function App() {
   }
 
   async function createSessionForProject(workspace?: string) {
+    if (!await pauseForegroundPlanBeforeLeaving()) return;
     setShowTaskCenter(false);
     const key = workspace ?? GENERAL_PROJECT_KEY;
     setExpandedProjectKey(key);
@@ -791,6 +886,7 @@ export function App() {
     if (!window.confirm(zh ? "将此会话移到废纸篓？" : "Move this session to the trash?")) return;
 
     if (session.current) {
+      if (!await pauseForegroundPlanBeforeLeaving()) return;
       const replacement = sessions.find((candidate) => candidate.id !== session.id);
       const switchResult = replacement
         ? await window.deki.switchSession(replacement.id)
@@ -843,10 +939,11 @@ export function App() {
         <nav className="sidebar-navigation" aria-label={zh ? "项目和会话" : "Projects and sessions"}>
           <button
             className={`task-center-nav${showTaskCenter ? " active" : ""}`}
-            onClick={() => {
+            onClick={() => void (async () => {
+              if (!await pauseForegroundPlanBeforeLeaving()) return;
               setShowTaskCenter(true);
               setSelectedTaskId(undefined);
-            }}
+            })()}
             data-testid="open-task-center"
           >
             <span className="task-center-nav-icon" aria-hidden="true">✓</span>
@@ -860,11 +957,10 @@ export function App() {
                 className="icon-button"
                 title={zh ? "添加或切换项目" : "Add or switch project"}
                 aria-label={zh ? "添加项目" : "Add project"}
-                onClick={() => void runCommand(
-                  window.deki.chooseWorkspace(),
-                  setError,
-                  refresh,
-                )}
+                onClick={() => void (async () => {
+                  if (!await pauseForegroundPlanBeforeLeaving()) return;
+                  await runCommand(window.deki.chooseWorkspace(), setError, refresh);
+                })()}
               >
                 +
               </button>
@@ -873,7 +969,8 @@ export function App() {
               {projectNodes.map((node) => {
                 const active = node.key === activeProjectKey;
                 const expanded = node.key === expandedProjectKey;
-                const canCreateSession = !busy && (!active || state.ready);
+                const canCreateSession = (!busy || Boolean(foregroundPlanTaskId))
+                  && (!active || state.ready);
                 return (
                   <div className={`project-tree-node${active ? " active" : ""}`} key={node.key}>
                     <div className="project-tree-row">
@@ -915,16 +1012,17 @@ export function App() {
                           >
                             <button
                               className="session-tree-item"
-                              disabled={busy && !session.current}
-                              onClick={() => {
+                              disabled={busy && !foregroundPlanTaskId && !session.current}
+                              onClick={() => void (async () => {
                                 setSessionContextMenu(undefined);
                                 setShowTaskCenter(false);
                                 setSelectedTaskId(undefined);
                                 if (session.current) return;
+                                if (!await pauseForegroundPlanBeforeLeaving()) return;
                                 setActiveSession(session);
                                 setMessages([]);
                                 setEvents([]);
-                                void runCommand(
+                                await runCommand(
                                   window.deki.switchSession(session.id),
                                   setError,
                                   async () => {
@@ -932,7 +1030,7 @@ export function App() {
                                     await refreshSessions();
                                   },
                                 );
-                              }}
+                              })()}
                             >
                               <strong>
                                 {pinnedSessionIds.has(session.id) && <PinIcon />}
@@ -1036,12 +1134,18 @@ export function App() {
             await refresh();
             await refreshSessions();
           }}
-          onOpenPlan={(planId) => {
+          onOpenPlan={(planId) => void (async () => {
+            const result = await window.deki.openPlanSession(planId);
+            if (!result.ok) {
+              setError(result.error ?? (zh ? "无法打开计划会话" : "Unable to open plan chat"));
+              return;
+            }
             setShowTaskCenter(false);
             setSelectedTaskId(undefined);
-            setInspectorOpen(true);
-            void refreshPlan(planId);
-          }}
+            await refresh();
+            await refreshSessions();
+            await refreshPlan();
+          })()}
         />
       ) : (
       <section className="app-main">
@@ -1110,7 +1214,7 @@ export function App() {
                   updateActiveConversation();
                 }}
               >
-                {messages.length === 0 && (
+                {conversationTimeline.length === 0 && (
                   <div className="empty-state">
                     <p className="eyebrow">
                       {state.workspace ? "PERMISSION-PROTECTED AGENT" : "GENERAL CHAT"}
@@ -1144,17 +1248,17 @@ export function App() {
                     )}
                   </div>
                 )}
-                {messages.map((message) => (
+                {conversationTimeline.map((item) => item.kind === "message" ? (
                   <ConversationTurn
-                    key={message.id}
-                    message={message}
+                    key={item.message.id}
+                    message={item.message}
                     models={state.models}
                     selectedModel={state.selectedModel}
                     showReasoning={settings?.effective.agent.showThinkingSummary ?? true}
                     zh={zh}
-                    {...(message.entryId
+                    {...(item.message.entryId
                       ? { onFork: () => void runCommand(
-                          window.deki.forkSession(message.entryId!),
+                          window.deki.forkSession(item.message.entryId!),
                           setError,
                           async () => {
                             await refresh();
@@ -1163,6 +1267,23 @@ export function App() {
                         ) }
                       : {})}
                   />
+                ) : (
+                  <div className="conversation-plan-turn" key={item.detail.plan.id}>
+                    <PlanPanel
+                      detail={item.detail}
+                      zh={zh}
+                      showReasoning={settings?.effective.agent.showThinkingSummary ?? true}
+                      onChanged={async () => {
+                        await refreshPlan(item.detail.plan.id);
+                        await refresh();
+                      }}
+                      onForegroundTask={(taskId) => {
+                        foregroundTaskIdRef.current = taskId;
+                        setForegroundTaskId(taskId);
+                        setBusy(Boolean(taskId));
+                      }}
+                    />
+                  </div>
                 ))}
               </div>
               {conversationMessages.length > 0 && (
@@ -1421,16 +1542,18 @@ export function App() {
                     >
                       <span aria-hidden="true">✦</span>
                     </button>
-                    <button
-                      className="composer-submit composer-background"
-                      aria-label={zh ? "后台运行" : "Run in background"}
-                      disabled={(!prompt.trim() && attachments.length === 0) || optimizingPrompt || isSessionCommand || !state.ready}
-                      onClick={() => void submit("background")}
-                    >
-                      <span aria-hidden="true">↗</span>
-                    </button>
+                    {interactionMode !== "plan" && (
+                      <button
+                        className="composer-submit composer-background"
+                        aria-label={zh ? "后台运行" : "Run in background"}
+                        disabled={(!prompt.trim() && attachments.length === 0) || optimizingPrompt || isSessionCommand || !state.ready}
+                        onClick={() => void submit("background")}
+                      >
+                        <span aria-hidden="true">↗</span>
+                      </button>
+                    )}
                     {busy ? (<>
-                      {foregroundTaskId && (
+                      {foregroundTaskId && !foregroundPlanTaskId && (
                         <button
                           className="composer-tool"
                           aria-label={zh ? "转到后台" : "Move to background"}
@@ -1451,7 +1574,19 @@ export function App() {
                       <button
                         className="composer-submit composer-stop danger"
                         aria-label={zh ? "停止" : "Stop"}
-                        onClick={() => void runCommand(window.deki.abortRun(), setError, refresh)}
+                        onClick={() => void runCommand(
+                          foregroundPlanTaskId
+                            ? window.deki.cancelTask(foregroundPlanTaskId)
+                            : window.deki.abortRun(),
+                          setError,
+                          async () => {
+                            foregroundTaskIdRef.current = undefined;
+                            setForegroundTaskId(undefined);
+                            setBusy(false);
+                            await refresh();
+                            await refreshPlan();
+                          },
+                        )}
                       >
                         <span className="composer-stop-glyph" aria-hidden="true" />
                       </button>
@@ -1474,11 +1609,12 @@ export function App() {
             {backgroundTask && (
               <button
                 className="background-task-notice"
-                onClick={() => {
+                onClick={() => void (async () => {
+                  if (!await pauseForegroundPlanBeforeLeaving()) return;
                   setSelectedTaskId(backgroundTask.id);
                   setShowTaskCenter(true);
                   setBackgroundTask(undefined);
-                }}
+                })()}
               >
                 <span>✓</span>
                 <span>
@@ -1521,29 +1657,16 @@ export function App() {
                     className="icon-button"
                     aria-label={zh ? "打开关联任务" : "Open linked task"}
                     title={zh ? "打开关联任务" : "Open linked task"}
-                    onClick={() => {
+                    onClick={() => void (async () => {
+                      if (!await pauseForegroundPlanBeforeLeaving()) return;
                       setSelectedTaskId(linkedTaskId);
                       setShowTaskCenter(true);
-                    }}
+                    })()}
                   >↗</button>
                 )}
                 <button className="icon-button" aria-label={zh ? "关闭运行详情" : "Close run details"} onClick={() => setInspectorOpen(false)}>×</button>
               </div>
             </header>
-            {activePlan && (
-              <PlanPanel
-                detail={activePlan}
-                zh={zh}
-                onChanged={async () => {
-                  await refreshPlan(activePlan.plan.id);
-                  await refresh();
-                }}
-                onOpenTask={(taskId) => {
-                  setSelectedTaskId(taskId);
-                  setShowTaskCenter(true);
-                }}
-              />
-            )}
             {diffs.length > 0 && (
               <Panel title={zh ? "变更 Diff" : "Change diffs"} count={diffs.length}>
                 {diffs.slice(-3).reverse().map((event, index) => (
@@ -2468,6 +2591,24 @@ function formatRelativeTime(value: string, zh: boolean): string {
   const days = Math.floor(hours / 24);
   if (days < 30) return zh ? `${days} 天` : `${days}d`;
   return new Date(timestamp).toLocaleDateString(zh ? "zh-CN" : "en-US");
+}
+
+function activePlanTask(detail: PlanDetail) {
+  const activeStatuses = new Set([
+    "queued",
+    "running",
+    "waiting_approval",
+    "waiting_user",
+    "waiting_workers",
+    "awaiting_apply",
+  ]);
+  if (detail.planningTask && activeStatuses.has(detail.planningTask.status)) {
+    return detail.planningTask;
+  }
+  if (detail.executionTask && activeStatuses.has(detail.executionTask.status)) {
+    return detail.executionTask;
+  }
+  return undefined;
 }
 
 function formatMessageTimestamp(value: string, zh: boolean): string {

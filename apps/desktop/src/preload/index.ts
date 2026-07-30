@@ -211,7 +211,7 @@ const api: DekiDesktopApi = {
     );
   },
   async approvePlan(planId, revision) {
-    return commandResultSchema.parse(
+    return taskSubmissionResultSchema.parse(
       await ipcRenderer.invoke(
         IPC_CHANNELS.approvePlan,
         approvePlanInputSchema.parse({ planId, revision }),

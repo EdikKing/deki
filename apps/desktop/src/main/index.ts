@@ -421,6 +421,9 @@ class DesktopController {
     if (interactionMode === "plan" && !this.#projectFeatures) {
       return { ok: false, error: "Plan 模式只在受信任的项目会话中可用" };
     }
+    if (interactionMode === "plan" && mode === "background") {
+      return { ok: false, error: "Plan 模式必须在当前对话中运行" };
+    }
     const runtime = this.#runtime;
     if (!runtime) {
       return { ok: false, error: "Agent Runtime 尚未就绪" };
@@ -536,12 +539,38 @@ class DesktopController {
       workspaceIds: input.workspaceIds ?? [this.#scopeId],
       ...(input.statuses ? { statuses: input.statuses } : {}),
       ...(input.kinds ? { kinds: input.kinds } : {}),
+      ...(input.deliveryModes ? { deliveryModes: input.deliveryModes } : {}),
       ...(input.query ? { query: input.query } : {}),
     });
   }
 
   getTask(taskId: string) {
-    return this.#tasks.getTask(taskId) ?? null;
+    const detail = this.#tasks.getTask(taskId);
+    if (
+      !detail
+      || detail.task.workspaceId !== this.#scopeId
+    ) return null;
+    if (
+      (
+        detail.task.kind !== "plan-step"
+        && detail.task.kind !== "planning"
+      )
+      || !detail.task.planId
+      || !this.#runtime
+    ) return detail;
+    const execution = taskStore?.getExecution(taskId);
+    if (!execution?.sourceSessionFile) return detail;
+    try {
+      return {
+        ...detail,
+        nodeSessionHistory: this.#runtime.getTaskSessionHistoryState(
+          execution.sourceSessionFile,
+          taskId,
+        ),
+      };
+    } catch {
+      return detail;
+    }
   }
 
   listPlans(input: PlanListInput) {
@@ -557,7 +586,7 @@ class DesktopController {
     return taskStore?.getPlan(planId) ?? null;
   }
 
-  async approvePlan(planId: string, revision: number): Promise<CommandResult> {
+  async approvePlan(planId: string, revision: number): Promise<TaskSubmissionResult> {
     if (!this.#trusted || !this.#runtime) {
       return { ok: false, error: "项目未受信任或 Runtime 尚未就绪" };
     }
@@ -569,9 +598,12 @@ class DesktopController {
       if (detail.planningTask?.status !== "succeeded") {
         return { ok: false, error: "规划任务尚未成功完成，不能批准计划" };
       }
-      const context = await this.#resolvePlanCheckpoint(detail, true);
+      if (this.#runtime.snapshot().sessionId !== detail.plan.sessionId) {
+        return { ok: false, error: "请先打开计划关联的对话，再批准执行" };
+      }
+      const context = await this.#resolvePlanCheckpoint(detail, false);
       const agentSettings = this.#settings.snapshot().effective.agent;
-      taskStore!.approvePlan(planId, revision, {
+      const task = taskStore!.approvePlan(planId, revision, {
         title: `执行计划：${createTaskTitle(detail.plan.goal)}`,
         execution: {
           type: "agent-prompt",
@@ -580,11 +612,11 @@ class DesktopController {
             ? { sourceSessionFile: context.sourceSessionFile }
             : {}),
           ...(context.sourceEntryId ? { sourceEntryId: context.sourceEntryId } : {}),
-          preferFork: true,
+          preferFork: false,
           interactionMode: "plan-execution",
           planId,
           planRevision: revision,
-          deliveryMode: "background",
+          deliveryMode: "foreground",
           ...(agentSettings.dagExecutionEnabled
             ? { dagModelRoutes: agentSettings.planModelRoutes }
             : {}),
@@ -604,7 +636,7 @@ class DesktopController {
           : {}),
       });
       this.#tasks.start();
-      return { ok: true };
+      return { ok: true, task };
     } catch (error) {
       return { ok: false, error: formatError(error) };
     }
@@ -620,6 +652,9 @@ class DesktopController {
       return { ok: false, error: "项目未受信任或 Runtime 尚未就绪" };
     }
     try {
+      if (mode === "background") {
+        return { ok: false, error: "Plan 模式必须在当前对话中运行" };
+      }
       const detail = taskStore?.getPlan(planId);
       if (!detail || detail.plan.workspaceId !== this.#scopeId) {
         return { ok: false, error: "未找到当前项目的计划" };
@@ -630,7 +665,7 @@ class DesktopController {
         );
       const context = activeExecution
         ? taskStore!.getExecution(detail.executionTask!.id)
-        : await this.#resolvePlanCheckpoint(detail, mode === "background");
+        : await this.#resolvePlanCheckpoint(detail, false);
       const activeStepIds = detail.stepStates.filter(
         (state) => state.revision === detail.plan.currentRevision
           && (state.status === "running" || state.status === "blocked"),
@@ -646,11 +681,11 @@ class DesktopController {
             ? { sourceSessionFile: context.sourceSessionFile }
             : {}),
           ...(context.sourceEntryId ? { sourceEntryId: context.sourceEntryId } : {}),
-          preferFork: mode === "background",
+          preferFork: false,
           interactionMode: "plan",
           planId,
           planRevision: detail.plan.currentRevision,
-          deliveryMode: mode,
+          deliveryMode: "foreground",
         },
       });
       return { ok: true, task: await request.planningTask };
@@ -3158,6 +3193,7 @@ function registerIpcHandlers(): void {
         ...(input.statuses ? { statuses: input.statuses } : {}),
         ...(input.workspaceIds ? { workspaceIds: input.workspaceIds } : {}),
         ...(input.kinds ? { kinds: input.kinds } : {}),
+        ...(input.deliveryModes ? { deliveryModes: input.deliveryModes } : {}),
         ...(input.query ? { query: input.query } : {}),
       }) ?? [],
     );
@@ -3165,7 +3201,10 @@ function registerIpcHandlers(): void {
   ipcMain.handle(IPC_CHANNELS.getTask, (event, raw) => {
     assertTrustedSender(event);
     const { taskId } = taskIdInputSchema.parse(raw);
-    return taskDetailSchema.nullable().parse(taskOrchestrator?.getTask(taskId) ?? null);
+    const stored = taskOrchestrator?.getTask(taskId) ?? null;
+    const task = stored?.task;
+    const host = task ? workspaceControllers.get(task.workspaceId) : undefined;
+    return taskDetailSchema.nullable().parse(host?.getTask(taskId) ?? stored);
   });
   ipcMain.handle(IPC_CHANNELS.cancelTask, async (event, raw) => {
     assertTrustedSender(event);
@@ -3307,7 +3346,7 @@ function registerIpcHandlers(): void {
     const { planId, revision } = approvePlanInputSchema.parse(raw);
     const plan = taskStore?.getPlan(planId)?.plan;
     const host = plan ? workspaceControllers.get(plan.workspaceId) : undefined;
-    return commandResultSchema.parse(
+    return taskSubmissionResultSchema.parse(
       await host?.approvePlan(planId, revision)
       ?? { ok: false, error: "计划所属项目尚未加载" },
     );
@@ -5786,7 +5825,7 @@ function renderPlanExecutionPrompt(
   );
   if (!revision) throw new Error("未找到已批准计划版本");
   const states = detail.stepStates.filter((state) => state.revision === revisionNumber);
-  return [
+  const content = [
     "执行下面已由用户批准的计划。严格按依赖顺序串行执行，一次只执行一个步骤。",
     "开始步骤前调用 plan__update_step 标记 running；完成后标记 completed 并提供摘要和证据。",
     "如需只读 Worker 协助，worker__delegate 请求必须携带当前 planId、revision 和 stepId，以便结论关联到步骤。",
@@ -5798,6 +5837,7 @@ function renderPlanExecutionPrompt(
     `计划：${JSON.stringify(revision)}`,
     `当前步骤状态：${JSON.stringify(states)}`,
   ].join("\n\n");
+  return `<deki_internal_plan_execution>\n${content}\n</deki_internal_plan_execution>`;
 }
 
 function applyNativeSettings(snapshot: SettingsSnapshot): void {

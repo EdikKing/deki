@@ -592,12 +592,14 @@ export class TaskStore {
     statuses?: TaskStatus[];
     workspaceIds?: string[];
     kinds?: TaskKind[];
+    deliveryModes?: Array<"foreground" | "background">;
     query?: string;
     limit?: number;
   } = {}): TaskSummary[] {
     const limit = Math.min(500, Math.max(1, options.limit ?? 100));
     if (options.statuses?.length === 0 || options.workspaceIds?.length === 0) return [];
     if (options.kinds?.length === 0) return [];
+    if (options.deliveryModes?.length === 0) return [];
     const clauses: string[] = [];
     const values: Array<string | number> = [];
     if (options.statuses?.length) {
@@ -611,6 +613,10 @@ export class TaskStore {
     if (options.kinds?.length) {
       clauses.push(`kind IN (${options.kinds.map(() => "?").join(", ")})`);
       values.push(...options.kinds);
+    }
+    if (options.deliveryModes?.length) {
+      clauses.push(`delivery_mode IN (${options.deliveryModes.map(() => "?").join(", ")})`);
+      values.push(...options.deliveryModes);
     }
     if (options.query?.trim()) {
       const query = `%${options.query.trim()}%`;
@@ -4977,6 +4983,7 @@ export class TaskOrchestrator {
     statuses?: TaskStatus[];
     workspaceIds?: string[];
     kinds?: TaskKind[];
+    deliveryModes?: Array<"foreground" | "background">;
     query?: string;
     limit?: number;
   } = {}): TaskSummary[] {
@@ -4991,6 +4998,7 @@ export class TaskOrchestrator {
     statuses?: TaskStatus[];
     workspaceIds?: string[];
     kinds?: TaskKind[];
+    deliveryModes?: Array<"foreground" | "background">;
     query?: string;
     limit?: number;
   } = {}): TaskRecord[] {
@@ -5250,7 +5258,8 @@ export class TaskOrchestrator {
   }
 
   promoteTask(taskId: string): boolean {
-    if (!this.#store.getTask(taskId)) return false;
+    const task = this.#store.getTask(taskId);
+    if (!task || task.kind === "planning" || task.kind === "plan-execution") return false;
     this.#store.promoteTask(taskId);
     return true;
   }
@@ -5888,6 +5897,9 @@ export class TaskOrchestrator {
         signal: active.controller.signal,
       });
       active.handle = handle;
+      if (handle.captureContext) {
+        this.#store.updateExecution(task.id, handle.captureContext());
+      }
       this.#store.bindRun(task.id, run.id, {
         sessionId: handle.sessionId,
         ...(handle.modelProvider ? { modelProvider: handle.modelProvider } : {}),

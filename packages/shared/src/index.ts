@@ -1017,6 +1017,7 @@ export const taskDetailSchema = z.object({
   integration: integrationRecordSchema.optional(),
   budget: taskBudgetSchema.optional(),
   budgetUsage: taskBudgetUsageSchema.optional(),
+  nodeSessionHistory: z.lazy(() => sessionHistoryStateSchema).optional(),
 }).strict();
 export type TaskDetail = z.infer<typeof taskDetailSchema>;
 
@@ -1505,6 +1506,7 @@ export const taskListInputSchema = z.object({
   statuses: z.array(taskStatusSchema).max(taskStatusSchema.options.length).optional(),
   workspaceIds: z.array(z.string().min(1)).max(100).optional(),
   kinds: z.array(taskKindSchema).max(taskKindSchema.options.length).optional(),
+  deliveryModes: z.array(z.enum(["foreground", "background"])).max(2).optional(),
   query: z.string().trim().max(500).optional(),
   limit: z.number().int().min(1).max(500).default(100),
 }).strict();
@@ -1708,7 +1710,7 @@ export interface DekiDesktopApi {
   ): Promise<ArtifactChunk>;
   listPlans(input?: Partial<PlanListInput>): Promise<PlanSummary[]>;
   getPlan(planId: string): Promise<PlanDetail | null>;
-  approvePlan(planId: string, revision: number): Promise<CommandResult>;
+  approvePlan(planId: string, revision: number): Promise<TaskSubmissionResult>;
   requestPlanRevision(
     planId: string,
     feedback: string,

@@ -95,9 +95,14 @@ export function TaskCenter(props: TaskCenterProps) {
         ...(workspaceId ? { workspaceIds: [workspaceId] } : {}),
         ...(status ? { statuses: [status] } : {}),
         kinds: taskCenterKinds,
+        deliveryModes: ["background"],
         limit: 500,
       }),
-      window.deki.listTasks({ kinds: taskCenterKinds, limit: 500 }),
+      window.deki.listTasks({
+        kinds: taskCenterKinds,
+        deliveryModes: ["background"],
+        limit: 500,
+      }),
     ]);
     if (taskRefreshSequence.current !== sequence) return;
     setTasks(rows);

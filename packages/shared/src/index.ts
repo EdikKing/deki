@@ -232,7 +232,7 @@ export const modelProviderCatalogResultSchema = z.object({
 }).strict();
 export type ModelProviderCatalogResult = z.infer<typeof modelProviderCatalogResultSchema>;
 
-export const DEKI_VERSION = "0.0.2";
+export const DEKI_VERSION = "0.0.3";
 
 export const modelSummarySchema = z.object({
   provider: z.string(),

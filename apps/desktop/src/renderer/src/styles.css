@@ -766,8 +766,8 @@ select {
 }
 
 .chat-panel {
-  --chat-column-max-width: 740px;
-  --chat-column-gutter: clamp(64px, 7vw, 86px);
+  --chat-column-max-width: 800px;
+  --chat-column-gutter: clamp(32px, 3.5vw, 43px);
 
   min-width: 0;
   min-height: 0;

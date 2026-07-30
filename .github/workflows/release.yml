@@ -85,8 +85,9 @@ jobs:
               && -n "$APPLE_API_ISSUER" ]]; then
               echo "RELEASE_SIGNED=true" >> "$GITHUB_ENV"
             else
-              echo "::error::macOS signing and notarization credentials are required because unsigned apps cannot use automatic updates."
-              exit 1
+              echo "::warning::macOS signing and notarization credentials are incomplete; building unsigned artifacts."
+              echo "RELEASE_SIGNED=false" >> "$GITHUB_ENV"
+              echo "CSC_IDENTITY_AUTO_DISCOVERY=false" >> "$GITHUB_ENV"
             fi
           else
             if [[ -n "$WIN_CSC_LINK" && -n "$WIN_CSC_KEY_PASSWORD" ]]; then
@@ -107,9 +108,15 @@ jobs:
           echo "CSC_KEY_PASSWORD=$MAC_CSC_KEY_PASSWORD" >> "$GITHUB_ENV"
           echo "APPLE_API_KEY=$RUNNER_TEMP/AuthKey.p8" >> "$GITHUB_ENV"
 
-      - name: Build release artifacts
+      - name: Build signed or non-macOS release artifacts
         if: runner.os != 'macOS' || env.RELEASE_SIGNED == 'true'
         run: pnpm ${{ matrix.command }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Build unsigned macOS release artifacts
+        if: runner.os == 'macOS' && env.RELEASE_SIGNED != 'true'
+        run: pnpm package:mac:unsigned
         env:
           GH_TOKEN: ${{ github.token }}
 
@@ -117,7 +124,7 @@ jobs:
         run: node scripts/verify-release-artifacts.mjs ${{ matrix.platform }}
 
       - name: Verify macOS signature and notarization ticket
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && env.RELEASE_SIGNED == 'true'
         shell: bash
         run: |
           verified_apps=0
@@ -230,6 +237,11 @@ jobs:
           WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
         run: |
           notes=()
+          if [[ -z "$MAC_CSC_LINK" || -z "$MAC_CSC_KEY_PASSWORD" \
+            || -z "$APPLE_API_KEY_BASE64" || -z "$APPLE_API_KEY_ID" \
+            || -z "$APPLE_API_ISSUER" ]]; then
+            notes+=(--notes "⚠️ This release contains unsigned and unnotarized macOS installers. macOS may require users to approve the app manually, and automatic updates are unavailable.")
+          fi
           if [[ -z "$WIN_CSC_LINK" || -z "$WIN_CSC_KEY_PASSWORD" ]]; then
             notes+=(--notes "⚠️ This release contains unsigned Windows installers. Windows may display security warnings during installation.")
           fi

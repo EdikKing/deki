@@ -4,6 +4,16 @@
 
 ## [Unreleased]
 
+## [0.0.7] - 2026-07-30
+
+### Fixed
+
+- 在缺少 Apple Developer 签名与公证凭据时发布未签名的 macOS 安装包，并在 Release 中明确标注限制。
+
+### Changed
+
+- 默认恢复上次使用的会话。
+
 ## [0.0.6] - 2026-07-30
 
 ### Fixed

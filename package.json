@@ -1,6 +1,6 @@
 {
   "name": "deki",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "private": true,
   "type": "module",
   "license": "AGPL-3.0-or-later",
@@ -17,6 +17,7 @@
     "package": "pnpm --filter @deki-ai/desktop package",
     "package:dir": "pnpm --filter @deki-ai/desktop package:dir",
     "package:mac": "pnpm --filter @deki-ai/desktop package:mac",
+    "package:mac:unsigned": "pnpm --filter @deki-ai/desktop package:mac:unsigned",
     "package:win": "pnpm --filter @deki-ai/desktop package:win",
     "package:linux": "pnpm --filter @deki-ai/desktop package:linux",
     "release:validate": "node scripts/validate-release-tag.mjs",

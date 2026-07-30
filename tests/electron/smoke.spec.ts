@@ -29,6 +29,40 @@ const execFileAsync = promisify(execFile);
 
 // Playwright requires an object-destructured fixtures parameter.
 // eslint-disable-next-line no-empty-pattern
+test("finishes graceful shutdown instead of remaining in the background", async ({}) => {
+  const temporaryHome = await mkdtemp(resolve(tmpdir(), "deki-electron-quit-"));
+  await seedChineseSettings(temporaryHome);
+  const electronApp = await electron.launch({
+    executablePath: electronPath,
+    args: createElectronArguments(temporaryHome),
+    env: createTestEnvironment(temporaryHome),
+  });
+  const child = electronApp.process();
+  let exited = false;
+
+  try {
+    await electronApp.firstWindow();
+    const exit = new Promise<void>((resolveExit, rejectExit) => {
+      const timeout = setTimeout(() => {
+        rejectExit(new Error("Electron remained alive after app.quit()"));
+      }, 7_000);
+      child.once("exit", () => {
+        exited = true;
+        clearTimeout(timeout);
+        resolveExit();
+      });
+    });
+    await electronApp.evaluate(({ app }) => app.quit());
+    await exit;
+    expect(child.exitCode).toBe(0);
+  } finally {
+    if (!exited) await electronApp.close();
+    await rm(temporaryHome, { recursive: true, force: true });
+  }
+});
+
+// Playwright requires an object-destructured fixtures parameter.
+// eslint-disable-next-line no-empty-pattern
 test("starts a general chat without a workspace", async ({}, testInfo) => {
   const temporaryHome = await mkdtemp(resolve(tmpdir(), "deki-electron-empty-"));
   await seedChineseSettings(temporaryHome);

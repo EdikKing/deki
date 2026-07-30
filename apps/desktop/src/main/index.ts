@@ -161,6 +161,7 @@ import {
   workerResultSchema,
 } from "@deki-ai/shared";
 import { decidePromptDispatch } from "./promptDispatch.js";
+import { waitForShutdown } from "./shutdown.js";
 
 protocol.registerSchemesAsPrivileged([{
   scheme: "app",
@@ -178,6 +179,7 @@ let agentSupervisor: AgentSupervisor | undefined;
 const workspaceControllers = new Map<string, DesktopController>();
 let quitting = false;
 let shutdownComplete = false;
+let shutdownPromise: Promise<void> | undefined;
 let updateCheckTimer: NodeJS.Timeout | undefined;
 let appliedUpdateConfiguration = "";
 let updateEventListenersRegistered = false;
@@ -2943,17 +2945,30 @@ async function initializeDesktopState(
 }
 
 async function shutdownDesktopState(): Promise<void> {
-  await taskOrchestrator?.dispose({ closeStore: false });
-  await agentSupervisor?.dispose();
-  await Promise.allSettled(
-    [...workspaceControllers.values()].map((host) => host.dispose()),
-  );
-  workspaceControllers.clear();
-  taskStore?.close();
-  taskStore = undefined;
-  taskOrchestrator = undefined;
-  agentSupervisor = undefined;
-  controller = undefined;
+  if (!shutdownPromise) {
+    shutdownPromise = (async () => {
+      const cleanup = (async () => {
+        await taskOrchestrator?.dispose({ closeStore: false });
+        await agentSupervisor?.dispose();
+        await Promise.allSettled(
+          [...workspaceControllers.values()].map((host) => host.dispose()),
+        );
+        workspaceControllers.clear();
+        taskStore?.close();
+      })();
+      const outcome = await waitForShutdown(cleanup, 5_000);
+      if (outcome === "timed-out") {
+        console.warn("Deki shutdown cleanup timed out; forcing process exit.");
+      }
+      taskStore = undefined;
+      taskOrchestrator = undefined;
+      agentSupervisor = undefined;
+      controller = undefined;
+    })().catch((error: unknown) => {
+      console.error("Deki shutdown cleanup failed:", formatError(error));
+    });
+  }
+  await shutdownPromise;
 }
 
 function createWindow(): BrowserWindow {

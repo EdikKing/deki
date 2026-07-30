@@ -915,9 +915,11 @@ export function App() {
                           >
                             <button
                               className="session-tree-item"
-                              disabled={busy}
+                              disabled={busy && !session.current}
                               onClick={() => {
                                 setSessionContextMenu(undefined);
+                                setShowTaskCenter(false);
+                                setSelectedTaskId(undefined);
                                 if (session.current) return;
                                 setActiveSession(session);
                                 setMessages([]);

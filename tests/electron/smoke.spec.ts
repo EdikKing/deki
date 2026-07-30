@@ -179,6 +179,68 @@ test("starts a general chat without a workspace", async ({}, testInfo) => {
 
 // Playwright requires an object-destructured fixtures parameter.
 // eslint-disable-next-line no-empty-pattern
+test("returns to chat when a sidebar session is selected from Task Center", async ({}) => {
+  const temporaryHome = await mkdtemp(resolve(tmpdir(), "deki-electron-task-navigation-"));
+  await seedChineseSettings(temporaryHome);
+  await seedComposerModels(temporaryHome);
+  await seedPersistedSession(
+    temporaryHome,
+    undefined,
+    "00000000-0000-4000-8000-000000000011",
+    "2026-07-27T10:00:00.000Z",
+  );
+  await seedPersistedSession(
+    temporaryHome,
+    undefined,
+    "00000000-0000-4000-8000-000000000012",
+    "2026-07-27T10:01:00.000Z",
+  );
+  const electronApp = await electron.launch({
+    executablePath: electronPath,
+    args: createElectronArguments(temporaryHome),
+    env: createTestEnvironment(temporaryHome),
+  });
+
+  try {
+    const window = await electronApp.firstWindow();
+    const navigation = window.getByRole("navigation", { name: "项目和会话" });
+    const initialSession = navigation.locator(".session-tree-item").filter({
+      hasText: "00000000-0000-4000-8000-000000000012",
+    });
+    await expect(initialSession).toHaveCount(1);
+    await initialSession.click();
+    await expect.poll(() => window.evaluate(
+      () => (globalThis as unknown as { deki: DekiDesktopApi }).deki
+        .getBootstrapState()
+        .then((state) => state.sessionId),
+    )).toBe("00000000-0000-4000-8000-000000000012");
+
+    await window.getByTestId("open-task-center").click();
+    await expect(window.getByTestId("task-center")).toBeVisible();
+    await initialSession.click();
+    await expect(window.getByTestId("task-center")).toHaveCount(0);
+    await expect(window.locator(".app-main")).toBeVisible();
+
+    await window.getByTestId("open-task-center").click();
+    const otherSession = navigation.locator(".session-tree-item").filter({
+      hasText: "00000000-0000-4000-8000-000000000011",
+    });
+    await expect(otherSession).toHaveCount(1);
+    await otherSession.click();
+    await expect(window.getByTestId("task-center")).toHaveCount(0);
+    await expect.poll(() => window.evaluate(
+      () => (globalThis as unknown as { deki: DekiDesktopApi }).deki
+        .getBootstrapState()
+        .then((state) => state.sessionId),
+    )).toBe("00000000-0000-4000-8000-000000000011");
+  } finally {
+    await electronApp.close();
+    await rm(temporaryHome, { recursive: true, force: true });
+  }
+});
+
+// Playwright requires an object-destructured fixtures parameter.
+// eslint-disable-next-line no-empty-pattern
 test("shows Plan progress and previews persisted artifacts inside Task Center", async ({}) => {
   const temporaryHome = await mkdtemp(resolve(tmpdir(), "deki-electron-task-plan-"));
   await seedChineseSettings(temporaryHome);

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { ImagePreviewViewer, type ImagePreviewItem } from "./ImagePreviewViewer";
 import anthropicLogo from "@lobehub/icons-static-svg/icons/anthropic.svg?url";
 import deepseekLogo from "@lobehub/icons-static-svg/icons/deepseek-color.svg?url";
 import geminiLogo from "@lobehub/icons-static-svg/icons/gemini-color.svg?url";
@@ -111,6 +112,10 @@ export function App() {
     canScrollUp: false,
     canScrollDown: false,
   });
+  const [imagePreviewer, setImagePreviewer] = useState<{
+    images: ImagePreviewItem[];
+    index: number;
+  } | null>(null);
   const activeSessionId = useRef<string | undefined>(undefined);
   const foregroundTaskIdRef = useRef<string | undefined>(undefined);
   const plansRef = useRef<PlanDetail[]>([]);
@@ -758,6 +763,38 @@ export function App() {
     setAttachments((current) => [...current, ...next]);
   }
 
+  const previewableAttachments: ImagePreviewItem[] = attachments.flatMap((attachment) =>
+    attachment.dataUrl
+      ? [{ src: attachment.dataUrl, alt: attachment.file.name }]
+      : []);
+
+  function openImagePreviewerFromComposer(attachmentId: string) {
+    if (previewableAttachments.length === 0) return;
+    const startIndex = previewableAttachments.findIndex((_, index) => {
+      const candidate = attachments[index];
+      return candidate?.id === attachmentId && Boolean(candidate.dataUrl);
+    });
+    const safeIndex = startIndex >= 0 ? startIndex : 0;
+    setImagePreviewer({ images: previewableAttachments, index: safeIndex });
+  }
+
+  function openImagePreviewerFromMessage(
+    items: ReadonlyArray<{ src: string; alt: string }>,
+    startAlt: string,
+  ) {
+    if (items.length === 0) return;
+    const images = items.map((item) => ({ src: item.src, alt: item.alt }));
+    const startIndex = images.findIndex((item) => item.alt === startAlt);
+    setImagePreviewer({
+      images,
+      index: startIndex >= 0 ? startIndex : 0,
+    });
+  }
+
+  function closeImagePreviewer() {
+    setImagePreviewer(null);
+  }
+
   async function optimizeCurrentPrompt() {
     const sourcePrompt = prompt;
     const value = sourcePrompt.trim();
@@ -926,6 +963,7 @@ export function App() {
   ];
 
   return (
+    <>
     <main className="app-shell">
       <aside className="navigation-sidebar">
         <div className="sidebar-brand">
@@ -1256,6 +1294,7 @@ export function App() {
                     selectedModel={state.selectedModel}
                     showReasoning={settings?.effective.agent.showThinkingSummary ?? true}
                     zh={zh}
+                    onImagePreview={(items, startAlt) => openImagePreviewerFromMessage(items, startAlt)}
                     {...(item.message.entryId
                       ? { onFork: () => void runCommand(
                           window.deki.forkSession(item.message.entryId!),
@@ -1367,7 +1406,18 @@ export function App() {
                     {attachments.map((attachment) => (
                       <div className="composer-attachment" key={attachment.id}>
                         {attachment.dataUrl
-                          ? <img src={attachment.dataUrl} alt="" />
+                          ? (
+                            <button
+                              type="button"
+                              className="composer-attachment-thumb clickable"
+                              aria-label={zh
+                                ? `查看 ${attachment.file.name}`
+                                : `View ${attachment.file.name}`}
+                              onClick={() => openImagePreviewerFromComposer(attachment.id)}
+                            >
+                              <img src={attachment.dataUrl} alt="" />
+                            </button>
+                          )
                           : <span className="attachment-file-icon" aria-hidden="true">▤</span>}
                         <span>
                           <strong>{attachment.file.name}</strong>
@@ -1753,6 +1803,17 @@ export function App() {
         </div>
       )}
     </main>
+    {imagePreviewer && (
+      <ImagePreviewViewer
+        images={imagePreviewer.images}
+        index={imagePreviewer.index}
+        zh={zh}
+        onClose={closeImagePreviewer}
+        onIndexChange={(next) =>
+          setImagePreviewer({ images: imagePreviewer.images, index: next })}
+      />
+    )}
+    </>
   );
 
   async function answerApproval(
@@ -1776,6 +1837,7 @@ function ConversationTurn(props: {
   showReasoning: boolean;
   zh: boolean;
   onFork?: () => void;
+  onImagePreview?: (attachments: ReadonlyArray<{ src: string; alt: string }>, startAlt: string) => void;
 }) {
   const assistant = props.message.role === "assistant";
   const model = assistant
@@ -1788,6 +1850,7 @@ function ConversationTurn(props: {
   const sender = assistant
     ? (model?.name ?? props.message.modelId ?? "Deki")
     : (props.zh ? "你" : "You");
+  const previewableAttachments = props.message.attachments?.filter((attachment) => Boolean(attachment.dataUrl)) ?? [];
   return (
     <article
       className={`message-turn ${props.message.role}`}
@@ -1825,9 +1888,29 @@ function ConversationTurn(props: {
           {props.message.attachments && props.message.attachments.length > 0 && (
             <div className="message-attachments">
               {props.message.attachments.map((attachment, index) => (
-                <div className={`message-attachment${attachment.dataUrl ? " image" : ""}`} key={`${attachment.name}-${index}`}>
+                <div
+                  className={`message-attachment${attachment.dataUrl ? " image" : ""}`}
+                  key={`${attachment.name}-${index}`}
+                >
                   {attachment.dataUrl
-                    ? <img src={attachment.dataUrl} alt={attachment.name} />
+                    ? (
+                      <button
+                        type="button"
+                        className="message-attachment-thumb clickable"
+                        aria-label={props.zh
+                          ? `查看 ${attachment.name}`
+                          : `View ${attachment.name}`}
+                        onClick={() => {
+                          if (previewableAttachments.length === 0) return;
+                          props.onImagePreview?.(
+                            previewableAttachments.map((item) => ({ src: item.dataUrl!, alt: item.name })),
+                            attachment.name,
+                          );
+                        }}
+                      >
+                        <img src={attachment.dataUrl} alt={attachment.name} />
+                      </button>
+                    )
                     : <span className="attachment-file-icon" aria-hidden="true">▤</span>}
                   <span>
                     <strong>{attachment.name}</strong>

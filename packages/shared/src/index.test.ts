@@ -7,6 +7,7 @@ import {
   optimizePromptInputSchema,
   optimizePromptResultSchema,
   rememberInputSchema,
+  resolveConfiguredLocale,
   resolveSystemLocale,
   sendPromptInputSchema,
   taskEventSchema,
@@ -43,6 +44,12 @@ describe("shared IPC schemas", () => {
     expect(resolveSystemLocale("zh-Hans-CN")).toBe("zh-CN");
     expect(resolveSystemLocale("en-GB")).toBe("en-US");
     expect(resolveSystemLocale("ja-JP")).toBe("en-US");
+  });
+
+  it("resolves an explicit or system-backed configured locale", () => {
+    expect(resolveConfiguredLocale("system", "zh-CN")).toBe("zh-CN");
+    expect(resolveConfiguredLocale("system", "en-US")).toBe("en-US");
+    expect(resolveConfiguredLocale("zh-CN", "en-US")).toBe("zh-CN");
   });
 
   it("accepts a normalized streaming event", () => {

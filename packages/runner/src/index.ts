@@ -25,6 +25,7 @@ import {
 import { GitCheckpointManager } from "@deki-ai/git-checkpoint";
 import {
   resolveSystemLocale,
+  type DekiLocale,
   type ValidationTarget,
   type WorkerWriteSetEntry,
 } from "@deki-ai/shared";
@@ -347,6 +348,7 @@ export class WorktreeRunner {
     resource: WorktreeResource;
     writeSet: WorkerWriteSetEntry[];
     validationTargets: ValidationTarget[];
+    locale?: DekiLocale;
     signal?: AbortSignal;
   }): Promise<FinalizedWorktree> {
     await assertWriteSetOutsideSubmodules(
@@ -424,7 +426,7 @@ export class WorktreeRunner {
       "-c", "user.email=agent@deki.local",
       "commit",
       "-m",
-      createImplementerCommitMessage(),
+      createImplementerCommitMessage(input.locale),
     ], this.#timeoutMs, input.signal);
     const commit = (await git(
       input.resource.path,

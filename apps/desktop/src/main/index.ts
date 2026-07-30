@@ -103,6 +103,8 @@ import {
   approvePlanInputSchema,
   planDetailSchema,
   planEventSchema,
+  resolveConfiguredLocale,
+  resolveSystemLocale,
   planIdInputSchema,
   planListInputSchema,
   planSummarySchema,
@@ -1725,6 +1727,7 @@ class DesktopController {
         memoryEngine: this.#memory,
         mcpManager: this.#mcp,
         settings: this.#settings.snapshot().effective,
+        systemLocale: resolveNativeSystemLocale(),
         resumeLatest: this.#resumeLatest,
         mcpEnvironment: this.#workspace
           ? Object.fromEntries(Object.entries(
@@ -4700,6 +4703,10 @@ async function executeWorktreeTask(
         resource,
         writeSet: validateWriteSet(context.writeSet),
         validationTargets: context.validationTargets,
+        locale: resolveConfiguredLocale(
+          host.getSettings().effective.general.locale,
+          resolveNativeSystemLocale(),
+        ),
         signal: input.signal,
       });
       const artifactStore = new ArtifactStore(paths.artifactsRoot);
@@ -5493,6 +5500,12 @@ function broadcastSettings(raw: SettingsSnapshot): void {
 function createTaskTitle(prompt: string): string {
   const firstLine = prompt.split("\n", 1)[0]?.trim() ?? prompt;
   return firstLine.length > 42 ? `${firstLine.slice(0, 42)}…` : firstLine;
+}
+
+function resolveNativeSystemLocale() {
+  return resolveSystemLocale(
+    app.getPreferredSystemLanguages()[0] ?? app.getLocale(),
+  );
 }
 
 function renderPlanningPrompt(

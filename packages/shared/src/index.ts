@@ -8,6 +8,13 @@ export function resolveSystemLocale(
   return locale.toLocaleLowerCase().startsWith("zh") ? "zh-CN" : "en-US";
 }
 
+export function resolveConfiguredLocale(
+  configuredLocale: "system" | DekiLocale,
+  systemLocale = resolveSystemLocale(),
+): DekiLocale {
+  return configuredLocale === "system" ? systemLocale : configuredLocale;
+}
+
 export const permissionPolicySchema = z.enum(["allow", "ask", "deny"]);
 export type PermissionPolicy = z.infer<typeof permissionPolicySchema>;
 export const permissionCategorySchema = z.enum([

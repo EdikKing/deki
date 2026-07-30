@@ -36,10 +36,12 @@ import {
   agentEventSchema,
   DEKI_VERSION,
   permissionPoliciesSchema,
+  resolveConfiguredLocale,
   resolveSystemLocale,
   type AgentEvent,
   type CapabilityProvider,
   type ConversationMessage,
+  type DekiLocale,
   type MemoryRecord,
   type MemoryScope,
   type ModelSummary,
@@ -68,6 +70,7 @@ export interface DekiAgentRuntimeOptions {
   memoryEngine: MemoryEngine;
   mcpManager: McpManager;
   settings: DekiSettings;
+  systemLocale?: DekiLocale;
   mcpEnvironment?: Record<string, Record<string, string>>;
   persistProjectGrant?: (
     category: import("@deki-ai/settings").PermissionCategory,
@@ -1524,6 +1527,7 @@ export class DekiAgentRuntime {
                 path: "deki://built-in/git-commit-conventions.md",
                 content: renderBuiltInGitCommitInstructions(
                   this.#options.settings.general.locale,
+                  this.#options.systemLocale,
                 ),
               },
               ...current.agentsFiles.filter((file) =>
@@ -3087,7 +3091,7 @@ export function renderBuiltInGitCommitInstructions(
   configuredLocale: DekiSettings["general"]["locale"] = "system",
   systemLocale = resolveSystemLocale(),
 ): string {
-  const locale = configuredLocale === "system" ? systemLocale : configuredLocale;
+  const locale = resolveConfiguredLocale(configuredLocale, systemLocale);
   const language = locale === "zh-CN" ? "简体中文（zh-CN）" : "English (en-US)";
   return [
     "# Deki 内置 Git 提交规范",

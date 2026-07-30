@@ -173,7 +173,7 @@ export type DekiSettings = z.infer<typeof settingsSchema>;
 export const defaultSettings: DekiSettings = settingsSchema.parse({
   general: {
     locale: "system",
-    startupMode: "general",
+    startupMode: "last-session",
     restoreSession: true,
     closeBehavior: "quit",
     launchAtLogin: false,

@@ -18,6 +18,13 @@ afterEach(async () => {
 });
 
 describe("SettingsStore", () => {
+  it("restores the last session by default", () => {
+    expect(defaultSettings.general).toMatchObject({
+      startupMode: "last-session",
+      restoreSession: true,
+    });
+  });
+
   it("enables bounded current-task recall by default", () => {
     expect(defaultSettings.memory).toMatchObject({
       taskMemoryEnabled: true,

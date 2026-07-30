@@ -1,6 +1,6 @@
 {
   "name": "@deki-ai/desktop",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "private": true,
   "type": "module",
   "description": "Deki local-first AI development workspace",

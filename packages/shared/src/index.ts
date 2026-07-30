@@ -1423,7 +1423,7 @@ export const clearDataInputSchema = z.object({
 }).strict();
 
 export const updateEventSchema = z.object({
-  type: z.enum(["checking", "available", "not-available", "downloading", "downloaded", "error"]),
+  type: z.enum(["checking", "available", "not-available", "downloading", "downloaded", "manual", "error"]),
   version: z.string().optional(),
   currentVersion: z.string().optional(),
   percent: z.number().min(0).max(100).optional(),
@@ -1634,6 +1634,7 @@ export const IPC_CHANNELS = {
   checkForUpdates: "deki:check-for-updates",
   downloadUpdate: "deki:download-update",
   installUpdate: "deki:install-update",
+  openUpdateDownloadPage: "deki:open-update-download-page",
   listMcpServers: "deki:list-mcp-servers",
   upsertMcpServer: "deki:upsert-mcp-server",
   removeMcpServer: "deki:remove-mcp-server",
@@ -1762,6 +1763,7 @@ export interface DekiDesktopApi {
   checkForUpdates(): Promise<CheckForUpdatesResult>;
   downloadUpdate(): Promise<CommandResult>;
   installUpdate(): Promise<CommandResult>;
+  openUpdateDownloadPage(): Promise<CommandResult>;
   listMcpServers(): Promise<McpServerEditor[]>;
   upsertMcpServer(server: McpServerEditor): Promise<CommandResult>;
   removeMcpServer(id: string): Promise<CommandResult>;

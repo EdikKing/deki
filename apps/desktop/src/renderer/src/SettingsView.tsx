@@ -1344,7 +1344,11 @@ function AboutSettings({ value, zh, update }: Pick<SettingsComponentProps, "valu
     }));
     const result = await window.deki.downloadUpdate();
     if (!result.ok) {
-      setUpdateEvent({ type: "error", error: result.error });
+      const manualUpdateRequired = /代码签名无效|code signature/i.test(result.error ?? "");
+      setUpdateEvent({
+        type: manualUpdateRequired ? "manual" : "error",
+        error: result.error,
+      });
     }
   };
   const installUpdate = async () => {
@@ -1378,6 +1382,10 @@ function AboutSettings({ value, zh, update }: Pick<SettingsComponentProps, "valu
       case "downloaded":
         description = zh ? `新版本 ${updateEvent.version ?? ""} 已下载，可立即重启安装` : `Version ${updateEvent.version ?? ""} is ready to install`;
         control = <button className="primary" onClick={() => void installUpdate()}>{zh ? "立即重启并安装" : "Restart and install"}</button>;
+        break;
+      case "manual":
+        description = updateEvent.error ?? (zh ? "当前安装包无法自动更新，请手动下载安装包" : "This installation cannot update automatically; download the installer manually");
+        control = <button className="primary" onClick={() => void window.deki.openUpdateDownloadPage()}>{zh ? "手动下载安装包" : "Download installer"}</button>;
         break;
       case "error":
         description = updateEvent.error ?? (zh ? "更新检查失败" : "Update check failed");

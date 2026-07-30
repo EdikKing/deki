@@ -3509,7 +3509,13 @@ function registerIpcHandlers(): void {
       await autoUpdater.downloadUpdate();
       return commandResultSchema.parse({ ok: true });
     } catch (error) {
-      return commandResultSchema.parse({ ok: false, error: formatError(error) });
+      const message = formatError(error);
+      return commandResultSchema.parse({
+        ok: false,
+        error: isMacCodeSignatureError(message)
+          ? "当前 macOS 安装包的代码签名无效，无法自动安装更新；请手动下载最新安装包"
+          : message,
+      });
     }
   });
   ipcMain.handle(IPC_CHANNELS.installUpdate, async (event) => {
@@ -3522,6 +3528,15 @@ function registerIpcHandlers(): void {
     }
     setImmediate(() => autoUpdater.quitAndInstall(false, true));
     return commandResultSchema.parse({ ok: true });
+  });
+  ipcMain.handle(IPC_CHANNELS.openUpdateDownloadPage, async (event) => {
+    assertTrustedSender(event);
+    try {
+      await shell.openExternal("https://github.com/EdikKing/deki/releases/latest");
+      return commandResultSchema.parse({ ok: true });
+    } catch (error) {
+      return commandResultSchema.parse({ ok: false, error: formatError(error) });
+    }
   });
   ipcMain.handle(IPC_CHANNELS.exportDiagnostics, async (event) => {
     assertTrustedSender(event);
@@ -5272,6 +5287,11 @@ function broadcastUpdateEvent(raw: UpdateEvent): void {
   }
 }
 
+function isMacCodeSignatureError(message: string): boolean {
+  return process.platform === "darwin"
+    && /code signature|code has no resources|signature.*validation/i.test(message);
+}
+
 function registerAutoUpdaterListeners(): void {
   if (updateEventListenersRegistered) return;
   updateEventListenersRegistered = true;
@@ -5310,9 +5330,13 @@ function registerAutoUpdaterListeners(): void {
     });
   });
   autoUpdater.on("error", (error) => {
+    const message = formatError(error);
+    const manualUpdateRequired = isMacCodeSignatureError(message);
     broadcastUpdateEvent({
-      type: "error",
-      error: formatError(error),
+      type: manualUpdateRequired ? "manual" : "error",
+      error: manualUpdateRequired
+        ? "当前 macOS 安装包的代码签名无效，无法自动安装更新；请手动下载最新安装包"
+        : message,
     });
   });
 }

@@ -16,6 +16,7 @@ import {
   taskSummarySchema,
   taskInputResponseSchema,
   taskSubmissionResultSchema,
+  updateEventSchema,
   updateSessionConfigurationInputSchema,
   workerRequestSchema,
 } from "./index";
@@ -29,6 +30,13 @@ describe("shared IPC schemas", () => {
     expect(isVersionNewer("1.0.0-beta.2", "1.0.0-beta.1")).toBe(true);
     expect(isVersionNewer("1.0.0", "1.0.0-beta.2")).toBe(true);
     expect(isVersionNewer("not-a-version", "0.0.3")).toBe(false);
+  });
+
+  it("accepts a manual update fallback event", () => {
+    expect(updateEventSchema.parse({
+      type: "manual",
+      error: "The installed app is not signed.",
+    }).type).toBe("manual");
   });
 
   it("resolves the supported locale from the system locale", () => {

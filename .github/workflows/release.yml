@@ -85,9 +85,8 @@ jobs:
               && -n "$APPLE_API_ISSUER" ]]; then
               echo "RELEASE_SIGNED=true" >> "$GITHUB_ENV"
             else
-              echo "::warning::macOS signing credentials are incomplete; building unsigned artifacts."
-              echo "RELEASE_SIGNED=false" >> "$GITHUB_ENV"
-              echo "CSC_IDENTITY_AUTO_DISCOVERY=false" >> "$GITHUB_ENV"
+              echo "::error::macOS signing and notarization credentials are required because unsigned apps cannot use automatic updates."
+              exit 1
             fi
           else
             if [[ -n "$WIN_CSC_LINK" && -n "$WIN_CSC_KEY_PASSWORD" ]]; then
@@ -114,24 +113,36 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
-      - name: Build unsigned macOS release artifacts
-        if: runner.os == 'macOS' && env.RELEASE_SIGNED != 'true'
-        run: pnpm --filter @deki-ai/desktop package:mac:unsigned
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CSC_IDENTITY_AUTO_DISCOVERY: "false"
-
       - name: Verify installers and update metadata
         run: node scripts/verify-release-artifacts.mjs ${{ matrix.platform }}
 
       - name: Verify macOS signature and notarization ticket
-        if: runner.os == 'macOS' && env.RELEASE_SIGNED == 'true'
+        if: runner.os == 'macOS'
         shell: bash
         run: |
-          app_path="$(find release -type d -name Deki.app -print -quit)"
-          test -n "$app_path"
-          codesign --verify --deep --strict --verbose=2 "$app_path"
-          spctl --assess --type execute --verbose=2 "$app_path"
+          verified_apps=0
+          while IFS= read -r app_path; do
+            codesign --verify --deep --strict --verbose=2 "$app_path"
+            spctl --assess --type execute --verbose=2 "$app_path"
+            verified_apps=$((verified_apps + 1))
+          done < <(find release -type d -name Deki.app -not -path '*/zip-verification/*' -print)
+          test "$verified_apps" -ge 2
+
+          verification_root="$(mktemp -d)"
+          trap 'rm -rf "$verification_root"' EXIT
+          verified_archives=0
+          for archive in release/*-mac-*.zip; do
+            destination="$verification_root/$(basename "$archive" .zip)"
+            mkdir -p "$destination"
+            ditto -x -k "$archive" "$destination"
+            archived_app="$(find "$destination" -type d -name Deki.app -print -quit)"
+            test -n "$archived_app"
+            codesign --verify --deep --strict --verbose=2 "$archived_app"
+            spctl --assess --type execute --verbose=2 "$archived_app"
+            verified_archives=$((verified_archives + 1))
+          done
+          test "$verified_archives" -ge 2
+
           for image in release/*.dmg; do
             xcrun stapler validate "$image"
           done
@@ -219,11 +230,8 @@ jobs:
           WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
         run: |
           notes=()
-          if [[ -z "$MAC_CSC_LINK" || -z "$MAC_CSC_KEY_PASSWORD" \
-            || -z "$APPLE_API_KEY_BASE64" || -z "$APPLE_API_KEY_ID" \
-            || -z "$APPLE_API_ISSUER" || -z "$WIN_CSC_LINK" \
-            || -z "$WIN_CSC_KEY_PASSWORD" ]]; then
-            notes+=(--notes "⚠️ This release contains unsigned desktop installers. macOS and Windows may display security warnings during installation.")
+          if [[ -z "$WIN_CSC_LINK" || -z "$WIN_CSC_KEY_PASSWORD" ]]; then
+            notes+=(--notes "⚠️ This release contains unsigned Windows installers. Windows may display security warnings during installation.")
           fi
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             while IFS= read -r asset; do

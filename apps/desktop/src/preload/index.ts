@@ -445,6 +445,11 @@ const api: DekiDesktopApi = {
       await ipcRenderer.invoke(IPC_CHANNELS.installUpdate),
     );
   },
+  async openUpdateDownloadPage() {
+    return commandResultSchema.parse(
+      await ipcRenderer.invoke(IPC_CHANNELS.openUpdateDownloadPage),
+    );
+  },
   async listMcpServers() {
     return mcpServerEditorSchema.array().parse(
       await ipcRenderer.invoke(IPC_CHANNELS.listMcpServers),

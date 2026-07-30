@@ -3180,7 +3180,7 @@ textarea {
 :is(
   input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
   select,
-  textarea
+  textarea:not(.composer-input)
 ):focus-visible {
   outline: 0;
   border-color: color-mix(in srgb, var(--accent) 78%, var(--border-strong));
@@ -3416,8 +3416,8 @@ html[data-theme="light"] .composer-card .composer-input {
   box-shadow: none;
 }
 
-.composer-card .composer-input:focus,
-.composer-card .composer-input:focus-visible {
+.composer-card textarea.composer-input:focus,
+.composer-card textarea.composer-input:focus-visible {
   border: 0;
   outline: 0;
   background: transparent;

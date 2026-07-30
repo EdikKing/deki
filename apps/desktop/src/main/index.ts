@@ -5998,7 +5998,7 @@ app.on("will-quit", (event) => {
   event.preventDefault();
   void shutdownDesktopState().finally(() => {
     shutdownComplete = true;
-    app.quit();
+    app.exit(0);
   });
 });
 

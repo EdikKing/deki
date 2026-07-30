@@ -1304,13 +1304,19 @@ test("trusts a workspace, streams fixture events, and recalls memory", async ({}
     const messageLayout = await window.evaluate(() => {
       const region = document.querySelector<HTMLElement>(".messages")!.getBoundingClientRect();
       const turn = document.querySelector<HTMLElement>(".message-turn")!.getBoundingClientRect();
+      const composer = document.querySelector<HTMLElement>(".composer-card")!.getBoundingClientRect();
       return {
         leftGap: turn.left - region.left,
         rightGap: region.right - turn.right,
+        composerLeft: composer.left,
+        composerRight: composer.right,
+        turnLeft: turn.left,
+        turnRight: turn.right,
       };
     });
-    expect(messageLayout.leftGap).toBeLessThanOrEqual(41);
-    expect(messageLayout.rightGap).toBeLessThanOrEqual(41);
+    expect(Math.abs(messageLayout.leftGap - messageLayout.rightGap)).toBeLessThanOrEqual(1);
+    expect(Math.abs(messageLayout.turnLeft - messageLayout.composerLeft)).toBeLessThanOrEqual(1);
+    expect(Math.abs(messageLayout.turnRight - messageLayout.composerRight)).toBeLessThanOrEqual(1);
     const copyMessage = window.getByRole("button", { name: "复制消息" }).first();
     await expect(copyMessage.locator(".copy-message-icon")).toHaveCount(1);
     await expect(copyMessage).toHaveText("");

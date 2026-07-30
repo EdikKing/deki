@@ -417,6 +417,7 @@ export const planRecordSchema = z.object({
   sessionId: z.string().min(1),
   planningTaskId: z.string().uuid().optional(),
   executionTaskId: z.string().uuid().optional(),
+  title: z.string().trim().min(1).max(200),
   goal: z.string().trim().min(1).max(100_000),
   status: planStatusSchema,
   currentRevision: z.number().int().positive(),

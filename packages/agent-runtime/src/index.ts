@@ -80,6 +80,7 @@ export interface DekiAgentRuntimeOptions {
   ) => Promise<{ commit(): void; release(): void } | null>;
   planTools?: {
     submit(input: {
+      title: string;
       goal: string;
       assumptions: string[];
       constraints: string[];
@@ -2584,6 +2585,7 @@ class PlanToolsProvider implements CapabilityProvider {
       additionalProperties: false,
     };
     const planContent = {
+      title: { type: "string", minLength: 1, maxLength: 200 },
       goal: { type: "string", minLength: 1, maxLength: 100_000 },
       assumptions: { type: "array", items: { type: "string" }, maxItems: 100 },
       constraints: { type: "array", items: { type: "string" }, maxItems: 100 },
@@ -2596,7 +2598,7 @@ class PlanToolsProvider implements CapabilityProvider {
         inputSchema: {
           type: "object",
           properties: planContent,
-          required: ["goal", "assumptions", "constraints", "steps"],
+          required: ["title", "goal", "assumptions", "constraints", "steps"],
           additionalProperties: false,
         },
         effect: "plan-control",
@@ -2610,7 +2612,10 @@ class PlanToolsProvider implements CapabilityProvider {
             planId: { type: "string", format: "uuid" },
             basedOnRevision: { type: "integer", minimum: 1 },
             feedback: { type: "string", maxLength: 10_000 },
-            ...planContent,
+            goal: planContent.goal,
+            assumptions: planContent.assumptions,
+            constraints: planContent.constraints,
+            steps: planContent.steps,
           },
           required: [
             "planId", "basedOnRevision", "goal", "assumptions", "constraints", "steps",

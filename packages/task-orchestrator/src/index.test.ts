@@ -94,7 +94,7 @@ describe("TaskStore", () => {
 
     const verified = new DatabaseSync(databasePath);
     expect((verified.prepare("PRAGMA user_version").get() as { user_version: number }).user_version)
-      .toBe(7);
+      .toBe(8);
     const taskColumns = verified.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
     const planColumns = verified.prepare("PRAGMA table_info(plans)").all() as Array<{ name: string }>;
     const tables = verified.prepare(`
@@ -102,6 +102,7 @@ describe("TaskStore", () => {
     `).all() as Array<{ name: string }>;
     expect(taskColumns.map((column) => column.name)).toContain("delivery_mode");
     expect(planColumns.map((column) => column.name)).toContain("replan_reason");
+    expect(planColumns.map((column) => column.name)).toContain("title");
     expect(tables.map((table) => table.name)).toContain("artifact_files");
     expect(tables.map((table) => table.name)).toContain("write_batches");
     verified.close();
@@ -142,7 +143,7 @@ describe("TaskStore", () => {
 
     const verified = new DatabaseSync(databasePath);
     expect((verified.prepare("PRAGMA user_version").get() as { user_version: number }).user_version)
-      .toBe(7);
+      .toBe(8);
     expect(verified.prepare(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'plans'",
     ).get()).toBeTruthy();
@@ -354,12 +355,14 @@ describe("TaskStore", () => {
       workspacePath: "/tmp/workspace-a",
       sessionId: "session-plan",
       planningTaskId: planningTask.id,
+      title: "规划并实施核心功能",
       goal: "规划并实施功能",
       assumptions: ["现有测试可运行"],
       constraints: ["保持兼容"],
       steps: planSteps(),
     });
     expect(plan.status).toBe("ready");
+    expect(plan.title).toBe("规划并实施核心功能");
     expect(store.getPlan(plan.id)?.events.map((event) => event.sequence)).toEqual([1, 2]);
 
     succeedPlanningTask(store, planningTask.id);

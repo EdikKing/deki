@@ -271,7 +271,8 @@ export function PlanPanel(props: PlanPanelProps) {
           <span className={`plan-status ${detail.plan.status}`}>
             {planStatusLabel(detail.plan.status, zh)}
           </span>
-          <strong>{zh ? `计划 v${detail.plan.currentRevision}` : `Plan v${detail.plan.currentRevision}`}</strong>
+          <strong title={detail.plan.title}>{detail.plan.title}</strong>
+          <small className="plan-version">v{detail.plan.currentRevision}</small>
         </div>
         <span className="plan-progress">
           {[...states.values()].filter((state) =>
@@ -433,12 +434,6 @@ export function PlanPanel(props: PlanPanelProps) {
             {zh ? "重新规划" : "Replan"}
           </button>
         )}
-        <button
-          disabled={busy}
-          onClick={() => void run(window.deki.openPlanSession(detail.plan.id))}
-        >
-          {zh ? "打开会话" : "Open chat"}
-        </button>
         {detail.executionTask
           && ["running", "waiting_approval", "waiting_user"].includes(
             detail.executionTask.status,

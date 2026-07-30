@@ -460,7 +460,8 @@ test("runs a real Plan revision and replan flow through an OpenAI-compatible fix
     ).deki.listSessions());
     await panel.getByRole("button", { name: "批准并执行" }).click();
 
-    await expect(panel).toContainText("计划 v2", { timeout: 15_000 });
+    await expect(panel).toContainText("重新规划流程验证", { timeout: 15_000 });
+    await expect(panel.locator(".plan-version")).toHaveText("v2");
     const planVisibility = await window.evaluate(async () => {
       const api = (globalThis as unknown as { deki: DekiDesktopApi }).deki;
       return {
@@ -2178,6 +2179,7 @@ function fixtureCompletion(
       tool: {
         name: "plan__submit",
         arguments: {
+          title: dag ? "DAG 发布收尾验收" : "重新规划流程验证",
           goal: dag ? "DAG 发布收尾验收" : "创建一个会触发重新规划的单步骤计划",
           assumptions: ["Initial fixture assumption"],
           constraints: ["Plan mode remains read-only"],

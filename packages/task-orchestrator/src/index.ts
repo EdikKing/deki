@@ -357,6 +357,7 @@ interface PlanRow {
   session_id: string;
   planning_task_id: string | null;
   execution_task_id: string | null;
+  title: string | null;
   goal: string;
   status: string;
   current_revision: number;
@@ -1731,6 +1732,7 @@ export class TaskStore {
     workspacePath?: string;
     sessionId: string;
     planningTaskId?: string;
+    title?: string;
     goal: string;
     assumptions: string[];
     constraints: string[];
@@ -1745,6 +1747,7 @@ export class TaskStore {
       ...(input.workspacePath ? { workspacePath: input.workspacePath } : {}),
       sessionId: input.sessionId,
       ...(input.planningTaskId ? { planningTaskId: input.planningTaskId } : {}),
+      title: input.title ?? createPlanTitle(input.goal),
       goal: input.goal,
       status: "ready",
       currentRevision: 1,
@@ -1763,15 +1766,16 @@ export class TaskStore {
       this.#database.prepare(`
         INSERT INTO plans (
           id, workspace_id, workspace_path, session_id, planning_task_id,
-          execution_task_id, goal, status, current_revision, approved_revision,
+          execution_task_id, title, goal, status, current_revision, approved_revision,
           executing_revision, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, NULL, ?, 'ready', 1, NULL, NULL, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, 'ready', 1, NULL, NULL, ?, ?)
       `).run(
         plan.id,
         plan.workspaceId,
         plan.workspacePath ?? null,
         plan.sessionId,
         plan.planningTaskId ?? null,
+        plan.title,
         plan.goal,
         now,
         now,
@@ -1786,7 +1790,7 @@ export class TaskStore {
       planEvents.push(this.#appendPlanEvent(
         plan.id,
         "plan.created",
-        { revision: 1, goal: plan.goal },
+        { revision: 1, title: plan.title, goal: plan.goal },
         plan.planningTaskId,
       ));
       planEvents.push(this.#appendPlanEvent(
@@ -4153,6 +4157,7 @@ export class TaskStore {
           session_id TEXT NOT NULL,
           planning_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
           execution_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+          title TEXT NOT NULL,
           goal TEXT NOT NULL,
           status TEXT NOT NULL,
           current_revision INTEGER NOT NULL,
@@ -4308,7 +4313,7 @@ export class TaskStore {
         );
         CREATE INDEX plan_execution_graphs_status_idx
           ON plan_execution_graphs(status, updated_at);
-        PRAGMA user_version = 7;
+        PRAGMA user_version = 8;
         COMMIT;
       `);
       return;
@@ -4584,6 +4589,28 @@ export class TaskStore {
       ).map((column) => (column as { name: string }).name));
       if (!columns.has("failure_detail_json")) {
         this.#database.exec("ALTER TABLE runs ADD COLUMN failure_detail_json TEXT");
+      }
+    }
+    const plansTable = this.#database.prepare(`
+      SELECT 1 AS found FROM sqlite_master
+      WHERE type = 'table' AND name = 'plans'
+    `).get() as { found: number } | undefined;
+    if (plansTable) {
+      const columns = new Set((
+        this.#database.prepare("PRAGMA table_info(plans)").all()
+      ).map((column) => (column as { name: string }).name));
+      if (!columns.has("title")) {
+        this.#database.exec(`
+          BEGIN;
+          ALTER TABLE plans ADD COLUMN title TEXT;
+          UPDATE plans
+          SET title = COALESCE(
+            (SELECT tasks.title FROM tasks WHERE tasks.id = plans.planning_task_id),
+            substr(goal, 1, 80)
+          );
+          PRAGMA user_version = 8;
+          COMMIT;
+        `);
       }
     }
   }
@@ -6182,6 +6209,7 @@ function rowToPlan(row: PlanRow): PlanRecord {
     sessionId: row.session_id,
     ...(row.planning_task_id ? { planningTaskId: row.planning_task_id } : {}),
     ...(row.execution_task_id ? { executionTaskId: row.execution_task_id } : {}),
+    title: row.title ?? createPlanTitle(row.goal),
     goal: row.goal,
     status: row.status,
     currentRevision: row.current_revision,
@@ -6193,6 +6221,11 @@ function rowToPlan(row: PlanRow): PlanRecord {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   });
+}
+
+function createPlanTitle(goal: string): string {
+  const firstLine = goal.split("\n", 1)[0]?.trim() || "实施计划";
+  return firstLine.length > 80 ? `${firstLine.slice(0, 79)}…` : firstLine;
 }
 
 function rowToPlanRevision(row: PlanRevisionRow): PlanRevisionRecord {

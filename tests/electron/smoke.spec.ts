@@ -275,6 +275,94 @@ test("returns to chat when a sidebar session is selected from Task Center", asyn
 
 // Playwright requires an object-destructured fixtures parameter.
 // eslint-disable-next-line no-empty-pattern
+test("restores the last active workspace and exact session after relaunch", async ({}) => {
+  const temporaryHome = await mkdtemp(resolve(tmpdir(), "deki-electron-restore-location-"));
+  const workspace = await mkdtemp(resolve(tmpdir(), "deki-electron-restore-workspace-"));
+  const normalizedWorkspace = await realpath(workspace);
+  const olderSessionId = "00000000-0000-4000-8000-000000000021";
+  const newerSessionId = "00000000-0000-4000-8000-000000000022";
+  await seedChineseSettings(temporaryHome);
+  await seedComposerModels(temporaryHome);
+  await seedPersistedSession(
+    temporaryHome,
+    normalizedWorkspace,
+    olderSessionId,
+    "2026-07-27T11:00:00.000Z",
+  );
+  await seedPersistedSession(
+    temporaryHome,
+    normalizedWorkspace,
+    newerSessionId,
+    "2026-07-27T11:01:00.000Z",
+  );
+  await writeFile(join(temporaryHome, ".deki", "config.json"), JSON.stringify({
+    version: 1,
+    trustedWorkspaces: {
+      [normalizedWorkspace]: { trustedAt: "2026-07-27T11:00:00.000Z" },
+    },
+    recentWorkspaces: [normalizedWorkspace],
+  }));
+
+  let electronApp: ElectronApplication | undefined;
+  try {
+    electronApp = await electron.launch({
+      executablePath: electronPath,
+      args: createElectronArguments(
+        temporaryHome,
+        "--workspace",
+        normalizedWorkspace,
+      ),
+      env: createTestEnvironment(temporaryHome),
+    });
+    let window = await electronApp.firstWindow();
+    await expect.poll(() => window.evaluate(
+      () => (globalThis as unknown as { deki: DekiDesktopApi }).deki
+        .getBootstrapState()
+        .then((state) => state.sessionId),
+    )).toBeTruthy();
+    const initialSessionId = await window.evaluate(
+      () => (globalThis as unknown as { deki: DekiDesktopApi }).deki
+        .getBootstrapState()
+        .then((state) => state.sessionId),
+    );
+    const targetSessionId = initialSessionId === olderSessionId
+      ? newerSessionId
+      : olderSessionId;
+    await window.evaluate(
+      (sessionId) => (globalThis as unknown as { deki: DekiDesktopApi }).deki
+        .switchSession(sessionId),
+      targetSessionId,
+    );
+    await expect.poll(() => window.evaluate(
+      () => (globalThis as unknown as { deki: DekiDesktopApi }).deki
+        .getBootstrapState()
+        .then((state) => state.sessionId),
+    )).toBe(targetSessionId);
+    await electronApp.close();
+    electronApp = undefined;
+
+    electronApp = await electron.launch({
+      executablePath: electronPath,
+      args: createElectronArguments(temporaryHome),
+      env: createTestEnvironment(temporaryHome),
+    });
+    window = await electronApp.firstWindow();
+    await expect.poll(() => window.evaluate(
+      () => (globalThis as unknown as { deki: DekiDesktopApi }).deki
+        .getBootstrapState(),
+    )).toMatchObject({
+      workspace: normalizedWorkspace,
+      sessionId: targetSessionId,
+    });
+  } finally {
+    await electronApp?.close();
+    await rm(temporaryHome, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+// Playwright requires an object-destructured fixtures parameter.
+// eslint-disable-next-line no-empty-pattern
 test("shows Plan progress and previews persisted artifacts inside Task Center", async ({}) => {
   const temporaryHome = await mkdtemp(resolve(tmpdir(), "deki-electron-task-plan-"));
   await seedChineseSettings(temporaryHome);

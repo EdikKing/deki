@@ -7,9 +7,11 @@ import {
   getDekiPaths,
   isWorkspaceTrusted,
   loadMcpConfig,
+  readLastActiveLocation,
   readMcpLocalConfig,
   resolveWorkspace,
   trustWorkspace,
+  writeLastActiveLocation,
   writeMcpLocalConfig,
   workspaceId,
 } from "./index";
@@ -51,6 +53,22 @@ describe("config", () => {
     await trustWorkspace(configFile, "/project");
     expect(await isWorkspaceTrusted(configFile, "/project")).toBe(true);
     expect(JSON.parse(await readFile(configFile, "utf8")).version).toBe(1);
+  });
+
+  it("persists the last active workspace and session", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "deki-active-location-"));
+    temporaryDirectories.push(directory);
+    const configFile = join(directory, "config.json");
+
+    await writeLastActiveLocation(configFile, {
+      workspace: "/project",
+      sessionId: "session-2",
+    });
+
+    await expect(readLastActiveLocation(configFile)).resolves.toEqual({
+      workspace: "/project",
+      sessionId: "session-2",
+    });
   });
 
   it("resolves MCP cwd relative to the workspace", async () => {

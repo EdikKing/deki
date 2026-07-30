@@ -10,7 +10,16 @@ const trustConfigSchema = z.object({
     trustedAt: z.string(),
   }).strict()),
   recentWorkspaces: z.array(z.string()).default([]),
+  lastActiveLocation: z.object({
+    workspace: z.string().nullable(),
+    sessionId: z.string().min(1),
+  }).strict().optional(),
 }).strict();
+
+export interface LastActiveLocation {
+  workspace?: string;
+  sessionId: string;
+}
 
 export const mcpServerConfigSchema = z.object({
   command: z.string().trim().min(1),
@@ -154,6 +163,33 @@ export async function revokeWorkspaceTrust(
 
 export async function listRecentWorkspaces(configFile: string): Promise<string[]> {
   return (await readTrustConfig(configFile)).recentWorkspaces;
+}
+
+export async function readLastActiveLocation(
+  configFile: string,
+): Promise<LastActiveLocation | undefined> {
+  const location = (await readTrustConfig(configFile)).lastActiveLocation;
+  if (!location) return undefined;
+  return {
+    ...(location.workspace ? { workspace: location.workspace } : {}),
+    sessionId: location.sessionId,
+  };
+}
+
+export async function writeLastActiveLocation(
+  configFile: string,
+  location: LastActiveLocation,
+): Promise<void> {
+  const config = await readTrustConfig(configFile);
+  config.lastActiveLocation = {
+    workspace: location.workspace ?? null,
+    sessionId: location.sessionId,
+  };
+  await mkdir(resolve(configFile, ".."), { recursive: true });
+  await writeFile(configFile, `${JSON.stringify(config, null, 2)}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
 }
 
 export async function loadMcpConfig(workspace: string): Promise<McpConfig> {

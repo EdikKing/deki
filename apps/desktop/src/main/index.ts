@@ -52,11 +52,13 @@ import {
   isWorkspaceTrusted,
   listRecentWorkspaces,
   loadMcpConfig,
+  readLastActiveLocation,
   readMcpConfig,
   readMcpLocalConfig,
   revokeWorkspaceTrust,
   resolveWorkspace,
   trustWorkspace,
+  writeLastActiveLocation,
   writeMcpConfig,
   writeMcpLocalConfig,
   workspaceId,
@@ -358,6 +360,19 @@ class DesktopController {
     });
   }
 
+  async rememberActiveLocation(): Promise<void> {
+    const sessionId = this.#runtime?.snapshot().sessionId;
+    if (!sessionId) return;
+    try {
+      await writeLastActiveLocation(this.#paths.configFile, {
+        ...(this.#workspace ? { workspace: this.#workspace } : {}),
+        sessionId,
+      });
+    } catch (error) {
+      this.#diagnostics.push(`无法保存最后活动会话: ${formatError(error)}`);
+    }
+  }
+
   async trust(): Promise<CommandResult> {
     if (!this.#workspace) {
       return { ok: true };
@@ -367,6 +382,7 @@ class DesktopController {
       this.#recentWorkspaces = await listRecentWorkspaces(this.#paths.configFile);
       this.#trusted = true;
       await this.#startRuntime();
+      await this.rememberActiveLocation();
       return { ok: true };
     } catch (error) {
       return { ok: false, error: formatError(error) };
@@ -824,7 +840,9 @@ class DesktopController {
   }
 
   async newSession(): Promise<CommandResult> {
-    return this.#run(async (runtime) => runtime.newSession());
+    const result = await this.#run(async (runtime) => runtime.newSession());
+    if (result.ok) await this.rememberActiveLocation();
+    return result;
   }
 
   async listSessions(query = "") {
@@ -848,7 +866,9 @@ class DesktopController {
   }
 
   async switchSession(id: string): Promise<CommandResult> {
-    return this.#run(async (runtime) => runtime.switchSession(id));
+    const result = await this.#run(async (runtime) => runtime.switchSession(id));
+    if (result.ok) await this.rememberActiveLocation();
+    return result;
   }
 
   async renameSession(id: string, name: string): Promise<CommandResult> {
@@ -2859,11 +2879,12 @@ async function writeDiagnosticLog(
 }
 
 async function bootstrap(): Promise<void> {
-  const workspace = await resolveStartupWorkspace(process.argv);
+  const startup = await resolveStartupLocation(process.argv);
   registerAutoUpdaterListeners();
   await initializeDesktopState(
-    workspace,
-    process.argv.includes("--resume"),
+    startup.workspace,
+    startup.resumeLatest,
+    startup.sessionId,
   );
   registerIpcHandlers();
   await configureAppProtocol();
@@ -2873,6 +2894,7 @@ async function bootstrap(): Promise<void> {
 async function initializeDesktopState(
   workspace: string | undefined,
   resumeLatest = false,
+  sessionId?: string,
 ): Promise<void> {
   const paths = getDekiPaths();
   await ensureDekiDirectories(paths);
@@ -2937,6 +2959,10 @@ async function initializeDesktopState(
   controller = await getOrCreateController(workspace, {
     resumeLatest,
   });
+  if (sessionId && controller.getState().sessionId !== sessionId) {
+    await controller.switchSession(sessionId);
+  }
+  await controller.rememberActiveLocation();
   taskOrchestrator.setConcurrency(
     controller.getSettings().effective.agent.maxConcurrentRuns,
   );
@@ -3806,11 +3832,69 @@ function registerIpcHandlers(): void {
   });
 }
 
-async function resolveStartupWorkspace(
+interface StartupLocation {
+  workspace?: string;
+  sessionId?: string;
+  resumeLatest: boolean;
+}
+
+async function resolveStartupLocation(
   argv: readonly string[],
-): Promise<string | undefined> {
-  if (!argv.includes("--workspace")) return undefined;
-  return resolveWorkspace(argv, process.cwd());
+): Promise<StartupLocation> {
+  if (argv.includes("--workspace")) {
+    return {
+      workspace: await resolveWorkspace(argv, process.cwd()),
+      resumeLatest: argv.includes("--resume"),
+    };
+  }
+
+  const paths = getDekiPaths();
+  const settings = new SettingsStore({ globalFile: paths.settingsFile });
+  const snapshot = await settings.initialize();
+  const restoreLastSession = argv.includes("--resume")
+    || (
+      snapshot.effective.general.restoreSession
+      && snapshot.effective.general.startupMode === "last-session"
+    );
+  if (!restoreLastSession) return { resumeLatest: false };
+
+  const lastActive = await readLastActiveLocation(paths.configFile);
+  if (lastActive) {
+    if (!lastActive.workspace) {
+      return {
+        sessionId: lastActive.sessionId,
+        resumeLatest: true,
+      };
+    }
+    if (await isWorkspaceTrusted(paths.configFile, lastActive.workspace)) {
+      try {
+        return {
+          workspace: await resolveWorkspace(
+            ["--workspace", lastActive.workspace],
+            process.cwd(),
+          ),
+          sessionId: lastActive.sessionId,
+          resumeLatest: true,
+        };
+      } catch {
+        // Fall back to a valid recent workspace when the previous one moved or disappeared.
+      }
+    }
+  }
+
+  const recentWorkspaces = await listRecentWorkspaces(paths.configFile);
+  for (const workspace of recentWorkspaces) {
+    if (!await isWorkspaceTrusted(paths.configFile, workspace)) continue;
+    try {
+      return {
+        workspace: await resolveWorkspace(["--workspace", workspace], process.cwd()),
+        resumeLatest: true,
+      };
+    } catch {
+      // Ignore stale recent-workspace entries.
+    }
+  }
+  return { resumeLatest: true };
 }
 
 function createEmptyBootstrapState(): BootstrapState {
@@ -3849,6 +3933,7 @@ async function switchToWorkspace(
     ) {
       return controller.trust();
     }
+    await controller.rememberActiveLocation();
     return { ok: true };
   } catch (error) {
     return { ok: false, error: formatError(error) };

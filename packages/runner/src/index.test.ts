@@ -544,6 +544,8 @@ async function repository() {
   const worktrees = join(root, "worktrees");
   await Promise.all([mkdir(repo), mkdir(worktrees)]);
   await git(repo, "init");
+  // Keep fixture contents byte-stable across the Windows and POSIX runners.
+  await git(repo, "config", "core.autocrlf", "false");
   await writeFile(join(repo, "tracked.txt"), "base\n");
   await writeFile(join(repo, "package.json"), JSON.stringify({
     scripts: { test: "node -e \"process.exit(0)\"" },

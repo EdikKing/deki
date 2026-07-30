@@ -230,7 +230,7 @@ export class WorktreeRunner {
     return {
       repositoryRoot: resolvedRoot,
       commonDirectory,
-      workspaceRelativePath: relative(resolvedRoot, resolvedWorkspace),
+      workspaceRelativePath: relative(resolvedRoot, resolvedWorkspace).replaceAll("\\", "/"),
     };
   }
 
@@ -1245,10 +1245,15 @@ async function processRun(
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<ProcessResult> {
   return new Promise((resolvePromise, reject) => {
+    const requiresWindowsShell = process.platform === "win32"
+      && /\.(?:cmd|bat)$/iu.test(command);
     const child = spawn(command, args, {
       cwd,
       env,
-      shell: false,
+      // Windows cannot execute package-manager .cmd shims directly with
+      // shell:false. The executable and validation script names are both
+      // selected from constrained allowlists before reaching this helper.
+      shell: requiresWindowsShell,
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
     });

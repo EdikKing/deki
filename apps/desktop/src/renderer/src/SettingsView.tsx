@@ -375,7 +375,7 @@ function GeneralSettings({ value, source, zh, update }: SettingsComponentProps) 
     <Toggle title={zh ? "恢复上次会话" : "Restore last session"} path="general.restoreSession" checked={value.general.restoreSession} source={source} onChange={(restoreSession) => update({ general: { restoreSession } })} />
     <Setting title={zh ? "关闭窗口时" : "When closing the window"} source={source("general.closeBehavior")}><select value={value.general.closeBehavior} onChange={(e) => void update({ general: { closeBehavior: e.target.value as "quit" | "keep-running" } })}><option value="quit">{zh ? "退出应用" : "Quit app"}</option><option value="keep-running">{zh ? "保持后台运行" : "Keep running"}</option></select></Setting>
     <Toggle title={zh ? "开机启动" : "Launch at login"} path="general.launchAtLogin" checked={value.general.launchAtLogin} source={source} onChange={(launchAtLogin) => update({ general: { launchAtLogin } })} />
-    <Toggle title={zh ? "检查更新" : "Check for updates"} description={zh ? "启动后从 GitHub Releases 检查签名更新；下载完成后将在退出时安装。" : "Checks GitHub Releases for signed updates after startup and installs downloaded updates on quit."} path="general.checkUpdates" checked={value.general.checkUpdates} source={source} onChange={(checkUpdates) => update({ general: { checkUpdates } })} />
+    <Toggle title={zh ? "检查更新" : "Check for updates"} description={zh ? "启动后从 GitHub Releases 检查签名更新；确认下载后可立即重启安装。" : "Checks GitHub Releases for signed updates after startup; downloaded updates can be installed with an immediate restart."} path="general.checkUpdates" checked={value.general.checkUpdates} source={source} onChange={(checkUpdates) => update({ general: { checkUpdates } })} />
   </>;
 }
 
@@ -1334,42 +1334,66 @@ function AboutSettings({ value, zh, update }: Pick<SettingsComponentProps, "valu
       setUpdateEvent({ type: "not-available" });
     }
   };
+  const downloadUpdate = async () => {
+    setUpdateEvent((current) => ({
+      type: "downloading",
+      version: current?.version,
+      percent: 0,
+      transferred: 0,
+      total: 0,
+    }));
+    const result = await window.deki.downloadUpdate();
+    if (!result.ok) {
+      setUpdateEvent({ type: "error", error: result.error });
+    }
+  };
+  const installUpdate = async () => {
+    const result = await window.deki.installUpdate();
+    if (!result.ok) {
+      setUpdateEvent({ type: "error", error: result.error });
+    }
+  };
   let description: string;
-  let extra: ReactNode = null;
+  let control: ReactNode;
   if (updateEvent) {
     switch (updateEvent.type) {
       case "checking":
         description = zh ? "正在检查更新……" : "Checking for updates…";
+        control = <button className="primary" disabled>{zh ? "正在检查" : "Checking"}</button>;
         break;
       case "available":
         description = zh ? `发现新版本 ${updateEvent.version}` : `New version ${updateEvent.version} available`;
+        control = <button className="primary" onClick={() => void downloadUpdate()}>{zh ? "立即更新" : "Update now"}</button>;
         break;
       case "not-available":
         description = zh ? "当前已是最新版本" : "Up to date";
+        control = <button className="primary" onClick={() => void checkNow()}>{zh ? "再次检查" : "Check again"}</button>;
         break;
       case "downloading":
         description = zh
           ? `正在下载 ${updateEvent.percent?.toFixed(1) ?? "?"}%（${formatBytes(updateEvent.transferred ?? 0)} / ${formatBytes(updateEvent.total ?? 0)}）`
           : `Downloading ${updateEvent.percent?.toFixed(1) ?? "?"}% (${formatBytes(updateEvent.transferred ?? 0)} / ${formatBytes(updateEvent.total ?? 0)})`;
-        extra = <progress className="update-progress" max={100} value={updateEvent.percent ?? 0} />;
+        control = <progress className="update-progress" max={100} value={updateEvent.percent ?? 0} />;
         break;
       case "downloaded":
-        description = zh ? `已下载 ${updateEvent.version ?? ""}，重启后安装` : `Downloaded ${updateEvent.version ?? ""}, installs on restart`;
-        extra = <button className="primary" onClick={async () => { await window.deki.checkForUpdates(); }}>{zh ? "立即重启" : "Restart now"}</button>;
+        description = zh ? `新版本 ${updateEvent.version ?? ""} 已下载，可立即重启安装` : `Version ${updateEvent.version ?? ""} is ready to install`;
+        control = <button className="primary" onClick={() => void installUpdate()}>{zh ? "立即重启并安装" : "Restart and install"}</button>;
         break;
       case "error":
         description = updateEvent.error ?? (zh ? "更新检查失败" : "Update check failed");
+        control = <button className="primary" onClick={() => void checkNow()}>{zh ? "重新检查" : "Try again"}</button>;
         break;
     }
   } else {
-    description = zh ? "从 edik-labs/deki 的 GitHub Releases 检查、下载，并在退出后安装。" : "Checks and downloads from edik-labs/deki GitHub Releases, then installs on quit.";
+    description = zh ? "从 edik-labs/deki 的 GitHub Releases 检查新版本；确认后下载并安装。" : "Checks edik-labs/deki GitHub Releases; download and install after confirmation.";
+    control = <button className="primary" onClick={() => void checkNow()}>{zh ? "立即检查" : "Check now"}</button>;
   }
   return <>
     <div className="about-card"><div className="brand-mark">D</div><div><h2>Deki {DEKI_VERSION}</h2><p>Electron 43.2.0 · Pi SDK 0.82.1 · MCP SDK 1.29.0</p></div></div>
     <Setting title={zh ? "开源许可证" : "Open-source license"} description="AGPL-3.0-or-later" source="product"><span className="value-text">GNU Affero General Public License v3.0 or later</span></Setting>
     <Setting title={zh ? "第三方许可证" : "Third-party licenses"} description={zh ? "根据锁文件自动生成完整依赖清单，并随应用打包。" : "A complete inventory is generated from the lockfile and packaged with the app."} source="product"><button className="ghost" onClick={() => void window.deki.openThirdPartyLicenses()}>{zh ? "打开完整清单" : "Open complete inventory"}</button></Setting>
     <Setting title={zh ? "更新通道" : "Update channel"} description={zh ? "Stable 仅接收正式版；Beta 可接收预发布版本。发布源为 GitHub Releases。" : "Stable receives final releases; Beta can receive prereleases. Updates are served by GitHub Releases."} source="global"><select value={value.updates.channel} onChange={(e) => void update({ updates: { channel: e.target.value as "stable" | "beta" } })}><option value="stable">Stable</option><option value="beta">Beta</option></select></Setting>
-    <Setting title={zh ? "客户端更新" : "Client updates"} description={description} source="product"><button className="primary" disabled={updateEvent?.type === "checking" || updateEvent?.type === "downloading"} onClick={checkNow}>{zh ? "立即检查" : "Check now"}{extra}</button></Setting>
+    <Setting title={zh ? "客户端更新" : "Client updates"} description={description} source="product">{control}</Setting>
   </>;
 }
 

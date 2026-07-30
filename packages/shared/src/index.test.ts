@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   agentEventSchema,
   bootstrapStateSchema,
+  isVersionNewer,
   memoryListInputSchema,
   optimizePromptInputSchema,
   optimizePromptResultSchema,
@@ -20,6 +21,16 @@ import {
 } from "./index";
 
 describe("shared IPC schemas", () => {
+  it("only treats a strictly newer SemVer release as an update", () => {
+    expect(isVersionNewer("0.0.3", "0.0.3")).toBe(false);
+    expect(isVersionNewer("v0.0.3", "0.0.3")).toBe(false);
+    expect(isVersionNewer("0.0.4", "0.0.3")).toBe(true);
+    expect(isVersionNewer("0.0.2", "0.0.3")).toBe(false);
+    expect(isVersionNewer("1.0.0-beta.2", "1.0.0-beta.1")).toBe(true);
+    expect(isVersionNewer("1.0.0", "1.0.0-beta.2")).toBe(true);
+    expect(isVersionNewer("not-a-version", "0.0.3")).toBe(false);
+  });
+
   it("resolves the supported locale from the system locale", () => {
     expect(resolveSystemLocale("zh-Hans-CN")).toBe("zh-CN");
     expect(resolveSystemLocale("en-GB")).toBe("en-US");

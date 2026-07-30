@@ -126,6 +126,7 @@ import {
   taskInputResponseSchema,
   taskApprovalDecisionInputSchema,
   integrationDecisionInputSchema,
+  isVersionNewer,
   artifactChunkInputSchema,
   artifactChunkSchema,
   taskSubmissionResultSchema,
@@ -180,6 +181,8 @@ let shutdownComplete = false;
 let updateCheckTimer: NodeJS.Timeout | undefined;
 let appliedUpdateConfiguration = "";
 let updateEventListenersRegistered = false;
+let updateAvailableToDownload = false;
+let updateReadyToInstall = false;
 const repositoryWriteLocks = new Map<string, Promise<void>>();
 const { autoUpdater } = electronUpdater;
 
@@ -3468,11 +3471,16 @@ function registerIpcHandlers(): void {
     }
     try {
       const result = await autoUpdater.checkForUpdates();
+      const currentVersion = app.getVersion();
+      const availableVersion = result?.updateInfo.version ?? null;
+      const updateAvailable = availableVersion !== null
+        && isVersionNewer(availableVersion, currentVersion);
+      updateAvailableToDownload = updateAvailable;
       return checkForUpdatesResultSchema.parse({
         ok: true,
-        currentVersion: app.getVersion(),
-        availableVersion: result?.updateInfo.version ?? null,
-        updateAvailable: result !== null,
+        currentVersion,
+        availableVersion,
+        updateAvailable,
       });
     } catch (error) {
       return checkForUpdatesResultSchema.parse({
@@ -3481,6 +3489,39 @@ function registerIpcHandlers(): void {
         error: formatError(error),
       });
     }
+  });
+  ipcMain.handle(IPC_CHANNELS.downloadUpdate, async (event) => {
+    assertTrustedSender(event);
+    if (!app.isPackaged) {
+      return commandResultSchema.parse({
+        ok: false,
+        error: "开发构建无法下载更新",
+      });
+    }
+    if (!updateAvailableToDownload) {
+      return commandResultSchema.parse({
+        ok: false,
+        error: "没有可下载的新版本，请先检查更新",
+      });
+    }
+    try {
+      updateReadyToInstall = false;
+      await autoUpdater.downloadUpdate();
+      return commandResultSchema.parse({ ok: true });
+    } catch (error) {
+      return commandResultSchema.parse({ ok: false, error: formatError(error) });
+    }
+  });
+  ipcMain.handle(IPC_CHANNELS.installUpdate, async (event) => {
+    assertTrustedSender(event);
+    if (!updateReadyToInstall) {
+      return commandResultSchema.parse({
+        ok: false,
+        error: "更新尚未下载完成",
+      });
+    }
+    setImmediate(() => autoUpdater.quitAndInstall(false, true));
+    return commandResultSchema.parse({ ok: true });
   });
   ipcMain.handle(IPC_CHANNELS.exportDiagnostics, async (event) => {
     assertTrustedSender(event);
@@ -5236,15 +5277,19 @@ function registerAutoUpdaterListeners(): void {
   updateEventListenersRegistered = true;
 
   autoUpdater.on("checking-for-update", () => {
+    updateAvailableToDownload = false;
     broadcastUpdateEvent({ type: "checking" });
   });
   autoUpdater.on("update-available", (info) => {
+    updateAvailableToDownload = isVersionNewer(info.version, app.getVersion());
+    updateReadyToInstall = false;
     broadcastUpdateEvent({
-      type: "available",
+      type: updateAvailableToDownload ? "available" : "not-available",
       version: info.version,
     });
   });
   autoUpdater.on("update-not-available", () => {
+    updateAvailableToDownload = false;
     broadcastUpdateEvent({ type: "not-available" });
   });
   autoUpdater.on("download-progress", (progress) => {
@@ -5257,6 +5302,8 @@ function registerAutoUpdaterListeners(): void {
     });
   });
   autoUpdater.on("update-downloaded", (info) => {
+    updateAvailableToDownload = false;
+    updateReadyToInstall = true;
     broadcastUpdateEvent({
       type: "downloaded",
       version: info.version,
@@ -5666,7 +5713,7 @@ function applyAutoUpdateSettings(snapshot: SettingsSnapshot): void {
   }
   if (!enabled) return;
 
-  autoUpdater.autoDownload = true;
+  autoUpdater.autoDownload = false;
   autoUpdater.autoInstallOnAppQuit = true;
   autoUpdater.allowPrerelease = channel === "beta";
   updateCheckTimer = setTimeout(() => {

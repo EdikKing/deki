@@ -1434,6 +1434,52 @@ export const updateEventSchema = z.object({
 }).strict();
 export type UpdateEvent = z.infer<typeof updateEventSchema>;
 
+type ParsedVersion = {
+  core: [number, number, number];
+  prerelease: string[];
+};
+
+function parseVersion(value: string): ParsedVersion | null {
+  const match = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(value.trim());
+  if (!match) return null;
+  return {
+    core: [Number(match[1]), Number(match[2]), Number(match[3])],
+    prerelease: match[4]?.split(".") ?? [],
+  };
+}
+
+/**
+ * Compares release versions using SemVer precedence. Invalid versions are
+ * treated as not newer so update checks never report a false positive.
+ */
+export function isVersionNewer(candidate: string, current: string): boolean {
+  const next = parseVersion(candidate);
+  const installed = parseVersion(current);
+  if (!next || !installed) return false;
+
+  for (let index = 0; index < next.core.length; index += 1) {
+    const difference = next.core[index]! - installed.core[index]!;
+    if (difference !== 0) return difference > 0;
+  }
+  if (next.prerelease.length === 0 || installed.prerelease.length === 0) {
+    return next.prerelease.length === 0 && installed.prerelease.length > 0;
+  }
+  const length = Math.max(next.prerelease.length, installed.prerelease.length);
+  for (let index = 0; index < length; index += 1) {
+    const nextPart = next.prerelease[index];
+    const installedPart = installed.prerelease[index];
+    if (nextPart === undefined) return false;
+    if (installedPart === undefined) return true;
+    if (nextPart === installedPart) continue;
+    const nextNumeric = /^\d+$/.test(nextPart);
+    const installedNumeric = /^\d+$/.test(installedPart);
+    if (nextNumeric && installedNumeric) return Number(nextPart) > Number(installedPart);
+    if (nextNumeric !== installedNumeric) return installedNumeric;
+    return nextPart > installedPart;
+  }
+  return false;
+}
+
 export const checkForUpdatesResultSchema = z.object({
   ok: z.boolean(),
   currentVersion: z.string().optional(),
@@ -1586,6 +1632,8 @@ export const IPC_CHANNELS = {
   openDataDirectory: "deki:open-data-directory",
   openThirdPartyLicenses: "deki:open-third-party-licenses",
   checkForUpdates: "deki:check-for-updates",
+  downloadUpdate: "deki:download-update",
+  installUpdate: "deki:install-update",
   listMcpServers: "deki:list-mcp-servers",
   upsertMcpServer: "deki:upsert-mcp-server",
   removeMcpServer: "deki:remove-mcp-server",
@@ -1712,6 +1760,8 @@ export interface DekiDesktopApi {
   openDataDirectory(): Promise<CommandResult>;
   openThirdPartyLicenses(): Promise<CommandResult>;
   checkForUpdates(): Promise<CheckForUpdatesResult>;
+  downloadUpdate(): Promise<CommandResult>;
+  installUpdate(): Promise<CommandResult>;
   listMcpServers(): Promise<McpServerEditor[]>;
   upsertMcpServer(server: McpServerEditor): Promise<CommandResult>;
   removeMcpServer(id: string): Promise<CommandResult>;

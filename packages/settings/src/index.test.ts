@@ -33,6 +33,17 @@ describe("SettingsStore", () => {
     });
   });
 
+  it("enables layered project memory with bounded handoff retention", () => {
+    expect(defaultSettings.memory).toMatchObject({
+      automaticCandidates: true,
+      automaticAcceptVerified: true,
+      automaticAcceptanceThreshold: 0.85,
+      handoffRetentionDays: 14,
+      handoffRecallLimit: 3,
+      handoffTokenBudget: 400,
+    });
+  });
+
   it("merges global, shared, local, and session settings in order", async () => {
     const root = await mkdtemp(join(tmpdir(), "deki-settings-"));
     directories.push(root);

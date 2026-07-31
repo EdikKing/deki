@@ -455,6 +455,26 @@ test("runs a real Plan revision and replan flow through an OpenAI-compatible fix
     await expect(panel).toBeVisible();
     await expect(panel.getByRole("button", { name: "批准并执行" }))
       .toBeEnabled({ timeout: 15_000 });
+    const planPresentation = await window.evaluate(async () => {
+      const api = (globalThis as unknown as { deki: DekiDesktopApi }).deki;
+      const history = await api.getSessionHistoryState();
+      const currentSession = (await api.listSessions()).find((session) => session.current);
+      return {
+        userMessages: history.messages
+          .filter((message) => message.role === "user")
+          .map((message) => message.content),
+        sessionName: currentSession?.name,
+      };
+    });
+    expect(planPresentation.userMessages.at(-1))
+      .toBe("创建一个会触发重新规划的单步骤计划");
+    expect(planPresentation.userMessages.at(-1)).not.toContain("你处于 Plan 模式");
+    expect(planPresentation.sessionName)
+      .toBe("创建一个会触发重新规划的单步骤计划");
+    expect(modelServer.userPrompts.some((prompt) =>
+      prompt.includes("你处于 Plan 模式")
+      && prompt.includes("目标：创建一个会触发重新规划的单步骤计划")
+    )).toBe(true);
     const sessionsBeforeApproval = await window.evaluate(() => (
       globalThis as unknown as { deki: DekiDesktopApi }
     ).deki.listSessions());

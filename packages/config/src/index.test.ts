@@ -1,12 +1,16 @@
+import { execFile } from "node:child_process";
 import { mkdtemp, mkdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   ensureDekiDirectories,
   getDekiPaths,
   isWorkspaceTrusted,
   loadMcpConfig,
+  projectBranchScopeId,
+  projectId,
   readLastActiveLocation,
   readMcpLocalConfig,
   resolveWorkspace,
@@ -16,6 +20,7 @@ import {
   workspaceId,
 } from "./index";
 
+const execFileAsync = promisify(execFile);
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
@@ -43,6 +48,48 @@ describe("config", () => {
     expect(workspace).toBe(await realpath(directory));
     expect(workspaceId(workspace)).toMatch(/^[a-f0-9]{24}$/);
     expect(workspaceId(workspace)).toBe(workspaceId(workspace));
+  });
+
+  it("shares a project id across linked Git worktrees while keeping branch scopes", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "deki-project-id-"));
+    temporaryDirectories.push(directory);
+    const repository = join(directory, "repository");
+    const worktree = join(directory, "worktree");
+    const otherRepository = join(directory, "other-repository");
+    await mkdir(repository);
+    await mkdir(otherRepository);
+    await execFileAsync("git", ["init", repository]);
+    await execFileAsync("git", ["init", otherRepository]);
+    await execFileAsync("git", ["-C", repository, "config", "user.email", "test@example.com"]);
+    await execFileAsync("git", ["-C", repository, "config", "user.name", "Deki Test"]);
+    await writeFile(join(repository, "README.md"), "fixture");
+    await execFileAsync("git", ["-C", repository, "add", "README.md"]);
+    await execFileAsync("git", ["-C", repository, "commit", "-m", "initial"]);
+    await execFileAsync("git", [
+      "-C",
+      repository,
+      "worktree",
+      "add",
+      "-b",
+      "feature/memory",
+      worktree,
+    ]);
+
+    const repositoryProjectId = await projectId(repository);
+    const worktreeProjectId = await projectId(worktree);
+    expect(worktreeProjectId).toBe(repositoryProjectId);
+    expect(await projectId(otherRepository)).not.toBe(repositoryProjectId);
+    expect(workspaceId(worktree)).not.toBe(workspaceId(repository));
+    expect(await projectBranchScopeId(worktree, worktreeProjectId))
+      .toBe(`${repositoryProjectId}:feature/memory`);
+  });
+
+  it("falls back to the workspace id outside Git", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "deki-non-git-project-"));
+    temporaryDirectories.push(directory);
+    expect(await projectId(directory)).toBe(workspaceId(directory));
+    expect(await projectBranchScopeId(directory, workspaceId(directory)))
+      .toBe(`${workspaceId(directory)}:no-branch`);
   });
 
   it("persists trust with restricted config content", async () => {

@@ -1,8 +1,12 @@
 import { createHash } from "node:crypto";
+import { execFile } from "node:child_process";
 import { access, mkdir, readFile, realpath, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
+import { promisify } from "node:util";
 import { z } from "zod";
+
+const execFileAsync = promisify(execFile);
 
 const trustConfigSchema = z.object({
   version: z.literal(1),
@@ -108,6 +112,58 @@ export async function resolveWorkspace(
 
 export function workspaceId(workspace: string): string {
   return createHash("sha256").update(workspace).digest("hex").slice(0, 24);
+}
+
+export async function projectId(workspace: string): Promise<string> {
+  try {
+    const { stdout } = await execFileAsync(
+      "git",
+      ["-C", workspace, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+      {
+        encoding: "utf8",
+        timeout: 5_000,
+        maxBuffer: 64 * 1024,
+      },
+    );
+    const commonDirectory = await realpath(stdout.trim());
+    return createHash("sha256")
+      .update(`git-common-dir:${commonDirectory}`)
+      .digest("hex")
+      .slice(0, 24);
+  } catch {
+    return workspaceId(workspace);
+  }
+}
+
+export async function projectBranchScopeId(
+  workspace: string,
+  projectScopeId: string,
+): Promise<string> {
+  try {
+    const { stdout } = await execFileAsync(
+      "git",
+      ["-C", workspace, "rev-parse", "--abbrev-ref", "HEAD"],
+      {
+        encoding: "utf8",
+        timeout: 5_000,
+        maxBuffer: 64 * 1024,
+      },
+    );
+    const branch = stdout.trim();
+    if (branch && branch !== "HEAD") return `${projectScopeId}:${branch}`;
+    const detached = await execFileAsync(
+      "git",
+      ["-C", workspace, "rev-parse", "--short=12", "HEAD"],
+      {
+        encoding: "utf8",
+        timeout: 5_000,
+        maxBuffer: 64 * 1024,
+      },
+    );
+    return `${projectScopeId}:detached-${detached.stdout.trim()}`;
+  } catch {
+    return `${projectScopeId}:no-branch`;
+  }
 }
 
 async function readTrustConfig(configFile: string): Promise<z.infer<typeof trustConfigSchema>> {

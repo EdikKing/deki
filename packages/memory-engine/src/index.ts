@@ -11,6 +11,7 @@ interface MemoryRow {
   id: string;
   scope: string;
   scope_id: string;
+  memory_key: string | null;
   type: string;
   content: string;
   source_json: string;
@@ -67,6 +68,7 @@ export class MemoryEngine {
   createMemory(input: {
     scope: MemoryScope;
     scopeId: string;
+    memoryKey?: string;
     content: string;
     source: MemorySource;
     type?: MemoryRecord["type"];
@@ -95,6 +97,7 @@ export class MemoryEngine {
       id: randomUUID(),
       scope: input.scope,
       scopeId: input.scopeId,
+      ...(input.memoryKey ? { memoryKey: input.memoryKey } : {}),
       type: input.type ?? "fact",
       content,
       source: input.source,
@@ -109,13 +112,14 @@ export class MemoryEngine {
 
     this.#database.prepare(`
       INSERT INTO memories (
-        id, scope, scope_id, type, content, source_json, confidence,
+        id, scope, scope_id, memory_key, type, content, source_json, confidence,
         created_at, updated_at, last_used_at, expires_at, pinned, sensitive, status
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
     `).run(
       memory.id,
       memory.scope,
       memory.scopeId,
+      memory.memoryKey ?? null,
       memory.type,
       memory.content,
       JSON.stringify(memory.source),
@@ -131,6 +135,102 @@ export class MemoryEngine {
     if (memory.status === "active") this.#supersedeConflicts(memory);
 
     return memory;
+  }
+
+  upsertMemory(input: {
+    scope: MemoryScope;
+    scopeId: string;
+    memoryKey: string;
+    content: string;
+    source: MemorySource;
+    type: MemoryRecord["type"];
+    status?: MemoryRecord["status"];
+    confidence?: number;
+    expiresAt?: string;
+    lowConfidenceArchiveThreshold?: number;
+  }): MemoryRecord {
+    const existing = this.#database.prepare(`
+      SELECT * FROM memories
+      WHERE scope = ? AND scope_id = ? AND memory_key = ?
+    `).get(input.scope, input.scopeId, input.memoryKey) as unknown as MemoryRow | undefined;
+    if (!existing) return this.createMemory(input);
+
+    const current = rowToMemory(existing);
+    const content = input.content.trim();
+    if (!content) throw new Error("记忆内容不能为空");
+    if (containsSensitiveData(content)) throw new SensitiveMemoryError();
+    const confidence = input.confidence ?? 1;
+    const lowConfidence = confidence
+      < (input.lowConfidenceArchiveThreshold ?? 0.45);
+    const expiresAt = current.pinned ? null : input.expiresAt ?? null;
+    const expired = expiresAt !== null && Date.parse(expiresAt) <= Date.now();
+    const status = expired || lowConfidence
+      ? "archived"
+      : input.status ?? "active";
+    const updatedAt = new Date().toISOString();
+    this.#database.prepare(`
+      UPDATE memories
+      SET content = ?, source_json = ?, type = ?, confidence = ?,
+          expires_at = ?, status = ?, updated_at = ?
+      WHERE id = ?
+    `).run(
+      content,
+      JSON.stringify(input.source),
+      input.type,
+      confidence,
+      expiresAt,
+      status,
+      updatedAt,
+      current.id,
+    );
+    this.#indexMemory(current.id, content);
+    const updated = this.#getMemory(input.scope, input.scopeId, current.id)!;
+    if (updated.status === "active") this.#supersedeConflicts(updated);
+    return updated;
+  }
+
+  migrateScope(scope: MemoryScope, fromScopeId: string, toScopeId: string): number {
+    if (fromScopeId === toScopeId) return 0;
+    const rows = this.#database.prepare(`
+      SELECT * FROM memories WHERE scope = ? AND scope_id = ?
+    `).all(scope, fromScopeId) as unknown as MemoryRow[];
+    let changed = 0;
+    for (const row of rows) {
+      const conflict = row.memory_key
+        ? this.#database.prepare(`
+            SELECT * FROM memories
+            WHERE scope = ? AND scope_id = ? AND memory_key = ?
+          `).get(scope, toScopeId, row.memory_key) as unknown as MemoryRow | undefined
+        : undefined;
+      if (conflict) {
+        if (row.updated_at > conflict.updated_at) {
+          this.#database.prepare(`
+            UPDATE memories
+            SET content = ?, source_json = ?, type = ?, confidence = ?,
+                expires_at = ?, pinned = ?, status = ?, updated_at = ?
+            WHERE id = ?
+          `).run(
+            row.content,
+            row.source_json,
+            row.type,
+            row.confidence,
+            row.expires_at,
+            row.pinned,
+            row.status,
+            row.updated_at,
+            conflict.id,
+          );
+          this.#indexMemory(conflict.id, row.content);
+        }
+        this.#database.prepare("DELETE FROM memories WHERE id = ?").run(row.id);
+      } else {
+        this.#database.prepare(
+          "UPDATE memories SET scope_id = ? WHERE id = ?",
+        ).run(toScopeId, row.id);
+      }
+      changed += 1;
+    }
+    return changed;
   }
 
   listProjectMemories(scopeId: string, limit = 100): MemoryRecord[] {
@@ -351,11 +451,56 @@ export class MemoryEngine {
     return selected;
   }
 
+  recallHandoffs(
+    scopeId: string,
+    query: string,
+    options: { limit?: number; tokenBudget?: number } = {},
+  ): MemoryRecord[] {
+    this.archiveExpiredMemories();
+    const limit = options.limit ?? 3;
+    const tokenBudget = options.tokenBudget ?? 300;
+    const queryTerms = extractTerms(query);
+    const rows = this.#database.prepare(`
+      SELECT * FROM memories
+      WHERE scope = 'branch' AND scope_id = ? AND status = 'active'
+        AND type = 'task-state' AND memory_key LIKE 'handoff:%'
+      ORDER BY pinned DESC, updated_at DESC
+      LIMIT 100
+    `).all(scopeId) as unknown as MemoryRow[];
+    const ranked = rows
+      .map(rowToMemory)
+      .map((memory) => ({
+        memory,
+        score: scoreMemory(memory, queryTerms) + recencyScore(memory.updatedAt),
+      }))
+      .sort((left, right) =>
+        right.score - left.score
+        || right.memory.updatedAt.localeCompare(left.memory.updatedAt));
+    const selected: MemoryRecord[] = [];
+    let usedTokens = 0;
+    for (const { memory } of ranked) {
+      if (selected.length >= limit) break;
+      const tokens = estimateMemoryTokens(memory.content);
+      if (usedTokens + tokens > tokenBudget) continue;
+      selected.push(memory);
+      usedTokens += tokens;
+    }
+    if (selected.length > 0) {
+      const now = new Date().toISOString();
+      const statement = this.#database.prepare(
+        "UPDATE memories SET last_used_at = ? WHERE id = ?",
+      );
+      for (const memory of selected) statement.run(now, memory.id);
+    }
+    return selected;
+  }
+
   archiveExpiredMemories(now = new Date()): number {
     return Number(this.#database.prepare(`
       UPDATE memories
       SET status = 'archived', updated_at = ?
       WHERE status IN ('active', 'pending')
+        AND pinned = 0
         AND expires_at IS NOT NULL
         AND expires_at <= ?
     `).run(now.toISOString(), now.toISOString()).changes);
@@ -549,6 +694,7 @@ export class MemoryEngine {
           id TEXT PRIMARY KEY,
           scope TEXT NOT NULL,
           scope_id TEXT NOT NULL,
+          memory_key TEXT,
           type TEXT NOT NULL,
           content TEXT NOT NULL,
           source_json TEXT NOT NULL,
@@ -585,6 +731,22 @@ export class MemoryEngine {
       ).all() as unknown as Array<{ id: string; content: string }>;
       for (const row of rows) this.#indexMemory(row.id, row.content);
     }
+    if (version.user_version < 3) {
+      const columns = this.#database.prepare(
+        "PRAGMA table_info(memories)",
+      ).all() as unknown as Array<{ name: string }>;
+      this.#database.exec("BEGIN");
+      if (!columns.some((column) => column.name === "memory_key")) {
+        this.#database.exec("ALTER TABLE memories ADD COLUMN memory_key TEXT");
+      }
+      this.#database.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS memories_scope_key_idx
+          ON memories(scope, scope_id, memory_key)
+          WHERE memory_key IS NOT NULL;
+        PRAGMA user_version = 3;
+        COMMIT;
+      `);
+    }
   }
 }
 
@@ -604,6 +766,7 @@ function rowToMemory(row: MemoryRow): MemoryRecord {
     id: row.id,
     scope: row.scope,
     scopeId: row.scope_id,
+    ...(row.memory_key ? { memoryKey: row.memory_key } : {}),
     type: row.type,
     content: row.content,
     source: JSON.parse(row.source_json),

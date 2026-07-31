@@ -123,6 +123,11 @@ const memorySettingsSchema = z.object({
   branchMemoryEnabled: z.boolean(),
   taskMemoryEnabled: z.boolean(),
   automaticCandidates: z.boolean(),
+  automaticAcceptVerified: z.boolean(),
+  automaticAcceptanceThreshold: z.number(),
+  handoffRetentionDays: z.number().int(),
+  handoffRecallLimit: z.number().int(),
+  handoffTokenBudget: z.number().int(),
   candidateConfirmationRequired: z.literal(true),
   userRecallLimit: z.number().int(),
   userCharacterBudget: z.number().int(),
@@ -298,9 +303,19 @@ export const promptAttachmentSchema = z.object({
 export type PromptAttachment = z.infer<typeof promptAttachmentSchema>;
 
 export const memorySourceSchema = z.object({
-  kind: z.enum(["user_command", "agent_candidate", "migration"]),
+  kind: z.enum([
+    "user_command",
+    "agent_candidate",
+    "agent_auto",
+    "session_handoff",
+    "migration",
+  ]),
   sessionId: z.string().optional(),
   detail: z.string().optional(),
+  evidence: z.array(z.object({
+    kind: z.enum(["user_message", "tool_result"]),
+    ref: z.string().min(1),
+  }).strict()).max(20).optional(),
 });
 
 export type MemorySource = z.infer<typeof memorySourceSchema>;
@@ -312,6 +327,7 @@ export const memoryRecordSchema = z.object({
   id: z.string(),
   scope: memoryScopeSchema,
   scopeId: z.string(),
+  memoryKey: z.string().optional(),
   type: z.enum(["preference", "fact", "decision", "experience", "task-state"]),
   content: z.string(),
   source: memorySourceSchema,

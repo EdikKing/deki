@@ -86,12 +86,18 @@ the gateway, and queues Provider calls at the configured concurrent-run limit.
 Skills are reported with source, trust, validation, dependency and conflict
 diagnostics.
 
-Automatic memory is off by default. When enabled, the current conversation
-model proposes at most three structured candidates after a successful task.
-Candidates stay pending and are excluded from recall until the user accepts
-them in the memory center.
+Layered automatic project memory is enabled by default. After each successful
+turn, the current conversation model proposes at most three durable memories
+and updates a branch-scoped handoff summary. A durable item becomes active
+automatically only when it cites a user message or successful Tool result and
+meets the configured confidence threshold (0.85 by default). Assistant-only
+inferences and lower-confidence items remain pending until accepted in the
+memory center. Handoffs expire after 14 days unless pinned.
 
-Memory has user, project and current-task scopes. `/remember` saves to the
+Memory has user, project, workspace, branch and current-task scopes. Project
+identity is derived from Git's canonical common directory, so linked worktrees
+share durable knowledge while workspace-local state remains isolated.
+`/remember` saves to the
 natural persistent scope for the current chat, while `/remember --task <text>`
 saves temporary goals, constraints or progress under the current Pi session
 ID. Each prompt queries the relevant persistent scope and current task

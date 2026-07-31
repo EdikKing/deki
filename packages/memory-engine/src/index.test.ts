@@ -183,6 +183,74 @@ describe("MemoryEngine", () => {
     expect(estimateMemoryTokens("你好 world")).toBeGreaterThanOrEqual(3);
   });
 
+  it("atomically rolls keyed handoffs forward and recalls them independently", async () => {
+    const engine = await createEngine();
+    const first = engine.upsertMemory({
+      scope: "branch",
+      scopeId: "project-a:feature",
+      memoryKey: "handoff:session-a",
+      content: "目标：迁移支付接口\n下一步：补充测试",
+      source: { kind: "session_handoff", sessionId: "session-a" },
+      type: "task-state",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    });
+    const updated = engine.upsertMemory({
+      scope: "branch",
+      scopeId: "project-a:feature",
+      memoryKey: "handoff:session-a",
+      content: "目标：迁移支付接口\n已完成：补充测试\n下一步：发布",
+      source: {
+        kind: "session_handoff",
+        sessionId: "session-a",
+        evidence: [{ kind: "tool_result", ref: "tool:test" }],
+      },
+      type: "task-state",
+      expiresAt: "2099-01-02T00:00:00.000Z",
+    });
+
+    expect(updated.id).toBe(first.id);
+    expect(engine.listMemories("branch", "project-a:feature")).toHaveLength(1);
+    expect(engine.recallHandoffs("project-a:feature", "发布", {
+      limit: 3,
+      tokenBudget: 100,
+    })[0]).toMatchObject({
+      memoryKey: "handoff:session-a",
+      content: expect.stringContaining("下一步：发布"),
+    });
+  });
+
+  it("keeps pinned handoffs active after their expiry time", async () => {
+    const engine = await createEngine();
+    const handoff = engine.createMemory({
+      scope: "branch",
+      scopeId: "project-a:main",
+      memoryKey: "handoff:session-a",
+      content: "目标：长期迁移",
+      source: { kind: "session_handoff", sessionId: "session-a" },
+      type: "task-state",
+      expiresAt: "2020-01-01T00:00:00.000Z",
+    });
+    engine.updateMemory("branch", "project-a:main", handoff.id, {
+      status: "active",
+      pinned: true,
+    });
+    engine.archiveExpiredMemories(new Date("2030-01-01T00:00:00.000Z"));
+    expect(engine.listMemories("branch", "project-a:main")).toHaveLength(1);
+  });
+
+  it("migrates legacy project scope records idempotently", async () => {
+    const engine = await createEngine();
+    engine.createMemory({
+      scope: "project",
+      scopeId: "workspace-a",
+      content: "项目使用 pnpm",
+      source: { kind: "migration" },
+    });
+    expect(engine.migrateScope("project", "workspace-a", "project-a")).toBe(1);
+    expect(engine.migrateScope("project", "workspace-a", "project-a")).toBe(0);
+    expect(engine.listMemories("project", "project-a")[0]?.content).toContain("pnpm");
+  });
+
   it("archives expired and low-confidence memories and supersedes conflicts", async () => {
     const engine = await createEngine();
     const expired = engine.createMemory({

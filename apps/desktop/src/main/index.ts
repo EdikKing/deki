@@ -55,6 +55,7 @@ import {
   readLastActiveLocation,
   readMcpConfig,
   readMcpLocalConfig,
+  projectId,
   revokeWorkspaceTrust,
   resolveWorkspace,
   trustWorkspace,
@@ -196,6 +197,7 @@ class DesktopController {
   readonly #workspace: string | undefined;
   readonly #runtimeWorkspace: string;
   readonly #scopeId: string;
+  readonly #projectId: string;
   readonly #projectFeatures: boolean;
   readonly #paths: DekiPaths;
   readonly #memory: MemoryEngine;
@@ -216,6 +218,7 @@ class DesktopController {
     workspace: string | undefined,
     runtimeWorkspace: string,
     scopeId: string,
+    projectScopeId: string,
     paths: DekiPaths,
     memory: MemoryEngine,
     settings: SettingsStore,
@@ -226,6 +229,7 @@ class DesktopController {
     this.#workspace = workspace;
     this.#runtimeWorkspace = runtimeWorkspace;
     this.#scopeId = scopeId;
+    this.#projectId = projectScopeId;
     this.#projectFeatures = workspace !== undefined;
     this.#paths = paths;
     this.#memory = memory;
@@ -256,6 +260,8 @@ class DesktopController {
     await mkdir(runtimeWorkspace, { recursive: true });
     const memory = new MemoryEngine(paths.memoryDatabase);
     const scopeId = workspace ? workspaceId(workspace) : "general";
+    const projectScopeId = workspace ? await projectId(workspace) : "general";
+    if (workspace) memory.migrateScope("project", scopeId, projectScopeId);
     const settings = new SettingsStore({
       globalFile: paths.settingsFile,
       ...(workspace ? { workspace } : {}),
@@ -284,6 +290,7 @@ class DesktopController {
       workspace,
       runtimeWorkspace,
       scopeId,
+      projectScopeId,
       paths,
       memory,
       settings,
@@ -334,7 +341,7 @@ class DesktopController {
         : {}),
       memories: [
         ...(this.#projectFeatures
-          ? this.#memory.listProjectMemories(this.#scopeId)
+          ? this.#memory.listProjectMemories(this.#projectId)
           : this.#settings.snapshot().effective.memory.userMemoryEnabled
             ? this.#memory.listMemories("user", "user", { limit: 100 })
             : []),
@@ -805,6 +812,13 @@ class DesktopController {
   }) {
     const runtime = this.#runtime;
     if (!runtime) throw new Error("任务所属工作区 Runtime 尚未就绪");
+    const planningDisplayPrompt = input.execution.interactionMode === "plan"
+      ? resolvePlanningDisplayPrompt(
+          input.task.goal,
+          input.execution.planId,
+          taskStore,
+        )
+      : undefined;
     const prompt = input.task.kind === "plan-execution" && input.task.planId
       ? renderPlanExecutionPrompt(taskStore?.getPlan(input.task.planId), input.task.goal)
       : input.execution.interactionMode === "plan"
@@ -827,6 +841,9 @@ class DesktopController {
       taskId: input.task.id,
       runId: input.run.id,
       prompt,
+      ...(planningDisplayPrompt === undefined
+        ? {}
+        : { displayPrompt: planningDisplayPrompt }),
       ...(input.execution.attachments
         ? { attachments: input.execution.attachments }
         : {}),
@@ -1181,7 +1198,7 @@ class DesktopController {
       }
       await this.#settings.update("global", globalSettings, snapshot.revision);
       const scope = this.#projectFeatures ? "project" : "user";
-      const scopeId = this.#projectFeatures ? this.#scopeId : "user";
+      const scopeId = this.#projectFeatures ? this.#projectId : "user";
       if (confirmation.response === 2) this.#memory.clearScope(scope, scopeId);
       const existing = new Set(this.#memory.listMemories(scope, scopeId, { limit: 10_000 })
         .map((memory) => memory.content));
@@ -1722,6 +1739,7 @@ class DesktopController {
       const runtime = new DekiAgentRuntime({
         workspace: this.#runtimeWorkspace,
         scopeId: this.#scopeId,
+        projectId: this.#projectId,
         projectFeatures: this.#projectFeatures,
         paths: this.#paths,
         memoryEngine: this.#memory,
@@ -2816,7 +2834,7 @@ class DesktopController {
     const scope = requested ?? (this.#projectFeatures ? "project" : "user");
     if (scope === "project") {
       if (!this.#projectFeatures) throw new Error("普通会话没有项目记忆作用域");
-      return { scope, scopeId: this.#scopeId };
+      return { scope, scopeId: this.#projectId };
     }
     if (scope === "workspace") {
       if (!this.#projectFeatures) throw new Error("普通会话没有工作区记忆作用域");
@@ -2826,7 +2844,7 @@ class DesktopController {
       if (!this.#projectFeatures) throw new Error("普通会话没有分支记忆作用域");
       return {
         scope,
-        scopeId: this.#runtime?.memoryScopeId("branch") ?? `${this.#scopeId}:no-branch`,
+        scopeId: this.#runtime?.memoryScopeId("branch") ?? `${this.#projectId}:no-branch`,
       };
     }
     if (scope === "task") {
@@ -5518,11 +5536,7 @@ function renderPlanningPrompt(
     const revision = detail?.revisions.find(
       (candidate) => candidate.revision === detail.plan.currentRevision,
     );
-    const eventFeedback = [...(detail?.events ?? [])].reverse().find(
-      (event) => event.type === "plan.replan_requested",
-    )?.payload.feedback;
-    const feedback = detail?.plan.replanReason
-      ?? (typeof eventFeedback === "string" ? eventFeedback : undefined);
+    const feedback = resolvePlanFeedback(detail);
     return [
       "你处于 Plan 模式。只允许读取和分析，不得修改文件或执行有副作用的工具。",
       "检查项目实际状态后，基于当前计划和反馈生成完整的新版本。",
@@ -5547,6 +5561,23 @@ function renderPlanningPrompt(
     "每一步必须声明 executionProfile。Implementer 还必须声明精确 writeSet 和 validationTargets；不要手工添加 Reviewer/Integrator，执行器会插入质量关卡。",
     `目标：${goal}`,
   ].join("\n\n");
+}
+
+function resolvePlanningDisplayPrompt(
+  goal: string,
+  planId: string | undefined,
+  store: TaskStore | undefined,
+): string {
+  if (!planId) return goal;
+  return resolvePlanFeedback(store?.getPlan(planId)) ?? goal;
+}
+
+function resolvePlanFeedback(detail: PlanDetail | undefined): string | undefined {
+  const eventFeedback = [...(detail?.events ?? [])].reverse().find(
+    (event) => event.type === "plan.replan_requested",
+  )?.payload.feedback;
+  return detail?.plan.replanReason
+    ?? (typeof eventFeedback === "string" ? eventFeedback : undefined);
 }
 
 function renderWorkerPrompt(
